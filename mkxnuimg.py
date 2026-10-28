@@ -16,9 +16,31 @@ import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
-PREBUILT = os.path.join(HERE, 'devices', 'poco-x5-pro', 'prebuilt')
-FD_BASE, FD_SIZE = 0x9FD00000, 0x200000
-PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
+# The device whose prebuilt/ the pieces come from: devices/<name>/prebuilt, chosen with
+# UEFI_TARGET=<device>. A piece the device's own directory does not carry (mkbootimg.py, the 5-byte
+# placeholder ramdisk) falls back to the poco-x5-pro port, which does.
+DEVICE = os.environ.get('UEFI_TARGET') or 'poco-x5-pro'
+PREBUILT = os.path.join(HERE, 'devices', DEVICE, 'prebuilt')
+FALLBACK = os.path.join(HERE, 'devices', 'poco-x5-pro', 'prebuilt')
+
+
+def part(name):
+    p = os.path.join(PREBUILT, name)
+    return p if os.path.isfile(p) else os.path.join(FALLBACK, name)
+
+# Header version of the image written: 0/1 keep the ramdisk inside boot.img (the firmware then takes
+# it from there), 4 is the Android 13+ layout with the ramdisk in init_boot instead.
+HEADER_VERSION = os.environ.get('BOOT_HEADER_VERSION') or '1'
+# The stock images of the phone carry "Android 14.0.0, 2026-04"; the firmware may refuse an image
+# that claims an older one, so these are passed through when set.
+OS_VERSION = os.environ.get('BOOT_OS_VERSION', '')
+OS_PATCH = os.environ.get('BOOT_OS_PATCH', '')
+# Where the boot shim copies the UEFI FD and the payload: a property of the device's memory map
+# (xbl's MemoryMapLib), so a port passes its own with these variables.
+FD_BASE = int(os.environ.get('FD_BASE', '0x9FD00000'), 16)
+FD_SIZE = int(os.environ.get('FD_SIZE', '0x200000'), 16)
+PAYLOAD_BASE = int(os.environ.get('PAYLOAD_BASE', '0xF0000000'), 16)
+PAYLOAD_MAX = 0x04000000
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
@@ -39,9 +61,9 @@ if os.path.isfile(fd_path):
              'dtb': os.path.join(MU, 'Resources/DTBs/redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
-    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
-             'dtb': os.path.join(PREBUILT, 'device-tree.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
-             'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+    parts = {'shim': part('BootShim.bin'), 'fd': part('SILICIUM_UEFI.fd'),
+             'dtb': part('device-tree.dtb'), 'ramdisk': part('ramdisk'),
+             'mkbootimg': part('mkbootimg.py')}
 shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
 assert len(fd) == FD_SIZE, hex(len(fd))
@@ -55,12 +77,21 @@ if args.payload:
     blob += b'\0' * (-len(blob) % 16)
     print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')
 
+if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
+if os.environ.get('RAMDISK'): parts['ramdisk'] = os.environ['RAMDISK']
 dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
-    subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+    cmd = [sys.executable, parts['mkbootimg'], '--kernel', kernel, '--header_version', HEADER_VERSION,
+           '-o', args.output]
+    if int(HEADER_VERSION) < 3:          # v3+ images carry no ramdisk at all
+        cmd += ['--ramdisk', parts['ramdisk']]
+    if OS_VERSION:
+        cmd += ['--os_version', OS_VERSION]
+    if OS_PATCH:
+        cmd += ['--os_patch_level', OS_PATCH]
+    subprocess.check_call(cmd)
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')

@@ -15,7 +15,7 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+#define PAYLOAD_BASE        0xA8000000ULL       /* "Kernel" reserved region of the device memory map */
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -517,6 +517,7 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_redist_size;        /* bytes of redistributor frames: one frame per core */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -524,11 +525,12 @@ struct platform {
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
 };
 
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
-	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
+	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .gic_redist_size = 0x100000, .uart = 0x09000000, .psci_hvc = 1,
 	.cores = 8, .core_shift = 0,
 	/*
 	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
@@ -541,7 +543,7 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .gic_redist_size = 0x100000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
@@ -549,6 +551,29 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+	.fb_base = 0xE1000000,
+};
+
+static const struct platform platform_corvette = {
+	/* OnePlus Ace 3 Pro, SM8650 (Pineapple). Core numbers and the GIC come from its device tree. */
+	.name = "corvette", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .gic_redist_size = 0x200000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/*
+	 * Cores 0-1 are Cortex-A520s (capacity 0x400 in the device tree), 2-6 Cortex-A720s (0x700) and
+	 * 7 a Cortex-X4 (0x766).
+	 */
+	.small_cores = 0x3,
+	.fb_base = 0xD5100000,          /* the start of the vendor's display reservation; to confirm from the log */
+};
+
+/*
+ * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
+ * device adds its description here; a display that matches none is QEMU's ramfb.
+ */
+static const struct platform *const platforms[] = {
+	&platform_redwood,
+	&platform_corvette,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -2166,7 +2191,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || PLAT == &platform_qemu_virt) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2432,7 +2457,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (PLAT == &platform_qemu_virt) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -3235,7 +3260,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, plat->gic_redist_size };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
 	dt_end(&w);
 	if (plat->uart != 0) {
@@ -3930,11 +3955,11 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = &platform_redwood;
-		} else {
+		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
+			if (platforms[i]->fb_base == SCREEN.base)
+				PLAT = platforms[i];
+		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
-		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
