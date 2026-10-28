@@ -1,0 +1,34 @@
+#
+# Boot Shim Configs
+#
+[boot_shim]
+requires_kernel_header = true
+
+#
+# UEFI FD Configs
+#
+# From the MemoryMapLib of the UEFI port: "UEFI FD" 0xA7100000, 3 MiB, right
+# after "FD Reserved" 0xA7000000 and before "Kernel" 0xA8000000 (the payload).
+# The stock uefi.img of the phone is 3 MiB too.
+#
+[uefi_fd]
+base = 0xA7100000
+size = 0x300000
+
+#
+# Android Boot Image Kernel Configs
+#
+[boot_image_kernel]
+kernel_compression = "gzip"
+append_dtb         = true
+
+#
+# Android Boot Image Configs
+#
+# Version 0, as tested on this phone with the earlier port: boot.img keeps a
+# ramdisk segment (the upstream "dummy" one), init_boot's ramdisk is emptied and
+# the firmware takes the ramdisk from the stock vendor_boot. Version 4 is the
+# Android 13+ layout with the ramdisk in init_boot.
+#
+[boot_image]
+header_version = 0
