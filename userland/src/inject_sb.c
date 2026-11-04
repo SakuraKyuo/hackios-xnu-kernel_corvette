@@ -677,11 +677,14 @@ gpu_draws(void)
 static void
 plain_vibrancy(void)
 {
-	if (gpu_draws()) {
+	char args[1024] = { 0 };
+	size_t size = sizeof(args);
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "vibrancy=1") != NULL) {
 		return;
 	}
 	CFPreferencesSetAppValue(CFSTR("BSUIVibrancyEffectViewDisabled"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
-	say("hakios: SpringBoard: no GPU draws, vibrant views are plain (the lock screen's clock is white)\n");
+	say("hakios: SpringBoard: vibrant views are plain (lock screen clock is white, no vibrancy wash)\n");
 }
 
 /* ---- the side button's long press ---------------------------------------------------------------- */
@@ -1246,6 +1249,12 @@ load_tweaks(void)
 	}
 }
 
+/*
+ * Native Metal now loads AIR and compiles MSL through the source bridge. Never replace
+ * missing shader resources with an unrelated library or force MPS constructors to nil:
+ * system startup must expose the actual missing resource or unsupported interface.
+ */
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1254,6 +1263,8 @@ hakios_springboard_init(void)
 	size_t length = 0;
 	IMP activation, snapshot_format, battery_lvl, battery_st, poster_switcher;
 	int token;
+
+	say("hakios: air85 SpringBoard: native Metal resources/MPS left to the system implementation\n");
 
 	if (name == NULL) {
 		return;

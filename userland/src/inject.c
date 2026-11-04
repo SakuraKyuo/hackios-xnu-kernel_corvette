@@ -97,6 +97,36 @@ replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *repl
 	return original;
 }
 
+#include <time.h>
+#include "metal_debug.h"
+#include <stdarg.h>
+
+/* Resolve the helper already injected into backboardd. Container services keep
+ * the original CF/IOKit-only dependency set of this library. */
+static void
+hakios_metal_renderer_log(const char *format, ...) __attribute__((format(printf,1,2)));
+static void
+hakios_metal_renderer_log(const char *format, ...)
+{
+    if (!hakios_metal_debug_enabled() && !strstr(format,"STOP") && !strstr(format,"FAIL") && !strstr(format,"exception")) return;
+    char buffer[768];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    void (*record)(const char *, ...) = dlsym(RTLD_DEFAULT, "hakios_metal_renderer_log");
+    if (record != NULL) record("%s", buffer);
+    else say("%s", buffer);
+}
+
+static void
+hakios_metal_renderer_diagnose(unsigned attempt)
+{
+    void (*diagnose)(unsigned) = dlsym(RTLD_DEFAULT, "hakios_metal_renderer_diagnose");
+    if (diagnose != NULL) diagnose(attempt);
+    else say("air88 Metal diagnostic helper unavailable\n");
+}
+
 /* ---- backboardd: CA::WindowServer ------------------------------------------------------------ */
 
 #define VT_APPLE_CLCD_DISPLAY   0x1d5b44520UL   /* vtable for CA::WindowServer::AppleCLCDDisplay */
@@ -121,7 +151,7 @@ my_is_ready(void *display)
 {
 	int ready = orig_is_ready(display);
 
-	if (ready != last_ready || calls_ready < 3) {
+	if (hakios_metal_debug_enabled() && (ready != last_ready || calls_ready < 3)) {
 		say("hakios: is_ready -> %d (call %u, flags %#llx, b233 %#x)\n", ready, calls_ready,
 		    (unsigned long long)DISPLAY_FLAGS(display), DISPLAY_B233(display));
 		last_ready = ready;
@@ -135,7 +165,7 @@ my_ignore_update_p(void *display, void *update)
 {
 	int ignore = orig_ignore_update_p(display, update) & 1;
 
-	if (ignore != last_ignore || calls_ignore < 3) {
+	if (hakios_metal_debug_enabled() && (ignore != last_ignore || calls_ignore < 3)) {
 		uint64_t *q = (uint64_t *)((char *)display + 0x220);
 
 		say("hakios: ignore_update_p -> %d (call %u, flags %#llx, update flags %#x)\n", ignore, calls_ignore,
@@ -154,7 +184,7 @@ my_begin_update(void *display, void *update)
 {
 	uintptr_t r = orig_begin_update(display, update);
 
-	if (calls_begin++ < 6) {
+	if (hakios_metal_debug_enabled() && calls_begin++ < 6) {
 		say("hakios: begin_update -> %#lx (flags %#llx)\n", r, (unsigned long long)DISPLAY_FLAGS(display));
 	}
 	return r;
@@ -165,35 +195,59 @@ my_finish_update(void *display, void *update, unsigned flags)
 {
 	uintptr_t r = orig_finish_update(display, update, flags);
 
-	if (calls_finish++ < 6) {
+	if (hakios_metal_debug_enabled() && calls_finish++ < 6) {
 		say("hakios: finish_update(%#x) -> %#lx\n", flags, r);
 	}
 	return r;
 }
 
-/*
- * Every frame the server asks for its renderer, and while there is none it tries again to make a
- * Metal and then an OpenGL ES context, which costs a lot and cannot succeed here. One try is enough:
- * without a renderer the server draws with CA::WindowServer::Server::sw_renderer().
- */
+/* The original software-only bring-up latched one transient failure forever.
+ * Retry at most four times, separated by 2/8/20 seconds. The verified renderer
+ * routine itself retains a successful context; do not rebuild it every frame. */
 static void *
 my_renderer(void *server)
 {
-	static int failed, said;
-	void *renderer;
-
-	if (failed) {
-		return NULL;
-	}
-	renderer = orig_renderer(server);
-	if (renderer == NULL) {
-		failed = 1;
-		say("hakios: no accelerated renderer; the software one will draw\n");
-	} else if (!said) {
-		said = 1;
-		say("hakios: the server has an accelerated renderer (%p)\n", renderer);
-	}
-	return renderer;
+    static unsigned attempts, observed;
+    static int failed, said;
+    static uint64_t retry_at;
+    struct timespec clock;
+    uint64_t now;
+    void *renderer;
+    observed++;
+    clock_gettime(CLOCK_MONOTONIC, &clock);
+    now = (uint64_t)clock.tv_sec * 1000000000ull + clock.tv_nsec;
+    if (failed && (attempts >= 4 || now < retry_at)) {
+        if ((observed % 300) == 0)
+            say("hakios: air88 compositor software; attempts=%u requests=%u\n", attempts, observed);
+        return NULL;
+    }
+    if (!failed && said) {
+        renderer = orig_renderer(server);
+        if (renderer != NULL) return renderer;
+        said = 0;
+    }
+    attempts++;
+    /* Offsets verified against this System's QuartzCore renderer at 0x1882e2548. */
+    void *display = *(void **)((char *)server + 0x60);
+    void *device = display ? *(void **)((char *)display + 0x108) : NULL;
+    void *context = *(void **)((char *)server + 0x318);
+    hakios_metal_renderer_log("air88 compositor begin: attempt=%u display-device=%p context=%p\n", attempts, device, context);
+    renderer = orig_renderer(server);
+    display = *(void **)((char *)server + 0x60);
+    device = display ? *(void **)((char *)display + 0x108) : NULL;
+    context = *(void **)((char *)server + 0x318);
+    hakios_metal_renderer_log("air88 compositor result: attempt=%u device=%p context=%p renderer=%p\n", attempts, device, context, renderer);
+    if (renderer != NULL) {
+        failed = 0; said = 1;
+        hakios_metal_renderer_log("air88 compositor ACCELERATED renderer=%p\n", renderer);
+        return renderer;
+    }
+    failed = 1;
+    retry_at = now + (attempts == 1 ? 2ull : attempts == 2 ? 8ull : 20ull) * 1000000000ull;
+    hakios_metal_renderer_diagnose(attempts);
+    if (attempts == 4)
+        hakios_metal_renderer_log("air88 compositor STOP RETRY: four failed attempts; software fallback continues\n");
+    return NULL;
 }
 
 static uintptr_t
@@ -202,7 +256,7 @@ my_render_update(void *server, void *update, unsigned *flags)
 	uintptr_t r = orig_render_update(server, update, flags);
 
 	if (calls_render++ < 6) {
-		say("hakios: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
+		if (hakios_metal_debug_enabled()) say("hakios: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
 	}
 	return r;
 }

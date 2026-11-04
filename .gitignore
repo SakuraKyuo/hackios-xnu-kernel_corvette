@@ -49,6 +49,7 @@ __pycache__/
 
 /userland/*
 !/userland/build.sh
+!/userland/build-native-metal.sh
 !/userland/*.py
 !/userland/rc.*
 !/userland/com.hakios.*.plist

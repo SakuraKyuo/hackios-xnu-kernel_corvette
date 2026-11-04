@@ -49,6 +49,8 @@
 #import <sys/wait.h>
 #import <time.h>
 #import <unistd.h>
+#import <errno.h>
+#import <sys/stat.h>
 
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
 
@@ -118,7 +120,7 @@ fault(int sig, siginfo_t *info, void *uap)
  * -- objc_initializeAfterForkError, which says nothing whatever about CoreImage. exec() clears
  * that, because the runtime starts afresh.
  */
-static void
+static int
 in_a_new_process(const char *what, const char *argument, int secs)
 {
 	extern char **environ;
@@ -129,7 +131,7 @@ in_a_new_process(const char *what, const char *argument, int secs)
 	printf("metal_test: %s (asked by a process of its own)\n", what);
 	if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ) != 0) {
 		printf("metal_test:   cannot start %s %s\n", argv[0], argument);
-		return;
+		return 0;
 	}
 	while (waitpid(pid, &status, WNOHANG) == 0) {
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
@@ -139,7 +141,7 @@ in_a_new_process(const char *what, const char *argument, int secs)
 			kill(pid, SIGKILL);
 			waitpid(pid, &status, 0);
 			printf("metal_test:   %s: still going after %d s, killed (it wedges here)\n", what, secs);
-			return;
+			return 1;
 		}
 	}
 	if (WIFSIGNALED(status)) {
@@ -149,6 +151,7 @@ in_a_new_process(const char *what, const char *argument, int secs)
 	} else if (WEXITSTATUS(status) != 0) {
 		printf("metal_test:   %s: ended with status %d\n", what, WEXITSTATUS(status));
 	}
+	return 0;
 }
 
 /* A string property of an IOKit service, or NULL; the caller frees it. */
@@ -308,6 +311,106 @@ the_device(void)
 	    "Apple family 1/4 %d/%d\n", (unsigned long long)[device registryID], (int)[device hasUnifiedMemory],
 	    (unsigned long)[device maxThreadsPerThreadgroup].width,
 	    (int)[device supportsFamily:MTLGPUFamilyApple1], (int)[device supportsFamily:MTLGPUFamilyApple4]);
+}
+
+/*
+ * The five steps of the note at the top, done by hand -- and asked by a process of its own, so
+ * that a step that takes the process down still names itself in the last line printed. The first
+ * line is Metal's own, before any of ours: this process is fresh and Metal has never built its
+ * list, so nil there is Metal's answer given with a device in the registry.
+ */
+@interface NSObject (HakiosMetalProbe)
+- (id)initWithAcceleratorPort:(io_service_t)port;
+@end
+
+static void
+metal_steps(void)
+{
+	id<MTLDevice> own = MTLCreateSystemDefaultDevice();
+	mach_port_t main_port = MACH_PORT_NULL;
+	kern_return_t kr;
+	CFMutableDictionaryRef matching;
+	io_iterator_t it = IO_OBJECT_NULL;
+	io_service_t service;
+	io_name_t name = { 0 };
+	char *plugin, *class_name;
+
+	printf("metal_test:   [pid %d] Metal's own first: MTLCreateSystemDefaultDevice() = %s\n",
+	    getpid(), own != nil ? "an object" : "nil");
+
+	/* step 1: the port Metal asks on, then the match, on that port */
+	kr = IOMainPort(MACH_PORT_NULL, &main_port);
+	printf("metal_test:   IOMainPort() = %#x, port %#x\n", kr, (unsigned) main_port);
+	if (kr != KERN_SUCCESS) {
+		main_port = MACH_PORT_NULL;     /* how main() asks; the rest can still be tested */
+	}
+	matching = IOServiceMatching("IOAcceleratorES");
+	kr = IOServiceGetMatchingServices(main_port, matching, &it);
+	printf("metal_test:   IOServiceGetMatchingServices(that port) = %#x\n", kr);
+	if (kr != KERN_SUCCESS) {
+		return;
+	}
+	service = IOIteratorNext(it);
+	IOObjectRelease(it);
+	if (service == IO_OBJECT_NULL) {
+		printf("metal_test:   the iterator came back empty: Metal would find no device\n");
+		return;
+	}
+
+	/* step 2: the two properties, read the way Metal reads them */
+	IORegistryEntryGetName(service, name);
+	plugin = service_string(service, "MetalPluginName");
+	class_name = service_string(service, "MetalPluginClassName");
+	printf("metal_test:   service \"%s\": plugin \"%s\", class \"%s\"\n", name,
+	    plugin ? plugin : "(none)", class_name ? class_name : "(none)");
+	if (plugin != NULL) {
+		/* step 3: "/System/Library/Extensions" + name + ".bundle" */
+		NSString *path = [@EXTENSIONS stringByAppendingString:
+		    [NSString stringWithFormat:@"/%s.bundle", plugin]];
+		NSBundle *bundle;
+
+		printf("metal_test:   %s: %s\n", [path UTF8String],
+		    access([path UTF8String], R_OK) == 0 ? "there" : "missing");
+		bundle = [NSBundle bundleWithPath:path];
+		printf("metal_test:   [NSBundle bundleWithPath:] = %s\n", bundle != nil ? "a bundle" : "nil");
+		if (bundle != nil) {
+			/* step 4: the class, and whether Metal would keep it */
+			Class cls = class_name != NULL
+			    ? [bundle classNamed:[NSString stringWithUTF8String:class_name]]
+			    : [bundle principalClass];
+			Class base = objc_getClass("_MTLDevice");
+
+			printf("metal_test:   classNamed: = %s\n", cls != Nil ? class_getName(cls) : "Nil");
+			if (cls != Nil) {
+				printf("metal_test:   a _MTLDevice: %s\n",
+				    base != Nil && [cls isSubclassOfClass:base] ? "yes" : "no");
+
+				/* step 5: what the driver does with the port of the service */
+				io_connect_t connection = IO_OBJECT_NULL;
+				kr = IOServiceOpen(service, mach_task_self(), 0, &connection);
+				printf("metal_test:   IOServiceOpen(service) = %#x\n", kr);
+				if (kr == KERN_SUCCESS) {
+					IOServiceClose(connection);
+				}
+				printf("metal_test:   about to send -initWithAcceleratorPort:\n");
+				id device = [[cls alloc] initWithAcceleratorPort:service];
+				printf("metal_test:   -initWithAcceleratorPort: = %s\n",
+				    device != nil ? "an object" : "nil");
+				if (device != nil) {
+					printf("metal_test:     class %s\n", class_getName([device class]));
+					if ([device respondsToSelector:@selector(name)]) {
+						printf("metal_test:     name \"%s\"\n", [[device name] UTF8String]);
+					}
+				}
+			}
+		}
+	}
+	free(plugin);
+	free(class_name);
+	IOObjectRelease(service);
+
+	printf("metal_test:   Metal's own again: MTLCreateSystemDefaultDevice() = %s\n",
+	    MTLCreateSystemDefaultDevice() != nil ? "an object" : "nil");
 }
 
 /* What iOS publishes about graphics besides: artwork, not rendering (see the note above). */
@@ -490,7 +593,7 @@ coreimage(void)
 		    kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
 		if (bitmap != NULL) {
 			CGContextDrawImage(bitmap, rect, image);
-			printf("metal_test:   CoreImage rendered: first pixel %u %u %u %u (inverted orange is about 0 128 255 255)\n",
+			printf("metal_test:   CoreImage rendered: first pixel %u %u %u %u (default color-managed output; use ci-linear for a numeric reference)\n",
 			    pixels[0], pixels[1], pixels[2], pixels[3]);
 			CGContextRelease(bitmap);
 		} else {
@@ -499,6 +602,110 @@ coreimage(void)
 		CGColorSpaceRelease(space);
 		CGImageRelease(image);
 	}
+}
+
+/* Explicit linear color spaces make the CPU reference independent of default gamma conversion. */
+static int coreimage_linear(void)
+{
+	@autoreleasepool {
+		CGColorSpaceRef linear = CGColorSpaceCreateWithName(kCGColorSpaceLinearSRGB);
+		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+		if (linear == NULL || device == nil) {
+			printf("metal_test: air79 FAIL linear: no color space or Metal device\n");
+			if (linear != NULL) CGColorSpaceRelease(linear);
+			return 0;
+		}
+		NSDictionary *options = @{kCIContextWorkingColorSpace:(__bridge id)linear,
+		    kCIContextOutputColorSpace:(__bridge id)linear};
+		printf("metal_test: air79 linear: create CIContext with native Metal device, linear input/working/output\n");
+		CIContext *context = [CIContext contextWithMTLDevice:device options:options];
+		if (context == nil) {
+			printf("metal_test: air79 FAIL linear: no CIContext\n");
+			CGColorSpaceRelease(linear);
+			return 0;
+		}
+		unsigned char input[64], output[64];
+		for (unsigned i = 0; i < 16; i++) {
+			input[4*i] = i * 17;
+			input[4*i+1] = 64 + (i % 4) * 32;
+			input[4*i+2] = 32 + (i / 4) * 48;
+			input[4*i+3] = 255;
+		}
+		memset(output, 0xa5, sizeof(output));
+		NSData *data = [NSData dataWithBytes:input length:sizeof(input)];
+		CIImage *source = [CIImage imageWithBitmapData:data bytesPerRow:16 size:CGSizeMake(4, 4)
+		    format:kCIFormatRGBA8 colorSpace:linear];
+		CIFilter *filter = [CIFilter filterWithName:@"CIColorInvert"];
+		[filter setValue:source forKey:kCIInputImageKey];
+		CIImage *result = [filter valueForKey:kCIOutputImageKey];
+		if (source == nil || filter == nil || result == nil) {
+			printf("metal_test: air79 FAIL linear: missing image or filter\n");
+			CGColorSpaceRelease(linear);
+			return 0;
+		}
+		printf("metal_test: air79 linear: render 16 distinct RGBA pixels, compare RGB=255-input, alpha=255, tolerance 1\n");
+		[context render:result toBitmap:output rowBytes:16 bounds:CGRectMake(0, 0, 4, 4)
+		    format:kCIFormatRGBA8 colorSpace:linear];
+		unsigned bad = 0, maximum = 0;
+		for (unsigned i = 0; i < sizeof(output); i++) {
+			unsigned expected = i % 4 == 3 ? 255 : 255 - input[i];
+			unsigned difference = output[i] > expected ? output[i] - expected : expected - output[i];
+			if (difference > maximum) maximum = difference;
+			if (difference > 1) {
+				if (bad < 8) printf("metal_test: air79 mismatch byte %u: got %u expected %u\n", i, output[i], expected);
+				bad++;
+			}
+		}
+		printf("metal_test: air79 linear: first %u %u %u %u; last %u %u %u %u; mismatched bytes %u/64, max error %u\n",
+		    output[0], output[1], output[2], output[3], output[60], output[61], output[62], output[63], bad, maximum);
+		printf("metal_test: air79 %s CoreImage linear inversion\n", bad == 0 ? "PASS" : "FAIL");
+		CGColorSpaceRelease(linear);
+		return bad == 0;
+	}
+}
+
+/*
+ * The plug-in asks for a directory for its shaders' cache before it will make a device: its
+ * strings name XDG_CACHE_HOME and ".cache/metal2vulkan", and, with neither set, a home
+ * directory this image does not have -- which is the "no-cachedir" it prints and then stops.
+ * This makes a directory that can be written, under the first of these that will have it, and
+ * sets XDG_CACHE_HOME to it before the first question about Metal is asked.
+ */
+static void
+shader_cache_dir(void)
+{
+	static const char *candidates[] = {
+		"/private/var/mobile/Library/Caches",
+		"/private/var/tmp",
+		"/redwood/cache",
+	};
+	char base[256] = { 0 };
+	int i;
+
+	@autoreleasepool {
+		printf("metal_test:   home directory: %s; XDG_CACHE_HOME: %s\n",
+		    NSHomeDirectory() != nil ? [NSHomeDirectory() UTF8String] : "(none)",
+		    getenv("XDG_CACHE_HOME") != NULL ? getenv("XDG_CACHE_HOME") : "(unset)");
+	}
+	for (i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {
+		char path[300];
+
+		mkdir(candidates[i], 0755);
+		/* both shapes it might append: "/metal2vulkan" and "/.cache/metal2vulkan" */
+		snprintf(path, sizeof(path), "%s/.cache", candidates[i]);
+		mkdir(path, 0755);
+		snprintf(path, sizeof(path), "%s/metal2vulkan", candidates[i]);
+		if (mkdir(path, 0755) == 0 || errno == EEXIST) {
+			snprintf(base, sizeof(base), "%s", candidates[i]);
+			break;
+		}
+	}
+	if (base[0] == 0) {
+		printf("metal_test:   no directory for the shader cache could be made\n");
+		return;
+	}
+	setenv("XDG_CACHE_HOME", base, 1);
+	printf("metal_test:   the shader cache directory: %s\n", base);
 }
 
 int
@@ -517,9 +724,15 @@ main(int argc, char **argv)
 	sigaction(SIGABRT, &sa, NULL);
 	sigaction(SIGTRAP, &sa, NULL);
 
+	/* before anything asks Metal: the plug-in wants a shader cache directory first */
+	shader_cache_dir();
+	printf("metal_test: air84 ordinary client: no explicit adapter installation\n");
+
 	/* one question, asked by a process of its own (see in_a_new_process) */
 	if (argc > 1) {
-		if (strcmp(argv[1], "ci-default") == 0) {
+		if (strcmp(argv[1], "ci-linear") == 0) {
+			return coreimage_linear() ? 0 : 1;
+		} else if (strcmp(argv[1], "ci-default") == 0) {
 			coreimage();
 		} else if (strcmp(argv[1], "ci-software") == 0) {
 			coreimage_options = @{ @"kCIContextUseSoftwareRenderer": @YES };
@@ -530,6 +743,10 @@ main(int argc, char **argv)
 		} else if (strcmp(argv[1], "ci-eagl-software") == 0) {
 			coreimage_over_eagl = 2;
 			coreimage();
+		} else if (strcmp(argv[1], "metal-device") == 0) {
+			the_device();
+		} else if (strcmp(argv[1], "metal-steps") == 0) {
+			metal_steps();
 		} else if (strcmp(argv[1], "plugins") == 0) {
 			plugins();
 		} else {
@@ -543,8 +760,11 @@ main(int argc, char **argv)
 	accelerators();
 	printf("metal_test: what the registry has that is a GPU\n");
 	gpu_services();
-	printf("metal_test: the device a program gets\n");
-	the_device();
+	if (in_a_new_process("the device a program gets", "metal-device", 20)) {
+		printf("metal_test: the device is wedged: the rest is not asked (a run that ends says more)\n");
+		return 0;
+	}
+	in_a_new_process("Metal's five steps, one by one", "metal-steps", 60);
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");

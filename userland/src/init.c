@@ -198,6 +198,13 @@ flash_root(const char *dev)
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");
+	{
+		struct stat ext_st;
+		if (stat(in_image("/Extensions"), &ext_st) == 0) {
+			ok = mount("bindfs", "/flash/System/Library/Extensions", MNT_RDONLY | MNT_UNION, (void *)in_image("/Extensions")) == 0;
+			check(ok, "our Metal extensions in /System/Library/Extensions (union)");
+		}
+	}
 	if (stat("/fw", &fw_st) == 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
@@ -820,6 +827,39 @@ read_whole(const char *path, char *buf, size_t size)
 	return (ssize_t)got;
 }
 
+/* Restore the framework's own resources from the RAM image, one leaf framework
+ * per union mount. Nested directories are not recursively merged by MNT_UNION. */
+static void
+mount_framework_resources(void)
+{
+    static const char *const frameworks[] = {
+        "QuartzCore.framework", "CoreImage.framework",
+        "MetalPerformanceShaders.framework/Frameworks/MPSCore.framework",
+        "MetalPerformanceShaders.framework/Frameworks/MPSImage.framework",
+        "MetalPerformanceShaders.framework/Frameworks/MPSFunctions.framework",
+        "MetalPerformanceShaders.framework/Frameworks/MPSMatrix.framework"
+    };
+    struct stat st;
+    if (stat(in_image("/FrameworkResources"), &st) != 0) return;
+    printf("\n-- air85 original framework resources from RAM --\n");
+    for (unsigned i = 0; i < sizeof(frameworks) / sizeof(frameworks[0]); i++) {
+        char from[512], to[512];
+        strcpy(from, join(base, "/FrameworkResources/", frameworks[i]));
+        strcpy(to, join("/System/Library/Frameworks/", frameworks[i], ""));
+        int ok = mount("bindfs", to, MNT_RDONLY | MNT_UNION, from) == 0;
+        if (!ok) printf("air85 resource mount: %s: %s\n", to, strerror(errno));
+        check(ok, to);
+    }
+    if (stat(in_image("/PrivateFrameworkResources/RenderBox.framework"), &st) == 0) {
+        char from[256];
+        strcpy(from, in_image("/PrivateFrameworkResources/RenderBox.framework"));
+        int ok = mount("bindfs", "/System/Library/PrivateFrameworks/RenderBox.framework",
+            MNT_RDONLY | MNT_UNION, from) == 0;
+        if (!ok) printf("air88 RenderBox resource mount: %s\n", strerror(errno));
+        check(ok, "air88 original RenderBox resources from RAM");
+    }
+}
+
 static void
 mount_writable(void)
 {
@@ -1407,6 +1447,60 @@ configure_vnodes(void)
 	}
 }
 
+/* The RAM System stores its cache in the OS cryptex. Expose its existing
+ * APFS directory at dyld's default path before the first dynamic exec. A
+ * synthetic alias keeps the original vnodes/volume; it writes no disk blocks. */
+static int
+configure_shared_cache(void)
+{
+    static const char *const source = "/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
+    static const char *const canonical = "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64";
+    unsigned char original[104], exposed[104];
+    struct stat st;
+    int ok = 1, fd;
+    printf("\n-- air86 cold dyld cache path --\n");
+    if (stat("/System/Library/Caches", &st) != 0) {
+        ok = synthetic_dir("/System/Library/Caches=/System/Cryptexes/OS/System/Library/Caches");
+    }
+    fd = open(source, O_RDONLY, 0);
+    ok = ok && fd >= 0 && pread(fd, original, sizeof(original), 0) == sizeof(original);
+    close(fd);
+    fd = open(canonical, O_RDONLY, 0);
+    ok = ok && fd >= 0 && pread(fd, exposed, sizeof(exposed), 0) == sizeof(exposed);
+    close(fd);
+    ok = ok && memcmp(original, exposed, sizeof(original)) == 0 && memcmp(exposed, "dyld_v1", 7) == 0;
+    if (ok) {
+        int entries = count_entries("/System/Library/Caches/com.apple.dyld");
+        printf("air86 cache path: canonical header equals Cryptex header; entries=%d uuid=", entries);
+        for (unsigned i = 88; i < 104; i++) printf("%02x", exposed[i]);
+        printf("\n");
+        ok = entries > 40;
+    } else {
+        printf("air86 cache path: cannot expose the existing Cryptex cache, errno=%d\n", errno);
+    }
+    check(ok, "air86 dyld default directory resolves the original System cache");
+    return ok;
+}
+
+static int
+check_cold_libsystem(void)
+{
+    char *argv[] = { "/redwood/bin/cache_probe", NULL };
+    char *envp[] = { "PATH=/bin:/usr/bin", "HOME=/", NULL };
+    int status = 0, ok;
+    printf("air86 stage: first dynamic exec; verify libSystem before launchd\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        execve(argv[0], argv, envp);
+        printf("air86 cache probe exec failed: errno=%d\n", errno);
+        _exit(127);
+    }
+    ok = pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    printf("air86 cache probe collected: pid=%d status=0x%x\n", pid, status);
+    check(ok, "air86 cold libSystem and exact shared cache are usable");
+    return ok;
+}
+
 int
 main(int argc, char **argv, char **envp)
 {
@@ -1441,6 +1535,24 @@ main(int argc, char **argv, char **envp)
 	}
 
 	show_system();
+    if (!configure_shared_cache()) {
+        printf("air86 STOP: cache path unavailable; halt before dynamic exec\n");
+        reboot(RB_HALT);
+        return 1;
+    }
+    if (!check_cold_libsystem()) {
+        printf("air86 STOP: libSystem preflight failed; halt before launchd\n");
+        reboot(RB_HALT);
+        return 1;
+    }
+	if (!flash_root_mode) {
+		struct stat ext_st;
+		if (stat(in_image("/Extensions"), &ext_st) == 0) {
+			int ext_ok = mount("bindfs", "/System/Library/Extensions", MNT_RDONLY | MNT_UNION, (void *)in_image("/Extensions")) == 0;
+			check(ext_ok, "our Metal extensions in /System/Library/Extensions (union)");
+		}
+	}
+	mount_framework_resources();
 	mount_writable();
 	restore_var();
 	test_files();

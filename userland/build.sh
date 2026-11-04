@@ -151,6 +151,7 @@ if [ -n "$PREBUILT" ]; then
 	done
 	cp obj/hello hello
 else
+	$DYN -o obj/cache_probe src/cache_probe.c
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
@@ -166,6 +167,8 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
+# The cold-cache preflight is a required init dependency.
+cp obj/cache_probe root/bin/cache_probe
 # The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
 # ends: the program and its job together, away from the iOS job list below, which several working
 # copies are editing at once.
@@ -390,9 +393,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
+# An image of ours alone (no sysimage in this copy): EXTRA's programs and etc/rc are still wanted --
+# stage0 execs this image's /sbin/init, and without etc/rc init halts right after its own checks.
+for f in $EXTRA; do cp "$f" root/bin/; done
+if [ -n "$RC" ]; then cp "$RC" root/etc/rc; fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/hakios.adreno.c, finds it in fw/
-if [ -d ../fw-gpu ]; then
+if [ -d ../fw-gpu ] && [ -n "$(ls -A ../fw-gpu 2>/dev/null)" ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
@@ -473,6 +480,10 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
+if [ "${NATIVE_METAL:-0}" = 1 ]; then
+	# The exact plugin pair and original Apple resources are local build inputs.
+	bash ./build-native-metal.sh root
+fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/hakios.image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
