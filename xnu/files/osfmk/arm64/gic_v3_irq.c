@@ -55,7 +55,8 @@
 #define GICD_IGRPMODR(n)        (0x0d00 + 4 * (n))
 #define GICD_IROUTER(n)         (0x6000 + 8 * (n))
 
-#define GICR_FRAME_SIZE         0x20000     /* RD_base + SGI_base per CPU */
+#define GICR_FRAME_SIZE         0x20000     /* RD_base + SGI_base per CPU: the usual spacing */
+#define GICR_FRAME_SIZE_LARGE   0x40000     /* the other spacing GICv3 allows: "redistributor-stride" */
 #define GICR_TYPER              0x0008
 #define GICR_TYPER_LAST         (1u << 4)
 #define GICR_WAKER              0x0014
@@ -80,6 +81,7 @@
 
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
+static vm_size_t   gicr_stride = GICR_FRAME_SIZE; /* how far apart the redistributor frames are */
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
 
 /*
@@ -399,7 +401,7 @@ gic_find_redistributor(void)
 	/* GICR_TYPER[63:32] packs Aff3.Aff2.Aff1.Aff0 */
 	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
 
-	for (vm_offset_t frame = gicr_base; frame + GICR_FRAME_SIZE <= gicr_base + gicr_size; frame += GICR_FRAME_SIZE) {
+	for (vm_offset_t frame = gicr_base; frame + gicr_stride <= gicr_base + gicr_size; frame += gicr_stride) {
 		uint64_t typer = *(volatile uint64_t *)(frame + GICR_TYPER);
 
 		if ((uint32_t)(typer >> 32) == affinity) {
@@ -437,6 +439,21 @@ gic_v3_irq_cpu_init(void)
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
 		gicr_size = reg[3];
+
+		/*
+		 * The frames are 0x20000 or 0x40000 apart, and only the firmware knows which: it says so in
+		 * "redistributor-stride". Boards that do not say get the smaller spacing.
+		 */
+		void const *stride_prop;
+		unsigned int stride_size;
+		if (SecureDTGetProperty(entry, "redistributor-stride", &stride_prop, &stride_size) == kSuccess &&
+		    stride_size >= sizeof(uint32_t)) {
+			uint32_t stride = *(uint32_t const *)stride_prop;
+
+			if (stride == GICR_FRAME_SIZE || stride == GICR_FRAME_SIZE_LARGE) {
+				gicr_stride = stride;
+			}
+		}
 		if (gicd_base == 0 || gicr_base == 0) {
 			panic("gic: cannot map the distributor/redistributor");
 		}
@@ -501,8 +518,8 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
-	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	kprintf("gic: v3, frames %u bytes apart, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
+	    (unsigned)gicr_stride, (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

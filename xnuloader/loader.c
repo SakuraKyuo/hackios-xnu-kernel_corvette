@@ -518,6 +518,7 @@ struct platform {
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
 	uint64_t gic_redist_size;        /* bytes of redistributor frames: one frame per core */
+	uint64_t gic_redist_stride;      /* bytes between frames: 0x20000, or 0x40000 on some SoCs */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -530,7 +531,7 @@ struct platform {
 
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
-	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .gic_redist_size = 0x100000, .uart = 0x09000000, .psci_hvc = 1,
+	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .gic_redist_size = 0x100000, .gic_redist_stride = 0x20000, .uart = 0x09000000, .psci_hvc = 1,
 	.cores = 8, .core_shift = 0,
 	/*
 	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
@@ -543,7 +544,7 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .gic_redist_size = 0x100000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .gic_redist_size = 0x100000, .gic_redist_stride = 0x20000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
@@ -557,7 +558,7 @@ static const struct platform platform_redwood = {
 static const struct platform platform_corvette = {
 	/* OnePlus Ace 3 Pro, SM8650 (Pineapple). Core numbers and the GIC come from its device tree. */
 	.name = "corvette", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .gic_redist_size = 0x200000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .gic_redist_size = 0x200000, .gic_redist_stride = 0x40000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-1 are Cortex-A520s (capacity 0x400 in the device tree), 2-6 Cortex-A720s (0x700) and
@@ -3262,6 +3263,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
 	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, plat->gic_redist_size };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	dt_prop_u32(&w, "redistributor-stride", (uint32_t)plat->gic_redist_stride);
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
