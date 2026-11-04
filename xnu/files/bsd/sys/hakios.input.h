@@ -115,6 +115,7 @@ void hakios_gpu_mapped(void);
 void hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void *start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+void hakios_gpu_request_context_reset(void);
 bool hakios_gpu_done(uint32_t fence);
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);

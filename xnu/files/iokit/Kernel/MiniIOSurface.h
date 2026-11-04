@@ -156,6 +156,8 @@ public:
  * A surface found or made here is held until MiniIOSurfaceDrop().
  */
 MiniIOSurface * MiniIOSurfaceCopy(uint32_t sid);
+/* Exact pixel-allocation match for a prepared native GPU import; returned surface is held. */
+MiniIOSurface * MiniIOSurfaceCopyForMemory(IOMemoryDescriptor * memory, uint64_t size);
 /*
  * What making and freeing surfaces has cost since this was last asked: how many, microseconds
  * each; how many got memory that was kept from one before.

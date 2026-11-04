@@ -1980,7 +1980,7 @@ synaptics_report(void)
 		}
 		contact[i].seen = true;
 		if (!contact[i].down) {
-			printf("synaptics: down at %u, %u (of %u x %u)\n", seen.last_x, seen.last_y, max_x, max_y);
+
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, i, x, y);
 		} else if ((contact[i].x != x || contact[i].y != y) && syna_move_due()) {
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, i, x, y);
@@ -2793,10 +2793,13 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		before = looked;
 		if (tick % (60 * (1000000 / poll_us)) == 0) {
-			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+			int touch_debug = 0;
+			int interrupt_high = gpio_get(PIN_INT);
+			PE_parse_boot_argn("touch_debug", &touch_debug, sizeof(touch_debug));
+			if (touch_debug) printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    interrupt_high ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
 		}
 		sleep_us(poll_us);
 	}

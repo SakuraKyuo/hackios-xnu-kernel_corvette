@@ -744,6 +744,53 @@ MiniIOSurfaceCopy(uint32_t sid)
 	return s;
 }
 
+/*
+ * A native Metal import carries a user address, not an IOSurface ID. Match the complete
+ * prepared pixel allocation by physical pages, never by an address from another task.
+ * Only whole, non-wrapped, zero-offset surfaces are supported here; unmatched buffers
+ * remain ordinary imports. gSurfaceLock protects the table and its holder count.
+ */
+MiniIOSurface *
+MiniIOSurfaceCopyForMemory(IOMemoryDescriptor * memory, uint64_t size)
+{
+	if (gSurfaceLock == NULL || memory == NULL || size == 0 || memory->getLength() != size) {
+		return NULL;
+	}
+	IOByteCount length = 0;
+	addr64_t first = memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+	if (first == 0) {
+		return NULL;
+	}
+	MiniIOSurface * found = NULL;
+	IOLockLock(gSurfaceLock);
+	for (uint32_t sid = 1; sid < MINISURF_TABLE_SIZE; sid++) {
+		MiniIOSurface * s = gSurfaceTable[sid];
+		if (s == NULL || s->client != NULL || s->info.offset != 0 || s->info.allocSize != size) {
+			continue;
+		}
+		addr64_t pixels = s->memory->getPhysicalSegment(PAGE_SIZE, &length, kIOMemoryMapperNone);
+		if (pixels != first) {
+			continue;
+		}
+		bool match = true;
+		for (uint64_t offset = 0; offset < size; offset += 4096) {
+			addr64_t a = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+			addr64_t b = s->memory->getPhysicalSegment(PAGE_SIZE + offset, &length, kIOMemoryMapperNone);
+			if (a == 0 || a != b) {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
+			surfaceHold(s);
+			found = s;
+			break;
+		}
+	}
+	IOLockUnlock(gSurfaceLock);
+	return found;
+}
+
 /* How many surfaces there are and how much (wired) memory they hold: for the kernel's memory report. */
 extern "C" void
 MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)

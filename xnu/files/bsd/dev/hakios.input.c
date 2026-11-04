@@ -45,6 +45,28 @@ hakios_tl(const char *format, ...)
 	loader_log_line(line);
 }
 
+/* Normal GPU tracing is opt-in; failures still use hakios_tl directly. */
+bool
+hakios_gpu_debug(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        uint32_t value = 0;
+        enabled = PE_parse_boot_argn("gpu_debug", &value, sizeof(value)) && value != 0;
+    }
+    return enabled != 0;
+}
+
+void hakios_gpu_trace(const char *format, ...) __printflike(1, 2);
+void
+hakios_gpu_trace(const char *format, ...)
+{
+    if (!hakios_gpu_debug()) return;
+    char line[192]; va_list arguments;
+    va_start(arguments, format); vsnprintf(line, sizeof(line), format, arguments); va_end(arguments);
+    loader_log_line(line);
+}
+
 static bool
 latency_lines(void)
 {

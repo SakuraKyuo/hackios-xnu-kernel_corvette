@@ -54,6 +54,13 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <signal.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+#if defined(GALLIUM_FREEDRENO)
+#include "frontend/winsys_handle.h"
+#endif
 /* <sys/ucontext.h>, not <ucontext.h>: the latter refuses to be included
  * without _XOPEN_SOURCE on the iOS SDK, and userland/src/inject.c takes the
  * same route for the same reason.
@@ -152,6 +159,214 @@ watch_for_faults(void)
 #else
 static void watch_for_faults(void) {}
 #endif
+
+#ifdef __APPLE__
+/*
+ * --panel: the picture on the phone's panel.
+ *
+ * The framebuffer (iokit/Kernel/MiniIOMobileFramebuffer.cpp) shows a surface a swap names, once the
+ * GPU is done with it: present() waits on the fence of the submission that named the surface's
+ * pixels and show() copies the surface onto the panel. The window server's frames go that way
+ * every day; a test program puts its own picture there the same way -- an IOSurface as the render
+ * target (the memory the window server's layers are made of), the GPU told to draw into it, and
+ * SwapBegin/SwapEnd with that surface.
+ *
+ * The request's layout is the framebuffer's (its SWAP_* constants, worked out from the iOS side).
+ */
+#define PANEL_SWAP_SIZE                 0x46c
+#define PANEL_SWAP_ID                   0x50
+#define PANEL_SWAP_SURFACE              0x54
+#define PANEL_SWAP_SOURCE               0x64    /* x, y, width, height in the surface */
+#define PANEL_SWAP_ENABLED              0xa4
+#define PANEL_SWAP_DEST                 0xc4    /* x, y, width, height on the display */
+#define PANEL_SWAP_LAYERS_SET           0x104   /* bit per layer given in this swap */
+#define PANEL_SELECTOR_GET_DISPLAY_SIZE 8
+#define PANEL_SELECTOR_SWAP_BEGIN       4
+#define PANEL_SELECTOR_SWAP_END         5
+
+static void *panelLibrary;
+static io_connect_t panelFramebuffer;           /* 0: not opened yet */
+static uint32_t panelSid;
+
+/* IOSurface.framework is not in air_run's link line (Mesa's build knows IOKit and CoreFoundation),
+ * and the port's own library takes IOSurfaces by another route. Here it is found by name. */
+static void *
+panel_symbol(const char *name)
+{
+   void *symbol;
+
+   if (panelLibrary == NULL) {
+      panelLibrary = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+      if (panelLibrary == NULL) {
+         fprintf(stderr, "air_run: --panel: IOSurface.framework: %s\n", dlerror());
+         return NULL;
+      }
+   }
+   symbol = dlsym(panelLibrary, name);
+   if (symbol == NULL)
+      fprintf(stderr, "air_run: --panel: IOSurface.framework has no %s\n", name);
+   return symbol;
+}
+
+/* A surface of the pixels, 32 bits each, blue first: the kind the framebuffer shows. */
+static void *
+panel_surface_create(uint32_t width, uint32_t height)
+{
+   typedef void *(*create_fn)(CFDictionaryRef);
+   typedef uint32_t (*id_fn)(void *);
+   create_fn create = (create_fn)panel_symbol("IOSurfaceCreate");
+   id_fn get_id = (id_fn)panel_symbol("IOSurfaceGetID");
+   CFMutableDictionaryRef properties;
+   CFStringRef key;
+   CFNumberRef number;
+   void *surface;
+   int value;
+
+   if (create == NULL || get_id == NULL)
+      return NULL;
+   properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                          &kCFTypeDictionaryValueCallBacks);
+   if (properties == NULL)
+      return NULL;
+#define PANEL_PROPERTY(name, number_value) \
+   do { \
+      key = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8); \
+      value = (number_value); \
+      number = CFNumberCreate(NULL, kCFNumberIntType, &value); \
+      CFDictionarySetValue(properties, key, number); \
+      CFRelease(number); \
+      CFRelease(key); \
+   } while (0)
+   PANEL_PROPERTY("IOSurfaceWidth", (int)width);
+   PANEL_PROPERTY("IOSurfaceHeight", (int)height);
+   PANEL_PROPERTY("IOSurfacePixelFormat", 0x42475241 /* 'BGRA' */);
+   PANEL_PROPERTY("IOSurfaceBytesPerElement", 4);
+#undef PANEL_PROPERTY
+   surface = create(properties);
+   CFRelease(properties);
+   if (surface != NULL)
+      panelSid = get_id(surface);
+   return surface;
+}
+
+static bool
+panel_framebuffer_open(void)
+{
+   io_service_t service;
+
+   if (panelFramebuffer != 0)
+      return true;
+   service = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("IOMobileFramebuffer"));
+   if (service == 0) {
+      fprintf(stderr, "air_run: --panel: there is no IOMobileFramebuffer service\n");
+      return false;
+   }
+   if (IOServiceOpen(service, mach_task_self(), 0, &panelFramebuffer) != 0) {
+      IOObjectRelease(service);
+      fprintf(stderr, "air_run: --panel: IOMobileFramebuffer would not open\n");
+      return false;
+   }
+   IOObjectRelease(service);
+   return true;
+}
+
+static bool
+panel_display_size(uint32_t *width, uint32_t *height)
+{
+   uint64_t size[2] = { 0, 0 };
+   uint32_t count = 2;
+
+   if (!panel_framebuffer_open())
+      return false;
+   if (IOConnectCallScalarMethod(panelFramebuffer, PANEL_SELECTOR_GET_DISPLAY_SIZE, NULL, 0,
+                                 size, &count) != KERN_SUCCESS || count < 2)
+      return false;
+   *width = (uint32_t)size[0];
+   *height = (uint32_t)size[1];
+   return *width != 0 && *height != 0;
+}
+
+static void
+panel_word(uint8_t *place, int32_t value)
+{
+   memcpy(place, &value, sizeof(value));
+}
+
+/* The swap the window server makes: layer 0 is this surface, the whole of it, over the whole display. */
+static bool
+panel_swap(uint32_t sid, uint32_t surfaceWidth, uint32_t surfaceHeight)
+{
+   uint8_t request[PANEL_SWAP_SIZE];
+   uint8_t answer[0x40];
+   size_t answerSize = sizeof(answer);
+   uint64_t swap = 0;
+   uint32_t count = 1;
+   uint32_t width = 0, height = 0;
+   int32_t source[4], destination[4];
+   kern_return_t result;
+
+   if (!panel_display_size(&width, &height))
+      return false;
+   result = IOConnectCallScalarMethod(panelFramebuffer, PANEL_SELECTOR_SWAP_BEGIN, NULL, 0, &swap, &count);
+   if (result != KERN_SUCCESS || count < 1) {
+      fprintf(stderr, "air_run: --panel: the framebuffer gave no swap number (%#x)\n", (unsigned)result);
+      return false;
+   }
+   source[0] = 0; source[1] = 0;
+   source[2] = (int32_t)surfaceWidth; source[3] = (int32_t)surfaceHeight;
+   destination[0] = 0; destination[1] = 0;
+   destination[2] = (int32_t)width; destination[3] = (int32_t)height;
+   memset(request, 0, sizeof(request));
+   panel_word(request + PANEL_SWAP_ID, (int32_t)swap);
+   panel_word(request + PANEL_SWAP_SURFACE, (int32_t)sid);
+   memcpy(request + PANEL_SWAP_SOURCE, source, sizeof(source));
+   panel_word(request + PANEL_SWAP_ENABLED, 1);
+   memcpy(request + PANEL_SWAP_DEST, destination, sizeof(destination));
+   panel_word(request + PANEL_SWAP_LAYERS_SET, 1);
+   result = IOConnectCallStructMethod(panelFramebuffer, PANEL_SELECTOR_SWAP_END, request, sizeof(request),
+                                      answer, &answerSize);
+   if (result != KERN_SUCCESS) {
+      fprintf(stderr, "air_run: --panel: the swap was refused (%#x)\n", (unsigned)result);
+      return false;
+   }
+   printf("air_run: --panel: swap %llu taken: surface %u is on its way to the panel, the framebuffer "
+          "waiting for the GPU itself\n", (unsigned long long)swap, sid);
+   return true;
+}
+
+#if defined(GALLIUM_FREEDRENO)
+/*
+ * The surface's memory as a render target: the kernel's GPU driver makes a buffer of it (the
+ * surface's ID is the "file descriptor", see tools/mesa/freedreno-darwin.patch), the way
+ * osmesa_surface_resource() does for the window server's layers.
+ */
+static struct pipe_resource *
+panel_resource(struct pipe_screen *screen, uint32_t surface)
+{
+   struct hakios_drm_surface description = { .surface = surface };
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+   };
+   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
+
+   if (hakios_drm_surface(-1, &description) != 0)
+      return NULL;
+   if (description.pixel_format != 0x42475241 /* 'BGRA' */ || description.planes != 0)
+      return NULL;
+   templ.width0 = description.width;
+   templ.height0 = description.height;
+   handle.handle = surface;
+   handle.stride = description.row_bytes;
+   handle.offset = description.offset;
+   handle.size = description.size;
+   return screen->resource_from_handle(screen, &templ, &handle, 0);
+}
+#endif
+#endif /* __APPLE__ */
 
 /* set by --library: the fill below is then floats, for the reason given there */
 static bool library_fill = false;
@@ -271,6 +486,31 @@ static int
 type_size_vec4(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
+}
+
+/*
+ * --solid: one quad, one colour, no input at all. (0, 1, 0, 1) is exact in
+ * float and unmistakable beside the red clear, so the pixel says which of the
+ * two writes reached the target.
+ */
+static nir_shader *
+solid_fragment_shader(const nir_shader_compiler_options * options)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, options, "solid");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                           glsl_vec4_type(), "colour");
+   out->data.location = FRAG_RESULT_DATA0;   /* what air_to_nir produces for a colour output */
+   out->data.driver_location = 0;
+   nir_store_var(&b, out, nir_imm_vec4(&b, 0.0f, 1.0f, 0.0f, 1.0f), 0xf);
+   /* ir3 sizes its table of outputs as nir->num_outputs * 4 and indexes it by
+    * the store's slot (ir3_compiler_nir.c, ctx->outputs). Left at zero, the
+    * table is empty and the store writes past it -- which is what the phone
+    * showed: "failed assert: idx < ctx->noutputs", and then the log stopped.
+    * air_to_nir counts its own outputs the same way (air_to_nir.c, num_outputs++);
+    * quad_vertex_shader above says so explicitly for the same reason.
+    */
+   b.shader->num_outputs = 1;
+   return b.shader;
 }
 
 static void
@@ -761,6 +1001,21 @@ main(int argc, char **argv)
     * modules were never run at all.
     */
    bool want_library = false;
+   /* --solid skips AIR entirely and draws one literal colour: a pixel that is
+    * not that colour then says the draw never reached the render target, not
+    * that the translated shader computed something else. It is the harness's
+    * way of telling the pipeline and the compiler apart.
+    */
+   bool want_solid = false;
+   /* --panel draws into an IOSurface and hands it to the framebuffer's swap, so the picture is on
+    * the panel and not only in a number this program prints.
+    */
+   bool want_panel = false;
+   /* --frames N repeats the submission, the fence wait and the swap N times: a path that
+    * lands once and then stalls is not a working path, and a swap taken once and then
+    * wedged is not either.
+    */
+   unsigned want_frames = 1;
    /* --buffer FILE is AIR_RUN_BUFFER as an argument, and it exists because the
     * device has no shell to set one with. iOS 16.5's own root carries no sh at
     * all -- /bin holds df and ps -- and the job list that runs this is read by
@@ -779,6 +1034,29 @@ main(int argc, char **argv)
          want_library = library_fill = true;
          argv++;
          argc--;
+      } else if (!strcmp(argv[1], "--solid")) {
+         want_solid = true;
+         argv++;
+         argc--;
+      } else if (!strcmp(argv[1], "--panel")) {
+         want_panel = true;
+         argv++;
+         argc--;
+      } else if (!strcmp(argv[1], "--sysmem")) {
+         /* Render straight into system memory: with tiling on, the draw lands
+          * in the GMEM buffer and a resolve pass copies it out, and a missing
+          * or failing resolve is one more way for a correct draw to read back
+          * as nothing. freedreno's own name for this is FD_MESA_DEBUG=sysmem.
+          */
+         setenv("FD_MESA_DEBUG", "sysmem", 1);
+         argv++;
+         argc--;
+      } else if (!strcmp(argv[1], "--frames") && argc > 2) {
+         want_frames = strtoul(argv[2], NULL, 0);
+         if (want_frames == 0)
+            want_frames = 1;
+         argv += 2;
+         argc -= 2;
       } else if (!strcmp(argv[1], "--buffer") && argc > 2) {
          setenv("AIR_RUN_BUFFER", argv[2], 1);
          argv += 2;
@@ -788,7 +1066,8 @@ main(int argc, char **argv)
       }
    }
    if (argc < 2) {
-      fprintf(stderr, "usage: air_run [--disasm] [--library] [--buffer FILE] "
+      fprintf(stderr, "usage: air_run [--disasm] [--library] [--buffer FILE] [--solid] [--panel] [--frames N] "
+                      "[--sysmem] "
                       "FILE[.metallib] [FUNCTION]\n");
       return 2;
    }
@@ -886,7 +1165,45 @@ main(int argc, char **argv)
       fprintf(stderr, "air_run: no gallium screen\n");
       return 1;
    }
+   /* Named before the line is printed and not after it: with --solid the
+    * metallib's function is picked and then never translated, and a run that
+    * still announced clearVertex left the log unable to say which path ran.
+    */
+   if (want_solid)
+      name = "solid";
    printf("air_run: %s on %s (%s)\n", name, screen->get_name(screen), how);
+
+#if defined(__APPLE__) && defined(GALLIUM_FREEDRENO)
+   struct pipe_resource *panel = NULL;
+
+   if (want_panel) {
+      uint32_t width = 0, height = 0;
+      void *surface;
+
+      if (!panel_display_size(&width, &height)) {
+         fprintf(stderr, "air_run: --panel: no display to ask the size of\n");
+         return 1;
+      }
+      surface = panel_surface_create(width, height);
+      if (surface == NULL) {
+         fprintf(stderr, "air_run: --panel: no IOSurface of %ux%u\n", width, height);
+         return 1;
+      }
+      panel = panel_resource(screen, panelSid);
+      CFRelease(surface);
+      if (panel == NULL) {
+         fprintf(stderr, "air_run: --panel: surface %u is not a buffer of this screen\n", panelSid);
+         return 1;
+      }
+      printf("air_run: --panel: IOSurface %u, %ux%u, is the render target (a buffer of the GPU, "
+             "B8G8R8A8)\n", panelSid, width, height);
+   }
+#else
+   if (want_panel) {
+      fprintf(stderr, "air_run: --panel: this air_run has no framebuffer to talk to\n");
+      return 1;
+   }
+#endif
 
    const void *options =
       screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_FRAGMENT);
@@ -901,12 +1218,20 @@ main(int argc, char **argv)
    struct air_to_nir_options air_options = { .constants = fc, .num_constants = num_fc,
                                             .library_wrapper = want_library };
    struct air_shader_info info;
-   const char *err;
-   nir_shader *fs = air_to_nir(ctx, bitcode, bitcode_size, NULL, &air_options, options,
-                               &info, &err);
-   if (!fs) {
-      fprintf(stderr, "air_run: %s: %s\n", name, err);
-      return 1;
+   const char *err = NULL;
+   nir_shader *fs;
+   if (want_solid) {
+      bzero(&info, sizeof(info));
+      info.stage = MESA_SHADER_FRAGMENT;
+      fs = solid_fragment_shader(options);
+      name = "solid";
+   } else {
+      fs = air_to_nir(ctx, bitcode, bitcode_size, NULL, &air_options, options,
+                      &info, &err);
+      if (!fs) {
+         fprintf(stderr, "air_run: %s: %s\n", name, err);
+         return 1;
+      }
    }
    if (info.stage == MESA_SHADER_COMPUTE)
       return dispatch_kernel(screen, &info, fs, name, how);
@@ -1014,6 +1339,40 @@ main(int argc, char **argv)
 
    struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
 
+   /* The port's memory, the processor's side alone: a texture written and
+    * read back through the map, with no GPU involved. Nothing had exercised
+    * this yet, and a map that does not round-trip makes every GPU answer read
+    * as zero -- the shape of result the first run on the phone gave.
+    */
+   if (pipe) {
+      struct pipe_box whole = { .width = WIDTH, .height = HEIGHT, .depth = 1 };
+      struct pipe_resource *probe = screen->resource_create(screen,
+         &(struct pipe_resource){ .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT, .width0 = WIDTH, .height0 = HEIGHT,
+            .depth0 = 1, .array_size = 1, .bind = PIPE_BIND_SAMPLER_VIEW });
+      struct pipe_transfer *xfer = NULL;
+      uint32_t *words = probe ?
+         pipe->texture_map(pipe, probe, 0, PIPE_MAP_WRITE, &whole, &xfer) : NULL;
+      if (!words) {
+         printf("air_run: the port's memory: a texture could not be mapped\n");
+      } else {
+         for (unsigned i = 0; i < WIDTH * HEIGHT * 4; i++)
+            words[i] = 0x12345678;
+         pipe->texture_unmap(pipe, xfer);
+         uint32_t *again = pipe->texture_map(pipe, probe, 0, PIPE_MAP_READ, &whole, &xfer);
+         unsigned wrong = ~0u;
+         if (again) {
+            wrong = 0;
+            for (unsigned i = 0; i < WIDTH * HEIGHT * 4; i++)
+               wrong += again[i] != 0x12345678;
+            pipe->texture_unmap(pipe, xfer);
+         }
+         printf("air_run: the port's memory: a texture the processor wrote reads back %s\n",
+                wrong == 0 ? "the same" :
+                wrong == ~0u ? "nothing (the second map failed)" : "different words");
+      }
+   }
+
    /* One target per render target the shader writes: a shader whose outputs
     * outnumber the framebuffer's attachments draws nothing at all, which
     * looks like a translation that produced no stores.
@@ -1033,11 +1392,23 @@ main(int argc, char **argv)
       .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
    };
    struct pipe_resource *target = NULL;
+#if defined(__APPLE__) && defined(GALLIUM_FREEDRENO)
+   if (panel != NULL) {
+      /* the surface is BGRA and of its own size: the shader's output goes into it as it is */
+      templ.format = panel->format;
+      templ.width0 = panel->width0;
+      templ.height0 = panel->height0;
+   }
+#endif
    struct pipe_framebuffer_state fb = {
-      .width = WIDTH, .height = HEIGHT, .nr_cbufs = num_rt,
+      .width = templ.width0, .height = templ.height0, .nr_cbufs = num_rt,
    };
    for (unsigned i = 0; i < num_rt; i++) {
       struct pipe_resource *res = screen->resource_create(screen, &templ);
+#if defined(__APPLE__) && defined(GALLIUM_FREEDRENO)
+      if (panel != NULL && i == read_rt)
+         res = panel;                   /* (the surface's, not ours to free) */
+#endif
       fb.cbufs[i] = pipe->create_surface(pipe, res,
          &(struct pipe_surface){ .format = templ.format });
       if (i == read_rt)
@@ -1046,8 +1417,8 @@ main(int argc, char **argv)
    pipe->set_framebuffer_state(pipe, &fb);
 
    pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
-      .scale = { WIDTH / 2.0f, HEIGHT / 2.0f, 1.0f },
-      .translate = { WIDTH / 2.0f, HEIGHT / 2.0f, 0.0f },
+      .scale = { fb.width / 2.0f, fb.height / 2.0f, 1.0f },
+      .translate = { fb.width / 2.0f, fb.height / 2.0f, 0.0f },
    });
 
    void *blend = pipe->create_blend_state(pipe, &(struct pipe_blend_state){
@@ -1232,16 +1603,62 @@ main(int argc, char **argv)
    });
    pipe->bind_fs_state(pipe, fs_cso);
 
+   /* --solid paints one quad green over a red clear. Green is the whole way,
+    * red is the clear alone (so the draw was dropped), zero is neither -- and
+    * the round-trip above then says whether the map is at fault.
+    */
    union pipe_color_union clear = { .ui = { 0, 0, 0, 0 } };
-   pipe->clear(pipe, PIPE_CLEAR_COLOR, NULL, &clear, 0.0, 0);
+   if (want_solid)
+      clear = (union pipe_color_union){ .f = { 1.0f, 0.0f, 0.0f, 1.0f } };
 
    struct pipe_draw_info draw = {
       .mode = MESA_PRIM_TRIANGLE_STRIP, .index_bounds_valid = true,
       .max_index = 3, .instance_count = 1,
    };
    struct pipe_draw_start_count_bias sc = { .start = 0, .count = 4 };
-   pipe->draw_vbo(pipe, &draw, 0, NULL, &sc, 1);
-   pipe->flush(pipe, NULL, 0);
+
+   unsigned frames = want_frames ? want_frames : 1;
+
+   for (unsigned frame = 0; frame < frames; frame++) {
+      pipe->clear(pipe, PIPE_CLEAR_COLOR, NULL, &clear, 0.0, 0);
+      pipe->draw_vbo(pipe, &draw, 0, NULL, &sc, 1);
+
+      /* Wait on the draw's fence before the pixel is read. The map below asks
+       * the kernel whether the GPU is done with the buffer (CPU_PREP), and that
+       * question is answered at once when the fence has not landed yet -- the
+       * first run on the phone came back with zeros for that reason. Two seconds
+       * is a stop, not a hang: if the fence never lands, the run still ends and
+       * says so.
+       */
+      struct pipe_fence_handle *fence = NULL;
+      pipe->flush(pipe, &fence, 0);
+      if (fence) {
+         bool landed = screen->fence_finish(screen, NULL, fence, 2000000000ull);
+
+         if (frames > 1)
+            printf("air_run: frame %u/%u: the draw's fence %s\n", frame + 1, frames,
+                   landed ? "landed" : "did not land within 2 s");
+         else
+            printf("air_run: the draw's fence %s\n", landed ? "landed" : "did not land within 2 s");
+         screen->fence_reference(screen, &fence, NULL);
+      }
+
+#if defined(__APPLE__) && defined(GALLIUM_FREEDRENO)
+      if (panel != NULL) {
+         /* The draw's fence landed above: the kernel's GPU driver has the surface's last submission
+          * recorded against it, so the framebuffer's wait is satisfied and the picture goes to the
+          * panel through the same show() the window server's frames go through.
+          */
+         if (panel_swap(panelSid, panel->width0, panel->height0)) {
+            if (frames > 1)
+               printf("air_run: --panel: frame %u/%u: THE PICTURE THE GPU DREW IS ON THE PANEL\n",
+                      frame + 1, frames);
+            else
+               printf("air_run: --panel: THE PICTURE THE GPU DREW IS ON THE PANEL\n");
+         }
+      }
+#endif
+   }
 
    /* the pixel */
    struct pipe_transfer *xfer;
@@ -1269,11 +1686,53 @@ main(int argc, char **argv)
       else
          printf("  %u\n", ((uint32_t *)pix)[c]);
    }
+   {
+      /* Sixteen words rather than the four floats above, so that a zero is a
+       * statement about the memory and not about one pixel: a red clear is
+       * 3f800000 00000000 00000000 3f800000, a green quad 00000000 3f800000
+       * 00000000 3f800000, and sixteen zeros say the core never wrote the page.
+       */
+      const uint32_t *words = pix;
+      unsigned zeros = 0;
+
+      printf("air_run: the target's first sixteen words:");
+      for (unsigned i = 0; i < 16; i++) {
+         printf(" %08x", words[i]);
+         zeros += words[i] == 0;
+      }
+      printf("  (%u of them are zero)\n", zeros);
+   }
    pipe->texture_unmap(pipe, xfer);
 
    printf("air_run: drew %ux%u into %s, %u render target%s\n",
-          WIDTH, HEIGHT, util_format_short_name(rt_format), num_rt,
+          fb.width, fb.height, util_format_short_name(rt_format), num_rt,
           num_rt == 1 ? "" : "s");
+
+   /* The target's memory, the processor's side. The probe texture above proves
+    * that a map round-trips; it does not prove that this map reaches the pages
+    * the kernel handed the GPU, and a map of some other allocation would read
+    * as zeros for every pixel the core wrote.
+    */
+   bool probe_target = target != NULL;
+#if defined(__APPLE__) && defined(GALLIUM_FREEDRENO)
+   probe_target = probe_target && panel == NULL;        /* (the panel would show that word) */
+#endif
+   if (probe_target) {
+      struct pipe_box whole = { .width = fb.width, .height = fb.height, .depth = 1 };
+      uint32_t *over = pipe->texture_map(pipe, target, 0, PIPE_MAP_WRITE, &whole, &xfer);
+
+      if (over) {
+         uint32_t *back;
+
+         over[0] = 0x12345678;
+         pipe->texture_unmap(pipe, xfer);
+         back = pipe->texture_map(pipe, target, 0, PIPE_MAP_READ, &whole, &xfer);
+         printf("air_run: the processor wrote 0x12345678 over the target and read back %s\n",
+                !back ? "nothing" : back[0] == 0x12345678 ? "the same" : "something else");
+         if (back)
+            pipe->texture_unmap(pipe, xfer);
+      }
+   }
 
    pipe->destroy(pipe);
    screen->destroy(screen);

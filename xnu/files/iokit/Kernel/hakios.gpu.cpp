@@ -38,11 +38,19 @@
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
+
+extern "C" {
+#include <console/video_console.h>
+extern struct vc_info vinfo;
+void proc_selfname(char * buf, int size);
+}
 #include <sys/systm.h>
 
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" void hakios_gpu_trace(const char * format, ...) __printflike(1, 2);
+extern "C" bool hakios_gpu_debug(void);
 
 extern "C" {
 /* bsd/dev/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
@@ -54,10 +62,15 @@ bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 void hakios_gpu_mapped(void);
 void hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
+void hakios_gpu_target_words(uint32_t * words, uint32_t count);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+void hakios_gpu_write_probe(uint64_t address);
+void hakios_gpu_request_context_reset(void);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 uint32_t hakios_gpu_last(void);
+bool hakios_gpu_idle_now(const char * what);
+bool hakios_gpu_await_idle(uint32_t ms);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
@@ -84,6 +97,7 @@ enum {
 	kMsmSubmitQueueQuery    = 0x4c,
 	kHakiosSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
 	kHakiosShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+	kHakiosLog             = 0x80,         /* ours: a program's line into the loader's log (what fastboot reads back) */
 };
 
 struct msm_timespec {
@@ -152,6 +166,10 @@ struct hakios_show {
 	uint64_t pixels;
 	uint32_t width, height, rowBytes, pad;
 };
+struct hakios_log {
+	uint32_t length;                        /* the bytes of text that follow */
+	char text[188];
+};
 
 #define kHakiosDescribe        0xffffffffu
 
@@ -160,12 +178,27 @@ struct hakios_show {
 #define MSM_INFO_SET_NAME       2
 #define MSM_INFO_GET_FLAGS      5
 #define MSM_BO_GPU_READONLY     0x00000002
+#define MSM_BO_CACHED           0x00010000
 #define MSM_PREP_NOSYNC         0x04
 #define MSM_SUBMIT_CMD_BUF      1
 #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
 
 #define GPU_BUFFERS             8192            /* a client's, at most */
 #define GPU_BUFFER_MAX          (256u << 20)
+#define GPU_ADDRESSES_START     0x20000000ull
+#define GPU_ADDRESSES_SIZE      0xe0000000ull
+/* Carved from the existing low-4G allocator; no additional GPU address bits. */
+#define GPU_NATIVE_VA_SIZE       (256ull << 20)
+#define GPU_NATIVE_COMPOSITOR_VA_SIZE (512ull << 20)
+
+/* A compositor's fixed pools alone consume 128-192 MiB. Reserve its VA from
+ * the same low-4G allocator; this is virtual capacity, not physical memory. */
+static uint64_t
+nativeVaSizeForProcess(const char *name)
+{
+    return strcmp(name, "backboardd") == 0 ? GPU_NATIVE_COMPOSITOR_VA_SIZE : GPU_NATIVE_VA_SIZE;
+}
+
 #define GPU_SUBMIT_CMDS         128
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
@@ -173,6 +206,7 @@ struct hakios_show {
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
+static uint32_t gNativeClientId;
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 
@@ -207,9 +241,9 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
 		IOLockLock(gGPULock);
 	}
-	if (milliseconds >= 1000 && !gGPUReported) {
+	if (!gGPUReported && milliseconds > 0) {
 		gGPUReported = true;
-		hakios_gpu_report("no answer");
+		hakios_gpu_report("wait timeout");
 	}
 	return false;
 }
@@ -217,14 +251,45 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 {
-	uint32_t fence = surface->drawn;
-	bool done = true;
-
-	if (fence != 0 && gGPULock != NULL) {
-		IOLockLock(gGPULock);
-		done = !hakios_gpu_ready() || gpuWait(fence, milliseconds);
-		IOLockUnlock(gGPULock);
+	if (gGPULock == NULL) {
+		return true;
 	}
+	bool done = true;
+	uint64_t patience, limit;
+	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
+	limit = mach_absolute_time() + patience;
+	IOLockLock(gGPULock);
+	for (;;) {
+		uint32_t fence = surface->drawn;
+		if (fence == 0) {
+			break;
+		}
+		uint64_t now = mach_absolute_time(), remaining = 0;
+		if (now < limit) {
+			absolutetime_to_nanoseconds(limit - now, &remaining);
+		}
+		bool pending = hakios_gpu_ready() && !hakios_gpu_done(fence);
+		done = !hakios_gpu_ready() || gpuWait(fence, (remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
+		if (!done) {
+			break;
+		}
+		/* gpuWait may release gGPULock; do not publish pixels for a superseded fence. */
+		if (surface->drawn != fence) {
+			if (mach_absolute_time() >= limit) {
+				done = false;
+				break;
+			}
+			continue;
+		}
+		uint8_t * pixels = surface->pixels();
+		uint32_t before = *(volatile uint32_t *)pixels;
+		hakios_gpu_to_memory(pixels, surface->info.allocSize - surface->info.offset);
+		uint32_t after = *(volatile uint32_t *)pixels;
+		hakios_gpu_trace("tl: air83 display fence: surface %u fence %u pending %u first %08x -> %08x\n",
+		    surface->sid, fence, pending, before, after);
+		break;
+	}
+	IOLockUnlock(gGPULock);
 	return done;
 }
 
@@ -245,7 +310,7 @@ slowWait(const char * kind, uint64_t began)
 	absolutetime_to_nanoseconds(now - began, &ns);
 	if (ns >= NSEC_PER_MSEC) {
 		absolutetime_to_nanoseconds(now, &at);
-		hakios_tl("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
+		hakios_gpu_trace("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
 	}
 }
 
@@ -292,9 +357,110 @@ class HakiosGPU : public IOService
 
 public:
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn newUserClient(task_t owningTask, void * securityID,
+	    UInt32 type, OSDictionary * properties,
+	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(HakiosGPU, IOService);
+
+static char gAdrenoStreamLine[128];
+static uint32_t gAdrenoStreamPos = 0;
+static char gAdrenoStreamWho[32];
+static thread_call_t gStreamFlushCall = NULL;
+
+static void
+adreno_stream_flush(void)
+{
+	if (gAdrenoStreamPos > 0) {
+		IOLog("NativeAdreno: [%s] %s\n", gAdrenoStreamWho[0] ? gAdrenoStreamWho : "client", gAdrenoStreamLine);
+		gAdrenoStreamLine[0] = '\0';
+		gAdrenoStreamPos = 0;
+		gAdrenoStreamWho[0] = '\0';
+	}
+}
+
+static void
+adreno_stream_flush_call(thread_call_param_t param0, thread_call_param_t param1)
+{
+	(void)param0;
+	(void)param1;
+	adreno_stream_flush();
+}
+
+extern "C" void
+hakios_adreno_handle_marker(UInt32 type)
+{
+	uint32_t val = type & 0xffff;
+	char who[32] = {};
+	proc_selfname(who, sizeof(who));
+
+	if (val >= 0x8000) {
+		adreno_stream_flush();
+		/* Telemetry row markers: 0xC000 | row starts row, 0x8000 | (a << 7) | b appends 2 chars */
+		static unsigned s_row = 48, s_len = 0;
+		static char s_rows[48][96];
+		if (val >= 0xC000) {
+			s_row = val & 0x3f;
+			s_len = 0;
+			if (s_row < 48) {
+				s_rows[s_row][0] = '\0';
+			}
+		} else if (s_row < 48) {
+			char pair[2] = { (char)((val >> 7) & 0x7f), (char)(val & 0x7f) };
+			for (int i = 0; i < 2; i++) {
+				if (pair[i] && s_len < sizeof(s_rows[0]) - 1) {
+					s_rows[s_row][s_len++] = pair[i];
+					s_rows[s_row][s_len] = '\0';
+				}
+			}
+		}
+		return;
+	}
+
+	if (val >= 0x7000 && val < 0x8000) {
+		if (val == 0x7fff || val == 0x7ffe) {
+			adreno_stream_flush();
+			strlcpy(gAdrenoStreamWho, who, sizeof(gAdrenoStreamWho));
+		} else if (val < 0x7100 && gAdrenoStreamPos < sizeof(gAdrenoStreamLine) - 1) {
+			char c = (char)(val & 0xff);
+			if (c == '\n') {
+				adreno_stream_flush();
+			} else {
+				if (!gAdrenoStreamWho[0]) {
+					strlcpy(gAdrenoStreamWho, who, sizeof(gAdrenoStreamWho));
+				}
+				gAdrenoStreamLine[gAdrenoStreamPos++] = c;
+				gAdrenoStreamLine[gAdrenoStreamPos] = '\0';
+				if (gStreamFlushCall != NULL) {
+					uint64_t deadline;
+					clock_absolutetime_interval_to_deadline(10 * NSEC_PER_MSEC, &deadline);
+					thread_call_enter_delayed(gStreamFlushCall, deadline);
+				}
+			}
+		}
+		return;
+	}
+
+	adreno_stream_flush();
+	IOLog("NativeAdreno: [%s] marker 0x%04x\n", who, val);
+}
+
+extern "C" IOReturn
+hakios_adreno_new_user_client(IOService * service, task_t owningTask, void * securityID,
+    UInt32 type, OSDictionary * properties, IOUserClient ** handler)
+{
+	if ((type >> 16) == 0x4147 && (type & 0xffff)) {
+		if (handler) {
+			*handler = NULL;
+		}
+		hakios_adreno_handle_marker(type);
+		return kIOReturnUnsupported;
+	}
+
+	adreno_stream_flush();
+	return service->IOService::newUserClient(owningTask, securityID, type, properties, handler);
+}
 
 bool
 HakiosGPU::start(IOService * provider)
@@ -308,6 +474,14 @@ HakiosGPU::start(IOService * provider)
 	return true;
 }
 
+IOReturn
+HakiosGPU::newUserClient(task_t owningTask, void * securityID,
+    UInt32 type, OSDictionary * properties,
+    IOUserClient ** handler)
+{
+	return hakios_adreno_new_user_client(this, owningTask, securityID, type, properties, handler);
+}
+
 void
 HakiosGPUStart(void)
 {
@@ -317,6 +491,9 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
+	if (gStreamFlushCall == NULL) {
+		gStreamFlushCall = thread_call_allocate(adreno_stream_flush_call, NULL);
+	}
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -352,6 +529,9 @@ struct gpu_buffer {
 	uint64_t                        pushed;         /* ... and when that was */
 	bool                            seen;           /* by the program: mapped, and from then on written by it */
 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
+	bool                            client_iova;
+    bool                            native_release_pending; /* no new submissions own this BO */
+	bool                            imported;
 };
 
 /*
@@ -366,6 +546,8 @@ struct gpu_left {
 	MiniIOSurface *                 surface;
 	uint64_t                        address, size;
 	uint32_t                        fence, flags;
+	bool                            client_iova;
+	bool                            imported;
 };
 #define GPU_LEFT                64
 
@@ -398,6 +580,13 @@ class HakiosGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(HakiosGPUUserClient);
 
 	task_t                  fTask;
+    uint64_t                fNativeVaStart;
+    uint64_t                fNativeVaSize;
+    uint64_t                fNativeBytesHigh;
+    uint32_t                fNativeId;
+    uint32_t                fNativeMapCount;
+    uint32_t                fNativeSubmitCount;
+    uint32_t                fNativeWaitLogged;
 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextQueue;
 	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
@@ -416,11 +605,13 @@ class HakiosGPUUserClient : public IOUserClient
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	void dropKept(struct gpu_kept * k);
 	void reap(void);
+	IOReturn syncImported(bool toGPU, uint32_t fence);
 	IOReturn gemNew(struct msm_gem_new * request);
 	IOReturn surfaceBuffer(struct hakios_surface * request);
 	IOReturn gemInfo(struct msm_gem_info * request);
 	IOReturn submit(struct msm_gem_submit * request);
 	IOReturn show(const struct hakios_show * request);
+	IOReturn handleTunnel(uint32_t method, const void * input, size_t input_size, void * output, uint32_t * output_size);
 
 public:
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
@@ -437,10 +628,15 @@ OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
 bool
 HakiosGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
 {
+	if ((type >> 16) == 0x4147 && (type & 0xffff)) {
+		hakios_adreno_handle_marker(type);
+		return false;
+	}
 	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
 		return false;
 	}
 	fTask = owningTask;
+	hakios_gpu_request_context_reset();
 	return true;
 }
 
@@ -454,6 +650,8 @@ HakiosGPUUserClient::start(IOService * provider)
 	return fBuffers != NULL;
 }
 
+static void probeForget(struct gpu_buffer * b);
+
 /*
  * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
  * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
@@ -462,6 +660,7 @@ HakiosGPUUserClient::start(IOService * provider)
 void
 HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
 {
+	probeForget(b);                         /* (a probe reads through the buffer's view: it goes with the buffer) */
 	bool busy = hakios_gpu_ready() && b->fence != 0 && !hakios_gpu_done(b->fence);
 
 	if (busy && fLeftCount == GPU_LEFT) {
@@ -476,6 +675,8 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		left->size = b->size;
 		left->fence = b->fence;
 		left->flags = b->flags;
+		left->client_iova = b->client_iova;
+		left->imported = b->imported;
 	} else {
 		if (busy) {
 			static uint32_t said;
@@ -488,13 +689,20 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * b)
 			if (said++ < 8) {
 				IOLog("HakiosGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
 			}
-		} else if (b->surface == NULL && hakios_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+		} else if (b->surface == NULL && !b->client_iova && !b->imported && hakios_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
 			b->memory = NULL;               /* (now the kept one's) */
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(b->address, b->size);
-			hakios_gpu_address_free(b->address, b->size);
+			if (b->address != 0) {
+				hakios_gpu_unmap(b->address, b->size);
+				if (!b->client_iova) {
+					hakios_gpu_address_free(b->address, b->size);
+				}
+			}
 		}
 		if (b->memory != NULL) {
+			if (b->imported) {
+				b->memory->complete(kIODirectionInOut);
+			}
 			b->memory->release();
 		}
 		if (b->surface != NULL) {
@@ -518,14 +726,21 @@ HakiosGPUUserClient::reap(void)
 			i++;
 			continue;
 		}
-		if (left->surface == NULL && hakios_gpu_ready() &&
+		if (left->surface == NULL && !left->client_iova && !left->imported && hakios_gpu_ready() &&
 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
 			left->memory = NULL;
 		} else if (hakios_gpu_ready()) {
-			hakios_gpu_unmap(left->address, left->size);
-			hakios_gpu_address_free(left->address, left->size);
+			if (left->address != 0) {
+				hakios_gpu_unmap(left->address, left->size);
+				if (!left->client_iova) {
+					hakios_gpu_address_free(left->address, left->size);
+				}
+			}
 		}
 		if (left->memory != NULL) {
+			if (left->imported) {
+				left->memory->complete(kIODirectionInOut);
+			}
 			left->memory->release();
 		}
 		if (left->surface != NULL) {
@@ -542,7 +757,30 @@ HakiosGPUUserClient::clientClose(void)
 		IOLockLock(gGPULock);
 		/* what the client had the GPU do last may still be going on, in these buffers */
 		if (hakios_gpu_ready()) {
-			gpuWait(hakios_gpu_last(), 1000);
+			uint32_t last = hakios_gpu_last();
+
+			/*
+			 * The three steps of metal_test run in processes of their own, one after the other: each
+			 * closes its client while the one before it has just had the core do a whole command
+			 * stream, and the next process then submits the same 290 words and stops in the client's
+			 * own CP_WAIT_FOR_IDLE. What the core and the GMU say at the moment the memory is taken
+			 * away is asked here, before and after the wait, so that a teardown too early shows.
+			 */
+			if (hakios_gpu_debug()) hakios_gpu_idle_now("a client closes, before the wait and its memory goes");
+			gpuWait(last, 1000);
+			/*
+			 * The fence means the command processor has read everything; the core behind it may
+			 * still be draining into exactly the memory that is about to be unmapped (seen: a
+			 * close at fence 2 read `still busy`, rbbm 0xc30405, and everything after it stuck).
+			 * Wait for the drain, the way the gen8 port does.
+			 */
+			{
+				bool idle = hakios_gpu_await_idle(1000);
+
+				hakios_gpu_trace("tl: a client closes: %s\n",
+				    idle ? "the core is idle, its memory can go" : "THE CORE NEVER WENT IDLE, its memory goes anyway");
+			}
+			if (hakios_gpu_debug()) hakios_gpu_idle_now("a client closes, after the wait");
 		}
 		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
 			if (fBuffers[i].memory != NULL) {
@@ -556,6 +794,16 @@ HakiosGPUUserClient::clientClose(void)
 		if (fLeftCount != 0) {
 			IOLog("HakiosGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
 		}
+        if (fNativeVaStart != 0) {
+            if (fLeftCount == 0 && hakios_gpu_ready() && hakios_gpu_done(hakios_gpu_last())) {
+                hakios_gpu_address_free(fNativeVaStart, fNativeVaSize);
+                hakios_gpu_trace("tl: air87 Native client %u VA released\n", fNativeId);
+            } else {
+                hakios_tl("tl: air87 Native client %u VA retained for unfinished GPU work\n", fNativeId);
+            }
+            fNativeVaStart = 0;
+            fNativeVaSize = 0;
+        }
 		IOLockUnlock(gGPULock);
 	}
 	if (!isInactive()) {
@@ -631,6 +879,8 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	b->seen = false;
 	b->fence = 0;
 	b->surface = NULL;
+	b->client_iova = false;
+	b->imported = false;
 	fBufferCount++;
 	fBufferBytes += size;
 	return b;
@@ -863,6 +1113,96 @@ HakiosGPUUserClient::gemInfo(struct msm_gem_info * request)
 	return ret;
 }
 
+static uint64_t sProbeAddress;
+static struct gpu_buffer * sProbeBuffer;
+static uint32_t sProbeOffset;
+static uint64_t sBinAddress;
+static struct gpu_buffer * sBinBuffer;
+static uint32_t sBinOffset;
+static uint32_t sBinBefore[8];
+static bool sRedirected;                        /* the target moved into the picture's page: read that instead */
+
+/* boot-arg gpu_redirect=0: the client's commands are left alone, so its own target gets the pixels. */
+static bool
+redirectTargets(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		uint32_t asked = 1;
+
+		PE_parse_boot_argn("gpu_redirect", &asked, sizeof(asked));
+		on = asked != 0;
+	}
+	return on;
+}
+
+/* A buffer is going away, and with it the memory a probe would read: what was pending is dropped. */
+static void
+probeForget(struct gpu_buffer * b)
+{
+	if (b == sProbeBuffer) {
+		sProbeAddress = 0;
+		sProbeBuffer = NULL;
+	}
+	if (b == sBinBuffer) {
+		sBinAddress = 0;
+		sBinBuffer = NULL;
+	}
+}
+
+/*
+ * Two places the core is expected to write, both read here once it is done, after
+ * hakios_gpu_to_memory has cleaned and invalidated the lines: the address the client draws into,
+ * and the visibility stream the binning pass writes before any render pass. The client's own
+ * readback has shown that the command processor reaches the first (it put a word there). The
+ * stream is copied when the submission is handed over and compared afterwards, because the client
+ * writes command buffers of its own into that buffer too: only what changed after the hand-over
+ * was written by the core.
+ */
+static void
+probeReport(void)
+{
+	uint32_t * at;
+
+	if (sProbeBuffer == NULL && sBinBuffer == NULL && !sRedirected) {
+		return;
+	}
+	if (!gpuWait(hakios_gpu_last(), 0)) {
+		return;                 /* (not done: look again at the next submission) */
+	}
+	if (sProbeBuffer != NULL && sProbeBuffer->kernel != NULL && sProbeOffset + 64 <= sProbeBuffer->size) {
+		at = (uint32_t *)((uint8_t *) sProbeBuffer->kernel + sProbeOffset);
+		hakios_gpu_to_memory(at, 64);
+		hakios_gpu_trace("tl: probe: the client named %#llx to draw into; memory holds %08x %08x %08x %08x %08x %08x\n",
+		    (unsigned long long) sProbeAddress, at[0], at[1], at[2], at[3], at[4], at[5]);
+	}
+	if (sRedirected) {
+		uint32_t words[8] = { 0 };
+
+		hakios_gpu_target_words(words, 8);
+		hakios_gpu_trace("tl: probe: the picture's page now holds %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+		sRedirected = false;
+	}
+	sProbeAddress = 0;
+	sProbeBuffer = NULL;
+	if (sBinBuffer != NULL && sBinBuffer->kernel != NULL && sBinOffset + 32 <= sBinBuffer->size) {
+		uint32_t changed = 0;
+
+		at = (uint32_t *)((uint8_t *) sBinBuffer->kernel + sBinOffset);
+		hakios_gpu_to_memory(at, 32);
+		for (uint32_t i = 0; i < 8; i++) {
+			changed += at[i] != sBinBefore[i];
+		}
+		hakios_gpu_trace("tl: probe: the bin data at %#llx: before %08x %08x %08x %08x, after %08x %08x %08x %08x, %u of 8 changed\n",
+		    (unsigned long long) sBinAddress, sBinBefore[0], sBinBefore[1], sBinBefore[2], sBinBefore[3],
+		    at[0], at[1], at[2], at[3], changed);
+	}
+	sBinAddress = 0;
+	sBinBuffer = NULL;
+}
+
 IOReturn
 HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 {
@@ -940,6 +1280,229 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
+		if (gpu_log) {
+			/*
+			 * What the command buffer holds where this processor sees it, at the address the core
+			 * will read it from: a page of zeroes is a core told to do nothing, however many words
+			 * the submission counted. Eight words a line keep inside the log's 192 bytes.
+			 */
+			uint32_t * at = (uint32_t *)((uint8_t *)b->kernel + cmds[i].submit_offset);
+			uint32_t n = cmds[i].size / 4, used = 0;
+
+			for (uint32_t w = 0; w < n; w++) {
+				used += at[w] != 0;
+			}
+			hakios_gpu_trace("tl: ib %u at %#llx: %u words, %u of them not zero\n", i,
+			    (unsigned long long)(b->address + cmds[i].submit_offset), n, used);
+			if (n >= 8) {
+				hakios_gpu_trace("tl: ib %u word 0 on: %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
+				    at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7]);
+			}
+			for (uint32_t w = 0; w < n; w += 8) {
+				uint32_t word8[8] = { 0 };
+
+				for (uint32_t k = 0; k < 8 && w + k < n; k++) {
+					word8[k] = at[w + k];
+				}
+				hakios_gpu_trace("tl: ib %u +%u: %08x %08x %08x %08x %08x %08x %08x %08x\n", i, w,
+				    word8[0], word8[1], word8[2], word8[3], word8[4], word8[5], word8[6], word8[7]);
+			}
+		}
+		/*
+		 * RB_MRT[0].BASE, in a type-4 packet of eight dwords: 0x8825 is its low word, and the
+		 * word after it the address the client has this core write pixels to.
+		 */
+		/*
+		 * RB_MRT[0].BASE, found by walking the packets: a type-4 packet writes its count of
+		 * dwords from its register index on, so this address is the payload word at regidx
+		 * 0x8825 and not a header word. Type-7 packets are stepped over whole so that no
+		 * payload word is taken for a header. Two packets of the client's buffer carry it.
+		 */
+		{
+			uint32_t * at = (uint32_t *)((uint8_t *) b->kernel + cmds[i].submit_offset);
+			uint32_t n = cmds[i].size / 4, found = 0;
+			uint64_t ib2[8];
+			uint32_t ib2n[8], count2 = 0;
+
+			for (uint32_t w = 0; w < n;) {
+				uint32_t h = at[w];
+
+				if ((h & 0xf0000000u) == 0x40000000u) {
+					uint32_t at4 = (h >> 8) & 0x3ffffu, n4 = h & 0x3fu;
+
+					if (n4 != 0 && 0x8825u - at4 < n4 && w + 1 + (0x8825u - at4) < n) {
+						found = at[w + 1 + (0x8825u - at4)];
+					}
+					w += n4 + 1;
+				} else if ((h & 0xf0000000u) == 0x70000000u) {
+					uint32_t op7 = (h >> 16) & 0x7fu, n7 = h & 0x3fffu;
+
+					/* CP_SET_BIN_DATA5: where the binning pass puts its visibility stream */
+					if (op7 == 0x55u && n7 >= 1 && w + 1 < n) {
+						uint64_t bin = at[w + 1] | ((uint64_t)(n7 >= 2 ? at[w + 2] : 0) << 32);
+
+						if (bin != 0 && sBinAddress == 0) {
+							sBinAddress = bin;
+						}
+					}
+					/* CP_INDIRECT_BUFFER: the command buffer this one tells the core to run next */
+					if (op7 == 0x3fu && n7 == 3 && w + 3 < n && count2 < 8) {
+						ib2[count2] = at[w + 1] | ((uint64_t)at[w + 2] << 32);
+						ib2n[count2++] = at[w + 3];
+					}
+					w += n7 + 1;
+				} else {
+					w++;
+				}
+			}
+			/*
+			 * The buffer a CP_INDIRECT_BUFFER points at holds the draw itself. Its words are here
+			 * where this processor sees them: what the core is told to draw with, and whether that
+			 * is a draw at all.
+			 */
+			for (uint32_t k = 0; k < count2; k++) {
+				struct gpu_buffer * p = NULL;
+				uint32_t off = 0, n2;
+
+				for (uint32_t j = 0; j < request->nr_bos; j++) {
+					struct gpu_buffer * q = buffer(bos[j].handle);
+
+					if (q != NULL && q->kernel != NULL && ib2[k] >= q->address &&
+					    ib2[k] - q->address + 4 <= q->size) {
+						p = q;
+						off = (uint32_t)(ib2[k] - q->address);
+						break;
+					}
+				}
+				if (p == NULL || !gpu_log) {
+					continue;
+				}
+				n2 = ib2n[k];
+				if (n2 > (uint32_t)((p->size - off) / 4)) {
+					n2 = (uint32_t)((p->size - off) / 4);
+				}
+				if (n2 > 256) {
+					n2 = 256;
+				}
+				hakios_gpu_trace("tl: ib2 %#llx at %#x: %u words\n", (unsigned long long) ib2[k], off, n2);
+				for (uint32_t w2 = 0; w2 < n2; w2 += 8) {
+					uint32_t word8[8] = { 0 };
+
+					for (uint32_t t = 0; t < 8 && w2 + t < n2; t++) {
+						word8[t] = ((uint32_t *) p->kernel)[off / 4 + w2 + t];
+					}
+					hakios_gpu_trace("tl: ib2 +%u: %08x %08x %08x %08x %08x %08x %08x %08x\n", w2,
+					    word8[0], word8[1], word8[2], word8[3], word8[4], word8[5], word8[6], word8[7]);
+				}
+			}
+			if (found != 0 && redirectTargets()) {
+				uint32_t moved = 0;
+
+				sProbeAddress = found;
+				/*
+				 * Every place this buffer, or the ones it points at, names the target is moved into
+				 * the picture's page at 0x10000000: that page is in the core's own address space, and
+				 * what the core writes there is read from here. Only the destination changes; the
+				 * client's commands are otherwise the client's.
+				 */
+				for (uint32_t w2 = 0; w2 < n; w2++) {
+					if (at[w2] == found) {
+						at[w2] = 0x10000000u;
+						moved++;
+					}
+				}
+				for (uint32_t k = 0; k < count2; k++) {
+					struct gpu_buffer * q = NULL;
+					uint32_t off2 = 0, n2;
+
+					for (uint32_t j = 0; j < request->nr_bos; j++) {
+						struct gpu_buffer * r = buffer(bos[j].handle);
+
+						if (r != NULL && r->kernel != NULL && ib2[k] >= r->address &&
+						    ib2[k] - r->address + 4 <= r->size) {
+							q = r;
+							off2 = (uint32_t)(ib2[k] - r->address);
+							break;
+						}
+					}
+					if (q == NULL) {
+						continue;
+					}
+					n2 = ib2n[k];
+					if (n2 > (uint32_t)((q->size - off2) / 4)) {
+						n2 = (uint32_t)((q->size - off2) / 4);
+					}
+					for (uint32_t w2 = 0; w2 < n2; w2++) {
+						uint32_t * qw = (uint32_t *)((uint8_t *) q->kernel + off2);
+
+						if (qw[w2] == found) {
+							qw[w2] = 0x10000000u;
+							moved++;
+						}
+					}
+				}
+				sRedirected = true;
+				if (gpu_log) {
+					hakios_gpu_trace("tl: probe: ib %u names %#x for the draw, moved in %u words\n", i, found, moved);
+				}
+			} else if (gpu_log) {
+				hakios_gpu_trace("tl: probe: ib %u names no target\n", i);
+			}
+		}
+	}
+	/*
+	 * The address is in a buffer of its own, not in the one the commands are in: the render
+	 * target is separate from the command buffer, and what this processor reads of it is what
+	 * the client reads back. Find the buffer that holds it among the submission's.
+	 */
+	if (sProbeAddress != 0) {
+		for (uint32_t i = 0; i < request->nr_bos; i++) {
+			struct gpu_buffer * p = buffer(bos[i].handle);
+
+			if (p != NULL && p->kernel != NULL && sProbeAddress >= p->address &&
+			    sProbeAddress - p->address + 64 <= p->size) {
+				sProbeBuffer = p;
+				sProbeOffset = (uint32_t)(sProbeAddress - p->address);
+				break;
+			}
+		}
+		if (sProbeBuffer == NULL) {
+			if (gpu_log) {
+				hakios_gpu_trace("tl: probe: %#x is in no buffer of this submission\n", (uint32_t)sProbeAddress);
+			}
+			sProbeAddress = 0;
+		} else {
+			if (gpu_log) {
+				hakios_gpu_trace("tl: probe: %#x is %#x into a buffer, %u bytes on\n",
+				    (uint32_t)sProbeAddress, sProbeOffset, (uint32_t)sProbeBuffer->size);
+			}
+			hakios_gpu_write_probe(sProbeAddress);
+		}
+	}
+	if (sBinAddress != 0) {
+		for (uint32_t i = 0; i < request->nr_bos; i++) {
+			struct gpu_buffer * p = buffer(bos[i].handle);
+
+			if (p != NULL && p->kernel != NULL && sBinAddress >= p->address &&
+			    sBinAddress - p->address + 32 <= p->size) {
+				sBinBuffer = p;
+				sBinOffset = (uint32_t)(sBinAddress - p->address);
+				break;
+			}
+		}
+		if (sBinBuffer == NULL) {
+			sBinAddress = 0;
+		} else if (gpu_log) {
+			hakios_gpu_trace("tl: probe: bin data %#x is %#x into a buffer\n", (uint32_t)sBinAddress, sBinOffset);
+		}
+	}
+	if (sBinBuffer != NULL && sBinBuffer->kernel != NULL && sBinOffset + 32 <= sBinBuffer->size) {
+		uint32_t * at = (uint32_t *)((uint8_t *) sBinBuffer->kernel + sBinOffset);
+
+		hakios_gpu_to_memory(at, 32);           /* (what the client has written there; the core writes next) */
+		for (uint32_t i = 0; i < 8; i++) {
+			sBinBefore[i] = at[i];
+		}
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
 	if (gpu_log && request->fence != 0) {
@@ -956,7 +1519,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			all_words += words[i];
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-		hakios_tl("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
+		hakios_gpu_trace("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
 	}
 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
 		request->fence_fd = -1;
@@ -983,7 +1546,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		hakios_gpu_report("the ring is full");
 	}
 	if (fSubmits++ < 4) {
-		IOLog("HakiosGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
+		hakios_gpu_trace("HakiosGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
 		    addresses[0], words[0]);
 	}
 	/* every five seconds in which something was submitted: how much, and what it cost here */
@@ -1058,6 +1621,25 @@ HakiosGPUUserClient::show(const struct hakios_show * request)
 IOReturn
 HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
 {
+	if (type == 0x5343) { /* 'SC' - Scanout Framebuffer */
+		if (vinfo.v_baseaddr == 0 || vinfo.v_rowbytes == 0 || vinfo.v_height == 0) {
+			return kIOReturnNotReady;
+		}
+		IOMemoryDescriptor * mem = IOMemoryDescriptor::withAddressRange(
+		    (mach_vm_address_t)vinfo.v_baseaddr,
+		    (mach_vm_size_t)vinfo.v_rowbytes * vinfo.v_height,
+		    kIODirectionInOut,
+		    kernel_task);
+		if (mem == NULL) {
+			return kIOReturnNoMemory;
+		}
+		if (options != NULL) {
+			*options = 0;
+		}
+		*memory = mem;
+		return kIOReturnSuccess;
+	}
+
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnBadArgument;
 
@@ -1074,10 +1656,923 @@ HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IO
 	return ret;
 }
 
+/*
+ * Native imports are user mappings of cached memory (including IOSurface pixels), not the
+ * driver's write-combined BOs. Their memory descriptor pins pages but does not make this
+ * non-coherent GPU see CPU writes, nor invalidate CPU cache lines after GPU writes.
+ * Use a temporary kernel view of the prepared descriptor and the same explicit dc civac
+ * helper as the working cached BO path. IOMemoryDescriptor::performOperation can become
+ * a no-op under XNU's __ARM_COHERENT_IO__ assumption, which this GPU port does not satisfy.
+ * gGPULock is held by the caller. Do not cache-synchronize an import still owned by the GPU.
+ */
+IOReturn
+HakiosGPUUserClient::syncImported(bool toGPU, uint32_t fence)
+{
+	bool any = false;
+	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+		if (fBuffers[i].memory != NULL && fBuffers[i].imported) {
+			any = true;
+			break;
+		}
+	}
+	if (!any) {
+		return kIOReturnSuccess;
+	}
+	/* This client may reuse the same cached import in consecutive command buffers. */
+	if (toGPU && hakios_gpu_last() != 0 && !gpuWait(hakios_gpu_last(), 1000)) {
+		hakios_tl("tl: air82 import sync: previous GPU work did not complete\n");
+		return kIOReturnTimeout;
+	}
+	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+		struct gpu_buffer * b = &fBuffers[i];
+		if (b->memory == NULL || !b->imported) {
+			continue;
+		}
+		if (!toGPU && (b->fence == 0 || (int32_t)(fence - b->fence) < 0 || b->pushed == b->fence)) {
+			continue;
+		}
+		auto mapping = b->memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
+		if (!mapping || mapping->getVirtualAddress() == 0 || mapping->getLength() < b->size) {
+			hakios_tl("tl: air82 import sync: cannot map handle %u, %llu bytes\n", i + 1, b->size);
+			return kIOReturnNoMemory;
+		}
+		void *base = (void *)mapping->getVirtualAddress();
+		uint32_t first = *(volatile uint32_t *)base;
+		hakios_gpu_to_memory(base, b->size);
+		uint32_t fresh = *(volatile uint32_t *)base;
+		IOByteCount contiguous = 0;
+		addr64_t phys = b->memory->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+		hakios_gpu_trace("tl: air82 import %s: handle %u iova %#llx phys %#llx bytes %llu fence %u first %08x -> %08x\n",
+		    toGPU ? "to GPU" : "to CPU", i + 1, b->address, (uint64_t)phys, b->size, b->fence, first, fresh);
+		if (!toGPU) {
+			b->pushed = b->fence;
+		}
+	}
+	return kIOReturnSuccess;
+}
+
+#define NATIVE_ADRENO_TUNNEL_MAGIC 0x4e544e4c /* 'NTNL' */
+
+enum {
+	kNativeAdrenoAbiVersion = 2,
+	kNativeAdrenoAbiMaxBuffers = 128,
+	kNativeAdrenoAbiMaxBoBytesShift = 28,
+	kNativeAdrenoMethodQuery = 1,
+	kNativeAdrenoMethodBoAlloc = 2,
+	kNativeAdrenoMethodBoMap = 3,
+	kNativeAdrenoMethodBoFree = 4,
+	kNativeAdrenoMethodSubmit = 5,
+	kNativeAdrenoMethodWaitFence = 6,
+	kNativeAdrenoMethodGetTimestamp = 7,
+	kNativeAdrenoMethodGetStatus = 8,
+	kNativeAdrenoMethodSetMetadata = 9,
+	kNativeAdrenoMethodGetMetadata = 10,
+	kNativeAdrenoMethodCreateQueue = 11,
+	kNativeAdrenoMethodCloseQueue = 12,
+	kNativeAdrenoMethodBoCpuMap = 13,
+	kNativeAdrenoMethodBoCpuUnmap = 14,
+	kNativeAdrenoMethodGetDeviceInfo = 15,
+	kNativeAdrenoMethodBoImport = 16,
+};
+
+struct NativeAdrenoAbiParams {
+	uint32_t abi_version;
+	uint32_t input_bits;
+	uint32_t output_bits;
+	uint32_t flags;
+	uint64_t max_bo_bytes;
+};
+
+struct NativeAdrenoAbiDeviceInfo {
+	uint32_t chip_id;
+	uint32_t gmem_bytes;
+	uint64_t gmem_base;
+	uint64_t uche_trap_base;
+	uint64_t va_start;
+	uint64_t va_size;
+	uint32_t highest_bank_bit;
+	uint32_t ubwc_swizzle;
+	uint32_t macrotile_mode;
+	uint32_t ubwc_version;
+	uint32_t flags;
+	uint32_t reserved;
+};
+
+struct NativeAdrenoAbiBoAlloc {
+	uint64_t bytes;
+	uint32_t align_log2;
+	uint32_t contiguous;
+};
+
+struct NativeAdrenoAbiBoAllocReply {
+	uint64_t handle;
+};
+
+struct NativeAdrenoAbiBoMap {
+	uint64_t handle;
+	uint64_t iova;
+	uint32_t permissions;
+	uint32_t writeback;
+	uint32_t shareability;
+	uint32_t reserved;
+};
+
+struct NativeAdrenoAbiBoMapReply {
+	uint64_t iova;
+};
+
+struct NativeAdrenoAbiBoFree {
+	uint64_t handle;
+};
+
+struct NativeAdrenoAbiBoCpuMap {
+	uint64_t handle;
+};
+
+struct NativeAdrenoAbiBoCpuMapReply {
+	uint32_t token;
+	uint32_t reserved;
+	uint64_t bytes;
+};
+
+struct NativeAdrenoAbiBoCpuUnmap {
+	uint64_t handle;
+	uint32_t token;
+	uint32_t reserved;
+};
+
+struct NativeAdrenoAbiBoImport {
+	uint64_t address;
+	uint64_t bytes;
+};
+
+struct NativeAdrenoAbiSubmitBuffer {
+	uint64_t handle;
+	uint64_t iova;
+	uint64_t bytes;
+};
+
+struct NativeAdrenoAbiSubmit {
+	uint32_t buffer_count;
+	uint32_t reserved;
+	uint64_t queue;
+	uint64_t wait_fence;
+	uint64_t wait_timeout_ns;
+	NativeAdrenoAbiSubmitBuffer buffers[kNativeAdrenoAbiMaxBuffers];
+};
+
+struct NativeAdrenoAbiSubmitReply {
+	uint64_t fence;
+};
+
+struct NativeAdrenoAbiWaitFence {
+	uint64_t fence;
+	uint64_t timeout_ns;
+};
+
+struct NativeAdrenoAbiTimestamp {
+	uint64_t ticks;
+};
+
+struct NativeAdrenoAbiStatus {
+	uint64_t faults;
+	uint64_t suspends;
+};
+
+struct NativeAdrenoAbiQueueReply {
+	uint64_t queue;
+};
+
+enum {
+	kNativeAdrenoAbiMetadataBytes = 64,
+};
+
+struct NativeAdrenoAbiMetadata {
+	uint64_t handle;
+	uint32_t bytes;
+	uint32_t reserved;
+	char text[kNativeAdrenoAbiMetadataBytes];
+};
+
+static uint32_t
+ibNop(void)
+{
+	static uint32_t at = 0;
+	static bool read = false;
+
+	if (!read) {
+		read = true;
+		PE_parse_boot_argn("adreno_ib_nop", &at, sizeof(at));
+	}
+	return at;
+}
+
+static uint32_t
+ibNopPackets(void)
+{
+	static uint32_t pkts = 1;
+	static bool read = false;
+
+	if (!read) {
+		read = true;
+		PE_parse_boot_argn("adreno_ib_nop_pkts", &pkts, sizeof(pkts));
+	}
+	return pkts == 0 ? 1 : pkts;
+}
+
+static uint32_t
+ibCut(void)
+{
+	static uint32_t cut = 0;
+	static bool read = false;
+
+	if (!read) {
+		read = true;
+		PE_parse_boot_argn("adreno_ib_cut", &cut, sizeof(cut));
+	}
+	return cut;
+}
+
+IOReturn
+HakiosGPUUserClient::handleTunnel(uint32_t method, const void * input, size_t input_size, void * output, uint32_t * output_size)
+{
+	adreno_stream_flush();
+	switch (method) {
+	case kNativeAdrenoMethodQuery: {
+		if (output == NULL || *output_size < sizeof(NativeAdrenoAbiParams)) {
+			return kIOReturnBadArgument;
+		}
+		NativeAdrenoAbiParams reply;
+		bzero(&reply, sizeof(reply));
+		reply.abi_version = kNativeAdrenoAbiVersion;
+		reply.input_bits = 48;
+		reply.output_bits = 36;
+		reply.flags = 1; /* NativeAdrenoParamsHostImport */
+		reply.max_bo_bytes = 1ULL << kNativeAdrenoAbiMaxBoBytesShift;
+		memcpy(output, &reply, sizeof(reply));
+		*output_size = sizeof(reply);
+		hakios_gpu_trace("HakiosGPU: NativeAdreno query handled (abi=%u)\n", reply.abi_version);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodGetDeviceInfo: {
+		if (output == NULL || *output_size < sizeof(NativeAdrenoAbiDeviceInfo)) {
+			return kIOReturnBadArgument;
+		}
+		NativeAdrenoAbiDeviceInfo reply;
+		bzero(&reply, sizeof(reply));
+		uint64_t val = 0;
+		if (hakios_gpu_parameter(0x03, &val)) {
+			reply.chip_id = (uint32_t)val;
+		} else {
+			reply.chip_id = 0x43051401;
+		}
+		if (hakios_gpu_parameter(0x02, &val)) {
+			reply.gmem_bytes = (uint32_t)val;
+		} else {
+			reply.gmem_bytes = 3 * 1024 * 1024;
+		}
+		reply.gmem_base = 0x1000000ull;
+		reply.uche_trap_base = 0x0001fffffffff000ull;
+        /* All clients share core_space. Never advertise the same VA interval
+         * to independent userspace allocators: BoMap used to replace another
+         * live client's PTEs, including that client's command buffers. */
+        char who[32] = {};
+        proc_selfname(who, sizeof(who));
+        IOLockLock(gGPULock);
+        if (fNativeVaStart == 0) {
+            uint64_t requested = nativeVaSizeForProcess(who);
+            fNativeVaStart = hakios_gpu_address(requested);
+            if (fNativeVaStart != 0) {
+                fNativeVaSize = requested;
+                fNativeId = ++gNativeClientId;
+            }
+        }
+        reply.va_start = fNativeVaStart;
+        reply.va_size = fNativeVaSize;
+        IOLockUnlock(gGPULock);
+        if (reply.va_start == 0) {
+            hakios_tl("tl: air101 Native VA exhausted: [%s] needs %llu MiB private window\n",
+                who, nativeVaSizeForProcess(who) >> 20);
+            return kIOReturnNoResources;
+        }
+        hakios_gpu_trace("tl: air87 Native client %u [%s] VA [%#llx,%#llx), %llu MiB reserved\n",
+            fNativeId, who, reply.va_start, reply.va_start + reply.va_size, reply.va_size >> 20);
+        hakios_gpu_trace("tl: air101 Native quota: client %u [%s] %llu MiB at %#llx\n",
+            fNativeId, who, reply.va_size >> 20, reply.va_start);
+		if (hakios_gpu_parameter(0x10, &val)) {
+			reply.highest_bank_bit = (uint32_t)val;
+		} else {
+			reply.highest_bank_bit = 16;
+		}
+		if (hakios_gpu_parameter(0x12, &val)) {
+			reply.ubwc_swizzle = (uint32_t)val;
+		} else {
+			reply.ubwc_swizzle = 6;
+		}
+		if (hakios_gpu_parameter(0x13, &val)) {
+			reply.macrotile_mode = (uint32_t)val;
+		} else {
+			reply.macrotile_mode = 1;
+		}
+		reply.ubwc_version = 4;
+		reply.flags = 1; /* NativeAdrenoDeviceClientIova */
+		memcpy(output, &reply, sizeof(reply));
+		*output_size = sizeof(reply);
+		hakios_gpu_trace("HakiosGPU: NativeAdreno device info: chip %#x, gmem %uKB, va %#llx..%#llx\n",
+		    reply.chip_id, reply.gmem_bytes >> 10, reply.va_start, reply.va_start + reply.va_size);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodBoAlloc: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiBoAlloc) ||
+		    output == NULL || *output_size < sizeof(NativeAdrenoAbiBoAllocReply)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiBoAlloc * req = (const NativeAdrenoAbiBoAlloc *)input;
+		NativeAdrenoAbiBoAllocReply * reply = (NativeAdrenoAbiBoAllocReply *)output;
+		uint64_t size = round_page_64(req->bytes);
+
+		if (size == 0 || size > GPU_BUFFER_MAX) {
+			return kIOReturnBadArgument;
+		}
+		IOBufferMemoryDescriptor * memory = IOBufferMemoryDescriptor::inTaskWithOptions(
+		    kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | (gGPUCached ? 0 : kIOMapWriteCombineCache),
+		    (vm_size_t)size, PAGE_SIZE);
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		if (gGPUCached) {
+			hakios_gpu_to_memory(memory->getBytesNoCopy(), size);
+		}
+
+		IOLockLock(gGPULock);
+		struct gpu_buffer * b = NULL;
+		uint32_t handle = 0;
+		for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
+			uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
+			if (fBuffers[i].memory == NULL) {
+				b = &fBuffers[i];
+				handle = i + 1;
+				fNextBuffer = i + 1;
+				break;
+			}
+		}
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			memory->release();
+			return kIOReturnNoResources;
+		}
+		bzero(b, sizeof(*b));
+		b->memory = memory;
+		b->kernel = (uint8_t *)memory->getBytesNoCopy();
+		b->size = size;
+		b->flags = 0;
+		b->address = 0;
+		b->seen = false;
+		b->client_iova = true;
+		b->imported = false;
+		fBufferCount++;
+		fBufferBytes += size;
+		IOLockUnlock(gGPULock);
+
+		char who[32] = {};
+		proc_selfname(who, sizeof(who));
+		hakios_gpu_trace("NativeAdreno: [%s] BoAlloc handle=%u bytes=%llu\n", who, handle, size);
+
+		reply->handle = handle;
+		*output_size = sizeof(*reply);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodBoMap: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiBoMap) ||
+		    output == NULL || *output_size < sizeof(NativeAdrenoAbiBoMapReply)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiBoMap * req = (const NativeAdrenoAbiBoMap *)input;
+		NativeAdrenoAbiBoMapReply * reply = (NativeAdrenoAbiBoMapReply *)output;
+
+		IOLockLock(gGPULock);
+		struct gpu_buffer * b = buffer((uint32_t)req->handle);
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			return kIOReturnBadArgument;
+		}
+		if (b->address != 0) {
+			IOLockUnlock(gGPULock);
+			return kIOReturnBusy;
+		}
+        if (fNativeVaStart == 0 || fNativeVaSize == 0 || (req->iova & 4095) || req->iova < fNativeVaStart ||
+            req->iova - fNativeVaStart >= fNativeVaSize ||
+            b->size > fNativeVaSize - (req->iova - fNativeVaStart)) {
+            hakios_tl("tl: air87 reject BoMap client %u: iova %#llx size %#llx outside [%#llx,%#llx)\n",
+                fNativeId, req->iova, b->size, fNativeVaStart, fNativeVaStart + fNativeVaSize);
+            IOLockUnlock(gGPULock);
+            return kIOReturnBadArgument;
+        }
+        reap();
+        for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+            const struct gpu_buffer *other = &fBuffers[i];
+            if (other != b && other->memory != NULL && other->address != 0 &&
+                req->iova < other->address + other->size && other->address < req->iova + b->size) {
+                hakios_tl("tl: air87 reject overlapping BoMap client %u handles %llu/%u\n",
+                    fNativeId, req->handle, i + 1);
+                IOLockUnlock(gGPULock);
+                return kIOReturnBusy;
+            }
+        }
+        for (uint32_t i = 0; i < fLeftCount; i++) {
+            if (req->iova < fLeft[i].address + fLeft[i].size && fLeft[i].address < req->iova + b->size) {
+                hakios_tl("tl: air87 reject deferred BoMap client %u handle %llu fence %u\n",
+                    fNativeId, req->handle, fLeft[i].fence);
+                IOLockUnlock(gGPULock);
+                return kIOReturnBusy;
+            }
+        }
+        b->address = req->iova;
+		bool mapped = true;
+		for (uint64_t offset = 0; offset < b->size && mapped; offset += 4096) {
+			IOByteCount length = 0;
+			addr64_t phys = b->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+			mapped = phys != 0 && hakios_gpu_map(b->address + offset, phys, (req->permissions & 2) == 0);
+		}
+		hakios_gpu_mapped();
+		if (!mapped) {
+			hakios_gpu_unmap(b->address, b->size);
+			b->address = 0;
+			IOLockUnlock(gGPULock);
+			return kIOReturnNoMemory;
+		}
+
+		char who[32] = {};
+		proc_selfname(who, sizeof(who));
+        if (++fNativeMapCount <= 4 || (fNativeMapCount & 31) == 0)
+            hakios_gpu_trace("tl: air87 map client %u [%s] handle %llu iova %#llx bytes %llu (map %u)\n",
+                fNativeId, who, req->handle, req->iova, b->size, fNativeMapCount);
+
+        if (fBufferBytes > fNativeBytesHigh &&
+            (fBufferBytes >> 25) > (fNativeBytesHigh >> 25)) {
+            fNativeBytesHigh = fBufferBytes;
+            hakios_gpu_trace("tl: air101 Native bytes: client %u [%s] live %llu MiB, BOs %u, VA window %llu MiB\n",
+                fNativeId, who, fBufferBytes >> 20, fBufferCount, fNativeVaSize >> 20);
+        }
+		reply->iova = b->address;
+		*output_size = sizeof(*reply);
+		IOLockUnlock(gGPULock);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodBoFree: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiBoFree)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiBoFree * req = (const NativeAdrenoAbiBoFree *)input;
+
+		IOLockLock(gGPULock);
+        if (!hakios_gpu_ready()) {
+            IOLockUnlock(gGPULock);
+            return kIOReturnNotReady;
+        }
+		struct gpu_buffer * b = buffer((uint32_t)req->handle);
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			return kIOReturnBadArgument;
+		}
+        /* Native's reaper returns the IOVA to its heap only after BoFree
+         * succeeds. Its existing Busy path retains this handle/IOVA for retry.
+         * Do not report success while freeBuffer would keep old PTEs in fLeft:
+         * the next allocation could otherwise reuse that still-live address. */
+        if (b->fence != 0 && !hakios_gpu_done(b->fence)) {
+            /* Vulkan has dropped its final BO reference. Preserve the last
+             * real use, not the fences of unrelated later submissions. */
+            b->native_release_pending = true;
+            static uint32_t reportedFence;
+            if (reportedFence != b->fence) {
+                reportedFence = b->fence;
+                hakios_gpu_trace("tl: air99 BoFree busy: client %u handle %llu iova %#llx bytes %llu fence %u; user retains VA\n",
+                    fNativeId, req->handle, b->address, b->size, b->fence);
+            }
+            IOLockUnlock(gGPULock);
+            return kIOReturnBusy;
+        }
+        if (b->native_release_pending) {
+            static uint32_t releases;
+            if (++releases <= 4 || (releases & 63) == 0)
+                hakios_gpu_trace("tl: air100 BoFree released: client %u handle %llu iova %#llx fence %u (release %u)\n",
+                    fNativeId, req->handle, b->address, b->fence, releases);
+        }
+		freeBuffer(b);
+		reap();
+		IOLockUnlock(gGPULock);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodBoCpuMap: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiBoCpuMap) ||
+		    output == NULL || *output_size < sizeof(NativeAdrenoAbiBoCpuMapReply)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiBoCpuMap * req = (const NativeAdrenoAbiBoCpuMap *)input;
+		NativeAdrenoAbiBoCpuMapReply * reply = (NativeAdrenoAbiBoCpuMapReply *)output;
+
+		IOLockLock(gGPULock);
+		struct gpu_buffer * b = buffer((uint32_t)req->handle);
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			return kIOReturnBadArgument;
+		}
+		reply->token = (uint32_t)req->handle;
+		reply->reserved = 0;
+		reply->bytes = b->size;
+		*output_size = sizeof(*reply);
+		IOLockUnlock(gGPULock);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodBoCpuUnmap:
+		return kIOReturnSuccess;
+
+	case kNativeAdrenoMethodBoImport: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiBoImport) ||
+		    output == NULL || *output_size < sizeof(NativeAdrenoAbiBoAllocReply)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiBoImport * req = (const NativeAdrenoAbiBoImport *)input;
+		NativeAdrenoAbiBoAllocReply * reply = (NativeAdrenoAbiBoAllocReply *)output;
+		uint64_t size = round_page_64(req->bytes);
+
+		if (size == 0 || size > GPU_BUFFER_MAX || (req->address & 4095)) {
+			return kIOReturnBadArgument;
+		}
+		IOMemoryDescriptor * memory = IOMemoryDescriptor::withAddressRange(
+		    (mach_vm_address_t)req->address,
+		    (mach_vm_size_t)size,
+		    kIODirectionInOut,
+		    fTask != NULL ? fTask : current_task());
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		if (memory->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+			memory->release();
+			return kIOReturnVMError;
+		}
+
+		IOLockLock(gGPULock);
+		struct gpu_buffer * b = NULL;
+		uint32_t handle = 0;
+		for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
+			uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
+			if (fBuffers[i].memory == NULL) {
+				b = &fBuffers[i];
+				handle = i + 1;
+				fNextBuffer = i + 1;
+				break;
+			}
+		}
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			memory->complete(kIODirectionInOut);
+			memory->release();
+			return kIOReturnNoResources;
+		}
+		bzero(b, sizeof(*b));
+		b->memory = memory;
+		b->kernel = NULL;
+		b->size = size;
+		b->flags = MSM_BO_CACHED;
+		b->address = 0;
+		b->seen = true;
+		b->client_iova = true;
+		b->imported = true;
+		b->surface = MiniIOSurfaceCopyForMemory(memory, size);
+		if (b->surface != NULL) {
+			hakios_gpu_trace("tl: air83 import surface: handle %u surface %u bytes %llu\n",
+			    handle, b->surface->sid, size);
+		}
+		fBufferCount++;
+		fBufferBytes += size;
+		hakios_gpu_trace("tl: air82 BoImport: handle %u user %#llx bytes %llu\n", handle, req->address, size);
+		IOLockUnlock(gGPULock);
+
+		reply->handle = handle;
+		*output_size = sizeof(*reply);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodSubmit: {
+		if (input == NULL || input_size < sizeof(uint32_t) * 2 + sizeof(uint64_t) * 3 ||
+		    output == NULL || *output_size < sizeof(NativeAdrenoAbiSubmitReply)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiSubmit * req = (const NativeAdrenoAbiSubmit *)input;
+		NativeAdrenoAbiSubmitReply * reply = (NativeAdrenoAbiSubmitReply *)output;
+
+        if (req->buffer_count == 0 || req->buffer_count > GPU_SUBMIT_CMDS ||
+            input_size < offsetof(NativeAdrenoAbiSubmit, buffers) +
+                req->buffer_count * sizeof(NativeAdrenoAbiSubmitBuffer)) {
+			return kIOReturnBadArgument;
+		}
+
+		uint64_t addresses[GPU_SUBMIT_CMDS];
+		uint32_t words[GPU_SUBMIT_CMDS];
+
+		IOLockLock(gGPULock);
+        if (gGPUReported) {
+            IOLockUnlock(gGPULock);
+            return kIOReturnNotResponding;
+        }
+		/* Imports need synchronization even when only the IB handles are listed here. */
+		IOReturn synchronized = syncImported(true, 0);
+		if (synchronized != kIOReturnSuccess) {
+			IOLockUnlock(gGPULock);
+			return synchronized;
+		}
+		for (uint32_t i = 0; i < req->buffer_count; i++) {
+			struct gpu_buffer * b = buffer((uint32_t)req->buffers[i].handle);
+            if (b == NULL || b->native_release_pending || b->address == 0 || (req->buffers[i].iova & 3) ||
+                (req->buffers[i].bytes & 3) || req->buffers[i].bytes == 0 ||
+                req->buffers[i].iova < b->address || req->buffers[i].iova - b->address >= b->size ||
+                req->buffers[i].bytes > b->size - (req->buffers[i].iova - b->address)) {
+                hakios_tl("tl: air87 reject submit IB client %u: index %u handle %llu iova %#llx bytes %llu\n",
+                    fNativeId, i, req->buffers[i].handle, req->buffers[i].iova, req->buffers[i].bytes);
+                IOLockUnlock(gGPULock);
+                return kIOReturnBadArgument;
+            }
+			/*
+			 * Every buffer the core is about to read is pushed out of this processor's cache, not
+			 * only the imported ones. Allocated buffers carried `seen = false`, so their words were
+			 * never cleaned: the first client's command buffer happened to be in memory, and the
+			 * next one -- its pages freshly allocated and its words written by the program -- could
+			 * be fetched by the command processor before they reached it. What the core then runs
+			 * is not what this processor wrote.
+			 */
+			if (b->kernel != NULL) {
+				hakios_gpu_to_memory(b->kernel, b->size);
+			}
+			addresses[i] = req->buffers[i].iova;
+			words[i] = (uint32_t)(req->buffers[i].bytes / 4);
+		}
+		{
+			uint32_t cut = ibCut();
+
+			if (cut != 0 && words[0] > cut) {
+				words[0] = cut;
+				hakios_gpu_trace("tl: adreno_ib_cut: the first command buffer is cut to %u words\n", cut);
+			}
+		}
+		hakios_gpu_to_memory(NULL, 0);
+
+		char who[32] = {};
+		proc_selfname(who, sizeof(who));
+        bool logIB = ++fNativeSubmitCount <= 2 && hakios_gpu_debug();
+        if (logIB || (fNativeSubmitCount & 31) == 0)
+            hakios_gpu_trace("tl: air87 submit client %u [%s] number %u next fence %u IB %#llx words %u\n",
+                fNativeId, who, fNativeSubmitCount, hakios_gpu_last() + 1, addresses[0], words[0]);
+		{
+			/* what the core is about to be given, where this processor sees it */
+			struct gpu_buffer * b0 = buffer((uint32_t)req->buffers[0].handle);
+			uint32_t off = b0 != NULL ? (uint32_t)((req->buffers[0].iova - b0->address) / 4) : 0;
+
+			hakios_gpu_trace("tl: tunnel ib 0 at %#llx: %u words\n",
+			    (unsigned long long)req->buffers[0].iova, words[0]);
+            if (logIB && b0 != NULL && b0->kernel != NULL && words[0] != 0 && words[0] <= 1024 &&
+			    off + words[0] <= b0->size / 4) {
+				uint32_t * at = (uint32_t *)b0->kernel + off;
+				uint32_t n = words[0];
+
+				for (uint32_t k = 0; k < n; k += 8) {
+					uint32_t w[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+					for (uint32_t j = 0; j < 8 && k + j < n; j++) {
+						w[j] = at[k + j];
+					}
+					hakios_gpu_trace("tl: tunnel ib %u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+					    k, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+				}
+			}
+			uint32_t nop = ibNop();
+
+			if (nop != 0 && b0 != NULL && b0->kernel != NULL && nop < words[0] &&
+			    off + words[0] <= b0->size / 4) {
+				uint32_t * at = (uint32_t *)b0->kernel + off;
+				uint32_t pkts = ibNopPackets();
+				uint32_t i = nop;
+
+				for (uint32_t p = 0; p < pkts && i < words[0]; p++) {
+					uint32_t w = at[i], type = w >> 28;
+					uint32_t cnt = (type == 7) ? (w & 0x7FFF) : (type == 4) ? (w & 0x1F) : 0;
+					uint32_t end = i + 1 + cnt;
+
+					if (end > words[0]) {
+						end = words[0];
+					}
+					hakios_gpu_trace("tl: adreno_ib_nop: words %u..%u (%08x) become NOPs\n",
+					    i, end - 1, w);
+					for (uint32_t k = i; k < end; k++) {
+						at[k] = 0x70100000;     /* CP_NOP, no payload */
+					}
+					i = end;
+				}
+				hakios_gpu_to_memory(b0->kernel, b0->size);
+			}
+		}
+
+		uint32_t fence = hakios_gpu_submit(addresses, words, req->buffer_count);
+		if (fence == 0) {
+			IOLockUnlock(gGPULock);
+			return kIOReturnBusy;
+		}
+		for (uint32_t i = 0; i < req->buffer_count; i++) {
+			struct gpu_buffer * b = buffer((uint32_t)req->buffers[i].handle);
+			if (b != NULL) {
+				b->fence = fence;
+			}
+		}
+        /* The ABI lists IBs only. Fence every active Native BO conservatively.
+         * A BO already handed to BoFree has no future userspace references;
+         * keep its recorded retirement fence stable until the release retry. */
+		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+            if (fBuffers[i].memory != NULL && fBuffers[i].client_iova &&
+                !fBuffers[i].native_release_pending) {
+				fBuffers[i].fence = fence;
+				if (fBuffers[i].surface != NULL) {
+					fBuffers[i].surface->drawn = fence;
+					hakios_gpu_trace("tl: air83 surface submitted: surface %u fence %u\n", fBuffers[i].surface->sid, fence);
+				}
+			}
+		}
+		reply->fence = fence;
+		*output_size = sizeof(*reply);
+		IOLockUnlock(gGPULock);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodWaitFence: {
+		if (input == NULL || input_size < sizeof(NativeAdrenoAbiWaitFence)) {
+			return kIOReturnBadArgument;
+		}
+		const NativeAdrenoAbiWaitFence * req = (const NativeAdrenoAbiWaitFence *)input;
+		if (req->fence == 0) {
+			return kIOReturnBadArgument;
+		}
+
+		IOLockLock(gGPULock);
+		if (req->timeout_ns == 0) {
+			bool done = hakios_gpu_done((uint32_t)req->fence);
+			IOReturn synchronized = done ? syncImported(false, (uint32_t)req->fence) : kIOReturnTimeout;
+			IOLockUnlock(gGPULock);
+			return synchronized;
+		}
+
+		uint64_t patience = req->timeout_ns / 1000000ULL;
+		if (patience == 0) {
+			patience = 1;
+		}
+
+		char who[32] = {};
+		proc_selfname(who, sizeof(who));
+        if (fNativeWaitLogged != (uint32_t)req->fence) {
+            fNativeWaitLogged = (uint32_t)req->fence;
+            if (fNativeSubmitCount <= 2 || gGPUReported)
+                hakios_gpu_trace("tl: air87 wait client %u [%s] fence %llu timeout_ns %llu\n",
+                    fNativeId, who, req->fence, req->timeout_ns);
+        }
+        if (gGPUReported) {
+            IOLockUnlock(gGPULock);
+            /* Retrying a known failed fence must not become an 8-us log loop. */
+            delay_for_interval((uint32_t)(patience < 100 ? patience : 100), NSEC_PER_MSEC);
+            return kIOReturnTimeout;
+        }
+
+		bool done = gpuWait((uint32_t)req->fence, patience);
+		IOReturn synchronized = done ? syncImported(false, (uint32_t)req->fence) : kIOReturnTimeout;
+		IOLockUnlock(gGPULock);
+		return synchronized;
+	}
+
+	case kNativeAdrenoMethodGetTimestamp: {
+		if (output == NULL || *output_size < sizeof(NativeAdrenoAbiTimestamp)) {
+			return kIOReturnBadArgument;
+		}
+		NativeAdrenoAbiTimestamp * reply = (NativeAdrenoAbiTimestamp *)output;
+		reply->ticks = mach_absolute_time();
+		*output_size = sizeof(*reply);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodGetStatus: {
+		if (output == NULL || *output_size < sizeof(NativeAdrenoAbiStatus)) {
+			return kIOReturnBadArgument;
+		}
+		NativeAdrenoAbiStatus * reply = (NativeAdrenoAbiStatus *)output;
+		reply->faults = 0;
+		reply->suspends = 0;
+		*output_size = sizeof(*reply);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodSetMetadata: {
+		if (input != NULL && input_size >= sizeof(NativeAdrenoAbiMetadata)) {
+			const NativeAdrenoAbiMetadata * meta = (const NativeAdrenoAbiMetadata *)input;
+			char line[kNativeAdrenoAbiMetadataBytes + 1] = {};
+			uint32_t len = meta->bytes < kNativeAdrenoAbiMetadataBytes ? meta->bytes : kNativeAdrenoAbiMetadataBytes;
+			memcpy(line, meta->text, len);
+			line[len] = '\0';
+			char who[32] = {};
+			proc_selfname(who, sizeof(who));
+			IOLog("NativeAdreno: [%s] metadata report: %s\n", who, line);
+		}
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodGetMetadata:
+		return kIOReturnSuccess;
+
+	case kNativeAdrenoMethodCreateQueue: {
+		if (output == NULL || *output_size < sizeof(NativeAdrenoAbiQueueReply)) {
+			return kIOReturnBadArgument;
+		}
+		NativeAdrenoAbiQueueReply * reply = (NativeAdrenoAbiQueueReply *)output;
+		reply->queue = 1;
+		*output_size = sizeof(*reply);
+		return kIOReturnSuccess;
+	}
+
+	case kNativeAdrenoMethodCloseQueue:
+		return kIOReturnSuccess;
+
+	case 0x7001: { /* NGP_METHOD_MODE */
+		struct NGPMode {
+			uint32_t version;
+			uint32_t format;
+			uint32_t width;
+			uint32_t height;
+			uint32_t stride;
+			uint64_t bytes;
+		};
+		if (output == NULL || *output_size < sizeof(struct NGPMode)) {
+			return kIOReturnBadArgument;
+		}
+		struct NGPMode * mode = (struct NGPMode *)output;
+		mode->version = 1;
+		mode->format = 1; /* NGP_BGRX8888 */
+		mode->width = vinfo.v_width;
+		mode->height = vinfo.v_height;
+		mode->stride = vinfo.v_rowbytes;
+		mode->bytes = (uint64_t)vinfo.v_rowbytes * vinfo.v_height;
+		*output_size = sizeof(*mode);
+		return kIOReturnSuccess;
+	}
+
+	case 0x7002: { /* NGP_METHOD_WAIT_SWAP */
+		IOSleep(16);
+		return kIOReturnTimeout;
+	}
+
+	case 0x7003: { /* NGP_METHOD_COMPLETE_SWAP */
+		return kIOReturnSuccess;
+	}
+
+	default:
+		IOLog("HakiosGPU: unknown tunnel method %u\n", method);
+		return kIOReturnUnsupported;
+	}
+}
+
 IOReturn
 HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
 {
+	if (args == NULL || fBuffers == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (!hakios_gpu_ready() && selector != kHakiosShow && selector != kHakiosLog) {
+		return kIOReturnNotReady;                       /* given back: the run is ending */
+	}
+
+	/* NativeAdreno wire tunnel from Turnip / NativeAdrenoMetal */
+	if (args->structureInput != NULL && args->structureInputSize >= 8 &&
+	    ((const uint32_t *)args->structureInput)[0] == NATIVE_ADRENO_TUNNEL_MAGIC) {
+		const uint32_t * header = (const uint32_t *)args->structureInput;
+		uint32_t method = header[1];
+		if (method == 0xffffffffu) {
+			return kIOReturnSuccess;
+		}
+		{
+			static uint32_t sWaits = 0;
+
+            if (method == kNativeAdrenoMethodSubmit || method == kNativeAdrenoMethodGetDeviceInfo ||
+                (method == kNativeAdrenoMethodWaitFence && sWaits++ < 3)) {
+				hakios_gpu_trace("tl: tunnel method %#x, in %u bytes, out %u\n", method,
+				    (unsigned) args->structureInputSize, (unsigned) args->structureOutputSize);
+			}
+		}
+		return handleTunnel(method, (const uint8_t *)args->structureInput + 8,
+		    args->structureInputSize - 8, args->structureOutput, &args->structureOutputSize);
+	}
+
 	union {
 		struct msm_param param;
 		struct msm_gem_new gemNew;
@@ -1091,20 +2586,23 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct drm_gem_close close;
 		struct hakios_surface surface;
 		struct hakios_show show;
+		struct hakios_log log;
 	} r;
 	size_t size = args->structureInputSize;
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
 
-	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
+	if (args->structureInput == NULL || size > sizeof(r)) {
 		return kIOReturnBadArgument;
-	}
-	if (!hakios_gpu_ready() && selector != kHakiosShow) {
-		return kIOReturnNotReady;                       /* given back: the run is ending */
 	}
 	bzero(&r, sizeof(r));
 	memcpy(&r, args->structureInput, size);
+
+	if (selector != kHakiosLog) {
+		hakios_gpu_trace("tl: msm method %#x, in %u bytes, out %u\n", selector,
+		    (unsigned) args->structureInputSize, (unsigned) args->structureOutputSize);
+	}
 
 	switch (selector) {
 	case kMsmGetParam:
@@ -1130,6 +2628,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 				waitOver(&r.cpuPrep.timeout, hakios_gpu_last());
 			}
 		}
+		probeReport();
 		IOLockUnlock(gGPULock);
 		slowWait("cpu-prep", waitBegan);
 		break;
@@ -1146,6 +2645,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 				waitOver(&r.waitFence.timeout, r.waitFence.fence);
 			}
 		}
+		probeReport();                          /* (the client's submission is done: its probes are read now) */
 		IOLockUnlock(gGPULock);
 		slowWait("fence", waitBegan);
 		break;
@@ -1176,6 +2676,13 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		break;
 	case kHakiosShow:
 		ret = show(&r.show);
+		break;
+	case kHakiosLog:                                /* ours: a program's line into the loader's log */
+		if (r.log.length >= sizeof(r.log.text)) {
+			r.log.length = sizeof(r.log.text) - 1;
+		}
+		r.log.text[r.log.length] = 0;
+		hakios_gpu_trace("%s\n", r.log.text);
 		break;
 	default:
 		IOLog("HakiosGPU: request %#x (%zu bytes) is not known here\n", selector, size);

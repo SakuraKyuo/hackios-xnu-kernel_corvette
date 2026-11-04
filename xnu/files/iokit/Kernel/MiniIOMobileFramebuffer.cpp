@@ -38,6 +38,8 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" void hakios_gpu_trace(const char * format, ...) __printflike(1, 2);
+extern "C" bool hakios_gpu_debug(void);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -112,7 +114,7 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
 #define kFBDefaultScale         3
 static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
 /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
-static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+static TUNABLE(uint32_t, gFBTrace, "fbtrace", 0);
 
 /*
  * A recording of the screen, for a machine one cannot look at while it runs (the phone is
@@ -249,6 +251,7 @@ public:
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
 	unsigned        fSwapFirst, fSwapsWaiting;
+	uint32_t        fSwapCompleted;        /* protected by fSwapLock, after the panel copy */
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -296,6 +299,7 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
+	IOReturn waitSwap(uint32_t wanted);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
@@ -401,6 +405,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
+	fSwapCompleted = 0;
 	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
@@ -846,7 +851,7 @@ IOMobileFramebuffer::reportFrameTimes(void)
 		}
 	}
 	if (total != 0) {
-		IOLog("MiniIOMobileFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
+		hakios_gpu_trace("MiniIOMobileFramebuffer: from one frame to the next: %u times under 10 ms, %u under 18, %u under 26, %u under 35, "
 		    "%u longer (the longest %u ms); half under %u ms, 95 in 100 under %u ms; %u pauses\n", within[0], within[1],
 		    within[2], within[3], within[4], fFrameLongest, half, most, fFramePauses);
 	}
@@ -867,7 +872,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
-		hakios_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+		hakios_gpu_trace("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
 	}
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
@@ -892,6 +897,24 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
+}
+
+/* A caller reuses a surface only once the requested swap finished its panel copy. */
+IOReturn
+IOMobileFramebuffer::waitSwap(uint32_t wanted)
+{
+	AbsoluteTime deadline;
+	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
+	IOLockLock(fSwapLock);
+	while ((int32_t)(fSwapCompleted - wanted) < 0) {
+		if (IOLockSleepDeadline(fSwapLock, &fSwapCompleted, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+		    (int32_t)(fSwapCompleted - wanted) < 0) {
+			IOLockUnlock(fSwapLock);
+			return kIOReturnTimeout;
+		}
+	}
+	IOLockUnlock(fSwapLock);
+	return kIOReturnSuccess;
 }
 
 void
@@ -987,7 +1010,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fLastFrame = began;
 	report = fSwapsShown < 8;
 	if (report) {
-		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
+		hakios_gpu_trace("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
@@ -1017,7 +1040,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
 		s = surfaces[layer];
 		if (report) {
-			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
+			hakios_gpu_trace("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
 			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
 			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
@@ -1043,13 +1066,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (recorded != NULL) {
 		record(recorded);
 	}
+	IOLockLock(fSwapLock);
+	fSwapCompleted = swapWord(swap, SWAP_ID);
+	IOLockWakeup(fSwapLock, &fSwapCompleted, false);
+	IOLockUnlock(fSwapLock);
+    if (fSwapsShown < 8 || (fSwapCompleted % 120) == 0)
+        hakios_gpu_trace("tl: air87 display completed: swap %u surface %u\n", fSwapCompleted, swapWord(swap, SWAP_SURFACE(0)));
 	fSwapsShown++;
 	if (gTouchLat) {
-		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+		hakios_gpu_trace("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
 		    micros(drawn));
 	}
 	if (layers != fLayersShown) {
-		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
+		hakios_gpu_trace("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
 		    fLayersShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)), swapWord(swap, SWAP_SURFACE(2)),
 		    swapWord(swap, SWAP_SURFACE(3)));
 		fLayersShown = layers;
@@ -1069,7 +1098,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
 		absolutetime_to_nanoseconds(fStatWaiting, &waiting);
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
-		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
+		hakios_gpu_trace("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
 		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
@@ -1084,7 +1113,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 			/* (CoreAnimation has made itself a new surface for every frame: see "the frames' surfaces" above) */
 			MiniIOSurfaceCost(&made, &making, &freed, &freeing, &again);
-			IOLog("MiniIOMobileFramebuffer: the frames came in surfaces %u, %u, %u, %u, %u and on, none twice; in that time "
+			hakios_gpu_trace("MiniIOMobileFramebuffer: the frames came in surfaces %u, %u, %u, %u, %u and on, none twice; in that time "
 			    "%u surfaces of all kinds were made, in %llu us each (%u of them of memory kept from one before), and %u "
 			    "freed, in %llu us each\n", fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
 			    fStatSurfaces[4], made, making, again, freed, freeing);
@@ -1094,7 +1123,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatWaiting = fStatBeatWait = 0;
 		reportFrameTimes();
 		if (fDiff) {
-			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
+			hakios_gpu_trace("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
 			    fDiffPixels / fStatFrames, fDiffLeft, fDiffTop, fDiffRight, fDiffBottom);
 			fDiffPixels = 0;
 			fDiffLeft = fDiffTop = ~0u;
@@ -1206,7 +1235,7 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32
 {
 	mach_port_t old;
 
-	IOLog("MiniIOMobileFramebuffer: notification port for type %u\n", (unsigned) type);
+	hakios_gpu_trace("MiniIOMobileFramebuffer: notification port for type %u\n", (unsigned) type);
 	if (type >= kFBNotifyTypes) {
 		return kIOReturnBadArgument;
 	}
@@ -1349,12 +1378,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		fOwner->present((const uint8_t *) args->structureInput);
 		return kIOReturnSuccess;
 
-	case kFBMethodSwapWait:                         /* a swap is on the screen as soon as it is made */
+	case kFBMethodSwapWait:                         /* wait until this swap's panel copy is complete */
 		if (gTouchLat) {
-			hakios_tl("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
+			hakios_gpu_trace("tl: w %llu %#llx %#llx at %llu\n", args->scalarInputCount > 0 ? in[0] : 0,
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
-		return kIOReturnSuccess;
+		return args->scalarInputCount > 0 && in[0] != 0 ? fOwner->waitSwap((uint32_t)in[0]) : kIOReturnSuccess;
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
@@ -1477,9 +1506,27 @@ publishDisplayNode(void)
 class IOAcceleratorES : public IOService
 {
 	OSDeclareDefaultStructors(IOAcceleratorES);
+
+public:
+	virtual IOReturn newUserClient(task_t owningTask, void * securityID,
+	    UInt32 type, OSDictionary * properties,
+	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+
+extern "C" IOReturn hakios_adreno_new_user_client(IOService * service, task_t owningTask, void * securityID,
+    UInt32 type, OSDictionary * properties, IOUserClient ** handler);
+
+IOReturn
+IOAcceleratorES::newUserClient(task_t owningTask, void * securityID,
+    UInt32 type, OSDictionary * properties,
+    IOUserClient ** handler)
+{
+	/* Who wants it and with what type: Metal is the only one expected, at its step 5. */
+	IOLog("IOAcceleratorES: a user client is asked for (type %#x)\n", (unsigned) type);
+	return hakios_adreno_new_user_client(this, owningTask, securityID, type, properties, handler);
+}
 
 static void
 publishAccelerator(IOService * provider)
@@ -1488,6 +1535,20 @@ publishAccelerator(IOService * provider)
 
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
 		accelerator->setName("sgx");
+		/*
+		 * A service made here has no IOClass property (only a kext's services get one, from the
+		 * personality), and IOServiceMatching("IOAcceleratorES") matches on that property: without
+		 * it Metal finds no accelerator at all, whatever else the service says.
+		 */
+		accelerator->setProperty("IOClass", "IOAcceleratorES");
+		accelerator->setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
+		/*
+		 * Metal loads /System/Library/Extensions/<MetalPluginName>.bundle. That directory is the
+		 * union of the system volume's Extensions and the small image's /redwood/Extensions, and
+		 * NativeAdrenoMetal.bundle is in the latter, so the plain name finds it.
+		 */
+		accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+		accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
 		accelerator->registerService();
 	}
 	OSSafeReleaseNULL(accelerator);
