@@ -9,13 +9,24 @@ tree and its Android.
 | SoC | Qualcomm Snapdragon 8 Gen 3 (SM8650, "pineapple" in the device tree) |
 | UEFI for the phone | `uefi/`: a port of Mu-Silicium (a patch and files; `apply.sh` clones and applies, `export.sh` saves) |
 | Prebuilt UEFI images | `prebuilt/`: `SILICIUM_UEFI.fd` (3 MB), `BootShim.bin`, the device tree `device-tree.dtb` (the phone's Android kernel's) |
-| Images to flash | `mkflashable.py`: `boot-v4.img`, `boot-uefi-only.img`, `boot-v0-ramdisk.img` |
+| Images to flash | `mkflashable.py`: `boot-v4.img` only |
 | The phone's firmware | **not in the repository**: `pull-firmware.sh` pulls it off your phone over `adb` |
 
 The touchscreen is a **Synaptics S3910** (TCM over SPI), not the Goodix GT9916S of the POCO: the
 driver is in `xnu/files/bsd/dev/hakios.goodix.c` and picks this phone's numbers in `board_corvette`
 (raw full scale 12640 x 27800: the chip counts tenths of a pixel; MOVE reports are capped at 125 Hz
 because the compositor cannot take more).
+
+## GPU: basic accelerated desktop milestone
+
+Adreno 750 / gen70900 can run the Native Metal backend, composite the desktop,
+and draw widgets. The kernel draw/readback check stays enabled; its orange/white/blue
+panel pattern is now opt-in (`gpu_test_pattern=1`). Normal GPU traces and touch
+position/periodic logs are quiet by default; errors remain visible.
+
+This is a bring-up milestone, not complete iOS Metal/media compatibility or a
+long-term stability certification. See [GPU build, evidence and remaining work](../../docs/corvette-gpu.md)
+for the exact external binary inputs, reproducible deployment and known limits.
 
 ## The memory map
 
@@ -38,17 +49,17 @@ From the top of the repository:
 ```sh
 make kernel JOBS=8                        # xnu-src/, DEVICE-independent
 make loader                               # needs xnuloader/identity.h (from your own IPSW)
-devices/corvette/mkflashable.py           # the boot images, from the stock firmware + loader.efi
+devices/corvette/mkflashable.py           # boot-v4.img, from the UEFI FD + loader.efi
 ```
 
-`mkflashable.py` reads the stock `init_boot.img` (for its ramdisk and its os version) from the
-firmware package given with `-f`, and writes into `out-corvette/` (or `-o`). Both boot images
-claim the stock "Android 14.0.0, 2026-04" so a firmware that enforces a rollback index has nothing
-to complain about.
+`mkflashable.py` writes only `boot-v4.img` into `out-corvette/` (or `-o`).
+It packages the UEFI FD and USB loader with Android boot header v4 and the stock
+Android 14.0.0 / 2026-04 OS metadata. Its temporary USB payload is removed after
+packing; no stock firmware extraction is needed.
 
-`boot-v4.img` is the layout the phone ships with: header v4, **no ramdisk in boot.img**, the
-firmware takes the generic ramdisk from the stock `init_boot` (flash the stock `init_boot` back).
-`boot-uefi-only.img` is the same without the payload, to watch the UEFI alone come up.
+The boot image has no ramdisk. The device uses the generic ramdisk already present
+in its stock `init_boot`; this script generates no `init_boot` image and requires
+no changes to that partition.
 
 ## What the loader knows about this phone
 
@@ -70,7 +81,9 @@ A kernel started on CPU7 (`bootcpu=7`) leaves CPU0 to the loader, whose USB poll
 Nothing of the phone's user data is written. With the loader running (UEFI from `boot-v4.img`):
 
 ```sh
-fastboot oem ramdisk <system.apfs>        # the iOS root volume, ~2.4 GB, into RAM (md0)
+fastboot reboot bootloader               # reset SoC state before a fresh GPU run
+fastboot oem ramdisk                      # the next download becomes the root image in RAM
+fastboot stage <system.apfs>              # the iOS root volume, ~2.4 GB (md0)
 fastboot stage run-kernel.bin             # the XNUP payload: the kernel, ~15 MB
 fastboot oem run                          # start it on CPU7
 ```
@@ -81,7 +94,12 @@ The log is pulled with `fastboot get_staged`:
 - `result: returned` — straight to `get_staged`; an `oem log` in between overwrites what the
   kernel left there.
 
-The kernel stops itself after the session's seconds and hands the log back to the loader.
+The kernel keeps running until an explicit halt or return request; the host log wait does not stop it.
+Warm reruns are currently suspended after reported 900E failures. `oem stop` does
+not reset SoC registers, and uploading a full image does not reset them either.
+Reboot into the bootloader before a fresh full stage. Do not repeat a failing
+address-access experiment to collect evidence after a 900E.
+
 
 ## Wi-Fi: WCN7850 "Kiwi"
 
