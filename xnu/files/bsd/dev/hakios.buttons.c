@@ -1,12 +1,12 @@
 /*
- * The buttons of the POCO X5 Pro (redwood) -- power, volume up, volume down -- as a source of
- * button records for /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg buttons=1:
- * every address below belongs to this phone.
+ * The buttons of the OnePlus Ace 3 Pro (corvette) -- power, volume up, volume down -- as a
+ * source of button records for /dev/hakios-touch (sys/hakios.input.h). The PMIC arbiter and
+ * peripheral mapping below are from the SM8650 device tree; only reads are issued.
  *
  * None of the three is a pin of the SoC. They are inputs of two of the power management chips:
- *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
- *   volume down  RESIN_N of the same block
- *   volume up    GPIO6 of the PM7325, pulled up; the key pulls it low
+ *   power        KPDPWR_N of the power-on block ("PON") of the PMK8550
+ *   volume up    RESIN_N of the same block
+ *   volume down  GPIO6 of the PM8550, pulled up; the key pulls it low
  * Both chips sit on the SPMI bus (slaves 0 and 1), and the way to that bus is the SoC's "PMIC
  * arbiter": it owns the bus and gives each of the systems on the chip (this one, the modem, the
  * always-on processor, TrustZone...) a set of registers per PMIC peripheral -- a "channel" -- to
@@ -33,12 +33,12 @@
  * The bring-up is made in steps, each said in the log before it is made. Boot-arg
  * buttons_steps=N stops after the first N:
  *   1  map the arbiter and read its version             (the first access to that block)
- *   2  find the channels of the two peripherals         (reads of the arbiter's tables)
+ *   2  find the APIDs of the two peripherals         (reads of the arbiter's tables)
  *   3  ask each peripheral what it is                   (the first transfers on the bus)
  *   4  read how the keys' inputs are set up, and what they say now
  *   5  watch them                                       (the default)
  *
- * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 5),
+ * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 7),
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
  * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
  */
@@ -93,22 +93,23 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
-#define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
+#define ARB_CORE_PHYS           0x0c400000UL    /* pineapple DT: "core" */
+#define ARB_CORE_SIZE           0x3000UL
+#define ARB_CNFG_PHYS           0x0c42d000UL    /* pineapple DT: "cnfg" */
+#define ARB_CNFG_SIZE           0x4000UL
+#define ARB_OBSERVER_PHYS       0x0c440000UL    /* pineapple DT: "obsrvr" */
+#define ARB_OBSERVER_SIZE       0x80000UL       /* v7 observers: 0x8000 per EE, 0x20 per APID */
+#define ARB_SYSTEM              0               /* pineapple DT: qcom,ee = 0 */
 
-#define ARB_VERSION             0x000
-#define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
+#define ARB_VERSION             0x0000
 #define ARB_VERSION_7           0x70000000u
-#define ARB_FEATURES            0x004           /* [10:0] the number of channels */
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts go to the owner */
-#define ARB_CHANNEL_INTERRUPTS  (1u << 24)
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
-#define ARB_MAX_CHANNELS        512
+#define ARB_VERSION_8           0x80000000u
+#define ARB_FEATURES            0x0004          /* [10:0] APIDs on SPMI bus 0 */
+#define ARB_APID_MAP(n)         (0x2000 + 4 * (n))       /* v7 core: APID -> PPID */
+#define ARB_APID_OWNER(n)       (4 * (n))               /* v7 cnfg, primary bus */
+#define ARB_OBSERVER_EE(n)      (0x8000 * (n))
+#define ARB_OBSERVER_APID(n)    (0x20 * (n))
+#define ARB_MAX_APIDS           1024
 
 #define OBSERVER_COMMAND        0x00
 #define OBSERVER_STATUS         0x08
@@ -149,8 +150,8 @@ struct peripheral {
 	uint16_t        channel;
 	bool            found;
 };
-static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
-static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static struct peripheral pon = { .name = "the PMK8550's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
+static struct peripheral pin = { .name = "GPIO6 of the PM8550", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -164,7 +165,7 @@ static struct {
 static const char *
 spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	vm_offset_t channel = arb_observer + ARB_OBSERVER_EE(ARB_SYSTEM) + ARB_OBSERVER_APID(p->channel);
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
@@ -214,14 +215,14 @@ static void
 find_channel(struct peripheral *p, uint32_t channels)
 {
 	for (uint32_t n = 0; n < channels; n++) {
-		uint32_t map = rd(arb_core + ARB_CHANNEL(n)), owner;
+		uint32_t map = rd(arb_core + ARB_APID_MAP(n)), owner;
 
 		if (map == 0 || ((map >> 8) & 0xfff) != p->id) {
 			continue;
 		}
-		owner = rd(arb_cnfg + ARB_OWNER(n)) & 7;
-		printf("buttons: channel %u is %s (%#x); written by system %u%s\n", n, p->name, map, owner,
-		    (map & ARB_CHANNEL_INTERRUPTS) ? ", which also gets its interrupts" : "");
+		owner = rd(arb_cnfg + ARB_APID_OWNER(n)) & 7;
+		printf("buttons: APID %u is %s (%#x); writable by system %u%s\n", n, p->name, map, owner,
+		    (map & (1u << 24)) ? ", and owns its interrupts" : "");
 		if (!p->found || owner == ARB_SYSTEM) {
 			p->found = true;
 			p->channel = (uint16_t)n;
@@ -333,20 +334,20 @@ buttons_poll(void)
 	const char *problem;
 	uint8_t status;
 
-	if (power.usable || volume_down.usable) {
+	if (power.usable || volume_up.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
 			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&volume_up, status & PON_RESIN);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
 		}
 	}
-	if (volume_up.usable) {
+	if (volume_down.usable) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&volume_up, !(status & GPIO_LEVEL));
+			button_look(&volume_down, !(status & GPIO_LEVEL));
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pin.name, problem);
@@ -399,12 +400,12 @@ pon_inputs(void)
 	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
 	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
-	power.usable = volume_down.usable = true;
+	power.usable = volume_up.usable = true;
 	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	volume_up.last = r[0] & PON_RESIN;
 }
 
-/* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
+/* Step 4 for the pin: it is volume down only if it is an input with a pull-up, and switched on. */
 static void
 pin_input(void)
 {
@@ -423,18 +424,18 @@ pin_input(void)
 	}
 	mode = c[0] & 3;
 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+	printf("buttons: volume down's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
-		    "which this driver does not do: volume up is left alone\n");
+		printf("buttons: volume down's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+		    "which this driver does not do: volume down is left alone\n");
 		return;
 	}
-	volume_up.usable = true;
-	volume_up.last = !(status & GPIO_LEVEL);
+	volume_down.usable = true;
+	volume_down.last = !(status & GPIO_LEVEL);
 }
 
 static void
@@ -450,7 +451,7 @@ say_summary(void)
 static void
 buttons_thread(void *parameter, __unused wait_result_t result)
 {
-	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
+	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, apids;
 	bool pon_known, pin_known;
 
 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
@@ -458,23 +459,28 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
-	version = rd(arb_core + ARB_VERSION);
-	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
-	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("buttons: this driver knows version 5 of the arbiter only: no buttons\n");
+	if (arb_core == 0 || arb_cnfg == 0 || arb_observer == 0) {
+		printf("buttons: an arbiter mapping failed; no PMIC reads are attempted\n");
 		goto out;
 	}
-	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
-		channels = ARB_MAX_CHANNELS;
+	version = rd(arb_core + ARB_VERSION);
+	apids = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	printf("buttons: PMIC arbiter version %#x, %u APIDs on SPMI bus 0\n", version, apids);
+	if (version < ARB_VERSION_7 || version >= ARB_VERSION_8) {
+		printf("buttons: this driver knows arbiter version 7 only: no buttons\n");
+		goto out;
+	}
+	if (apids == 0 || apids > ARB_MAX_APIDS) {
+		printf("buttons: invalid APID count %u; no peripheral scan is attempted\n", apids);
+		goto out;
 	}
 	if (steps < 2) {
 		goto out;
 	}
 
-	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
-	find_channel(&pon, channels);
-	find_channel(&pin, channels);
+	printf("buttons: step 2: look through the arbiter's table for the APIDs of the two peripherals\n");
+	find_channel(&pon, apids);
+	find_channel(&pin, apids);
 	if (steps < 3) {
 		goto out;
 	}
@@ -493,7 +499,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	if (pin_known) {
 		pin_input();
 	}
-	if (!power.usable && !volume_up.usable) {
+	if (!power.usable && !volume_up.usable && !volume_down.usable) {
 		printf("buttons: nothing that can be read: no buttons\n");
 		goto out;
 	}
