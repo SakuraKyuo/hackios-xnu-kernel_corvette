@@ -47,6 +47,49 @@
 
 /* ---- saying things ------------------------------------------------------------------------- */
 
+/*
+ * The kernel's vsnprintf(), and Linux's "%pV" (a format and its arguments, struct va_format) where
+ * it is a format's only conversion: what ath12k's debug.c says everything with ("%pV"; "ath12k: %pV").
+ */
+int
+lx_vformat(char *line, size_t size, const char *format, va_list list)
+{
+	const char *v = NULL;
+	bool alone;
+
+	for (const char *c = format; *c != 0 && v == NULL; c++) {
+		if (c[0] == '%' && c[1] == 'p' && c[2] == 'V') {
+			v = c;
+		}
+	}
+	alone = v != NULL;
+
+	for (const char *c = format; alone && *c != 0; c++) {
+		if (*c == '%' && c != v) {
+			if (c[1] == '%') {
+				c++;
+			} else {
+				alone = false;
+			}
+		}
+	}
+	if (alone && size > 0) {
+		struct va_format *vaf = va_arg(list, struct va_format *);
+		size_t at = (size_t)(v - format) < size - 1 ? (size_t)(v - format) : size - 1;
+		va_list inner;
+
+		memcpy(line, format, at);
+		line[at] = 0;
+		va_copy(inner, *vaf->va);
+		vsnprintf(line + at, size - at, vaf->fmt, inner);
+		va_end(inner);
+		at = strlen(line);
+		strlcpy(line + at, v + 3, size - at);
+		return ((int)strlen(line));
+	}
+	return (vsnprintf(line, size, format, list));
+}
+
 int
 printf(const char *format, ...)
 {
@@ -54,7 +97,7 @@ printf(const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	lx_vformat(line, sizeof(line), format, list);
 	va_end(list);
 	lx_os_print(line);
 	return (0);
@@ -219,6 +262,13 @@ void
 linux_rcu_read_unlock(unsigned type)
 {
 	__sync_fetch_and_sub(&rcu_readers, 1);
+}
+
+/* (asked by checks that something is looked at under RCU: whether anyone is) */
+bool
+linux_rcu_read_lock_held(unsigned type)
+{
+	return (rcu_readers > 0);
 }
 
 void
@@ -755,40 +805,79 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
+/* (LX_POOL_MB, LX_POOL_RINGS_MB: another size for one driver -- ath12k, whose rings come to under 3 MB and whose receive rings hold some 6700 buffers when idle) */
+#ifdef LX_POOL_MB
+#define POOL_SIZE	((uint32_t)(LX_POOL_MB) << 20)
+#define POOL_RINGS	((uint32_t)(LX_POOL_RINGS_MB) << 20)
+#else
 #define POOL_SIZE	(44u << 20)
 #define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#endif
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
+/*
+ * Where the kernel cannot give that much in one physical piece (the Xiaomi 14 Pro), the pool is
+ * pieces of LX_POOL_PIECE bytes each, taken one by one; a ring never straddles two of them, and a
+ * slot cannot. An offset into the pool is then the piece's number and the offset within it.
+ */
+#ifdef LX_POOL_PIECE
+#define POOL_PIECE	((uint32_t)(LX_POOL_PIECE))
+#else
+#define POOL_PIECE	POOL_SIZE
+#endif
+#define POOL_PIECES	(POOL_SIZE / POOL_PIECE)
+_Static_assert(POOL_SIZE % POOL_PIECE == 0 && POOL_RINGS % POOL_PIECE == 0 || POOL_PIECES == 1, "the pool's pieces");
 
 static struct {
-	uint8_t *memory;
-	unsigned long long address;		/* the radio's, of the first byte */
+	uint8_t *memory[POOL_PIECES];
+	unsigned long long address[POOL_PIECES];	/* the radio's, of each piece's first byte */
 	uint32_t rings_used;
 	uint32_t free_slots[POOL_SLOTS], free_count;
 } pool;
 
+#define POOL_AT(offset)		(pool.memory[(offset) / POOL_PIECE] + (offset) % POOL_PIECE)
+#define POOL_ADDRESS(offset)	(pool.address[(offset) / POOL_PIECE] + (offset) % POOL_PIECE)
+
 int
 lx_pool_init(void)
 {
-	if (pool.memory != NULL) {
+	if (pool.memory[0] != NULL) {
 		return (0);
 	}
-	pool.memory = lx_os_radio_memory(POOL_SIZE, &pool.address);
-	if (pool.memory == NULL) {
-		return (ENOMEM);
+	for (uint32_t i = 0; i < POOL_PIECES; i++) {
+		pool.memory[i] = lx_os_radio_memory(POOL_PIECE, &pool.address[i]);
+		if (pool.memory[i] == NULL) {
+			printf("lx: piece %u of %u of the radio's memory (%u KB) cannot be had\n", i, POOL_PIECES, POOL_PIECE >> 10);
+			return (ENOMEM);	/* (what was had stays: the kernel's side has shown it to the radio) */
+		}
 	}
 	for (uint32_t i = 0; i < POOL_SLOTS; i++) {
 		pool.free_slots[i] = POOL_SLOTS - 1 - i;
 	}
 	pool.free_count = POOL_SLOTS;
-	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", POOL_SIZE >> 20, pool.address);
+	printf("lx: %u MB for the radio to read and write, in %u piece(s); it knows them from %#llx on\n", POOL_SIZE >> 20,
+	    POOL_PIECES, pool.address[0]);
 	return (0);
+}
+
+/* the pool's offset of memory, or -1 if it is not the pool's (or the stretch leaves its piece) */
+static long
+pool_offset(const void *memory, size_t size)
+{
+	const uint8_t *m = memory;
+
+	for (uint32_t i = 0; i < POOL_PIECES; i++) {
+		if (pool.memory[i] != NULL && m >= pool.memory[i] && m + size <= pool.memory[i] + POOL_PIECE) {
+			return ((long)i * POOL_PIECE + (m - pool.memory[i]));
+		}
+	}
+	return (-1);
 }
 
 static bool
 in_pool(const void *memory, size_t size)
 {
-	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + POOL_SIZE);
+	return (pool_offset(memory, size) >= 0);
 }
 
 void *
@@ -797,18 +886,42 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 	uint32_t at;
 
 	size = roundup2(size, 64);
+#ifdef LX_COHERENT_APART
+	/*
+	 * A large piece (ath12k: the memory the firmware asks for, megabytes each, and the data
+	 * path's banks of link descriptors) is a piece of its own, which the kernel shows the radio
+	 * as it does the pool: the pool's part for rings stays for the rings.
+	 */
+	if (size >= LX_COHERENT_APART) {
+		unsigned long long address = 0;
+		void *memory = lx_os_radio_memory(size, &address);
+
+		printf("lx: %zu bytes for the radio in a piece of their own: %s%#llx\n", size, memory != NULL ? "at " : "NONE, ",
+		    address);
+		if (memory != NULL) {
+			*dma_handle = address;
+		}
+		return (memory);
+	}
+#endif
 	lx_os_lock();
 	at = pool.rings_used;
-	if (pool.memory == NULL || at + size > POOL_RINGS) {
+	if (size >= 4096) {
+		at = roundup2(at, 4096);		/* (Linux's are pages: ath12k checks its 4 KB tables for it) */
+	}
+	if (at % POOL_PIECE + size > POOL_PIECE) {
+		at = roundup(at, POOL_PIECE);		/* (a ring in one piece) */
+	}
+	if (pool.memory[0] == NULL || size > POOL_PIECE || at + size > POOL_RINGS) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
 	}
-	pool.rings_used += size;
+	pool.rings_used = at + size;
 	lx_os_unlock();
-	bzero(pool.memory + at, size);
-	*dma_handle = pool.address + at;
-	return (pool.memory + at);
+	bzero(POOL_AT(at), size);
+	*dma_handle = POOL_ADDRESS(at);
+	return (POOL_AT(at));
 }
 
 void
@@ -835,20 +948,38 @@ dma_free_noncoherent(struct device *dev, size_t size, void *memory, dma_addr_t h
 
 /*
  * FreeBSD's question for the physical address of memory, which LinuxKPI asks before it hands
- * memory to a device. Here the answer is the radio's address, for memory of the pool; no other
- * memory has one (0, which lkpi_dma_map_phys() below then refuses).
+ * memory to a device. Here the answer is the radio's address, for memory of the pool; other memory
+ * answers with its own address, and lkpi_dma_map_phys() below has the kernel show it to the radio.
  */
 vm_paddr_t
 pmap_kextract(vm_offset_t va)
 {
-	return (in_pool((void *)va, 1) ? pool.address + ((uint8_t *)va - pool.memory) : 0);
+	long at = pool_offset((void *)va, 1);
+
+	/* (other memory: its own address, which lkpi_dma_map_phys() tells from the radio's by its top bits) */
+	return (at >= 0 ? POOL_ADDRESS((uint32_t)at) : (vm_paddr_t)va);
 }
 
 /* A buffer handed to the radio: it must be the pool's. */
 dma_addr_t
 lkpi_dma_map_phys(struct device *dev, vm_paddr_t address, size_t length, enum dma_data_direction direction, unsigned long attributes)
 {
-	if (address < pool.address || address + length > pool.address + POOL_SIZE) {
+	bool reached = false;
+
+	/* the heap's (kmalloc()): shown to the radio where it is, by the kernel */
+	if (address >= 0xffff000000000000ull) {
+		unsigned long long io = lx_os_radio_reach((const void *)(uintptr_t)address, length);
+
+		if (io == 0) {
+			printf("lx: memory of the heap is given to the radio and cannot be shown to it (%zu bytes)\n", length);
+			return (DMA_MAPPING_ERROR);
+		}
+		return ((dma_addr_t)io);
+	}
+	for (uint32_t i = 0; i < POOL_PIECES && !reached; i++) {
+		reached = address >= pool.address[i] && address + length <= pool.address[i] + POOL_PIECE;
+	}
+	if (!reached) {
 		printf("lx: memory is given to the radio that it cannot reach (%zu bytes)\n", length);
 		return (DMA_MAPPING_ERROR);
 	}
@@ -898,7 +1029,7 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 	skb->prev = skb->next = skb;
 	skb->shinfo = (struct skb_shared_info *)((uint8_t *)skb + roundup2(sizeof(struct sk_buff), 64));
 	skb->truesize = size + NET_SKB_PAD;
-	skb->head = skb->data = pool.memory + POOL_RINGS + (size_t)slot * POOL_SLOT;
+	skb->head = skb->data = POOL_AT(POOL_RINGS + slot * POOL_SLOT);
 	skb_reset_tail_pointer(skb);
 	skb->end = skb->head + size + NET_SKB_PAD;
 	skb_reserve(skb, NET_SKB_PAD);
@@ -911,9 +1042,11 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 	if (skb == NULL) {
 		return;
 	}
-	if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_RINGS) {
+	long at = pool_offset(skb->head, 1);
+
+	if (at >= POOL_RINGS) {
 		lx_os_lock();
-		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + POOL_RINGS)) / POOL_SLOT);
+		pool.free_slots[pool.free_count++] = (uint32_t)((at - POOL_RINGS) / POOL_SLOT);
 		lx_os_unlock();
 	}
 	lkpi_kfree(skb->m);
@@ -1212,6 +1345,12 @@ const struct dmi_system_id *
 linux_dmi_first_match(const struct dmi_system_id *list)
 {
 	return (NULL);				/* (no table of the machine's maker here) */
+}
+
+unsigned
+lx_buffers_free(void)
+{
+	return (pool.free_count);
 }
 
 /* What the layer holds of the kernel's memory right now: a number that keeps growing is a leak. */

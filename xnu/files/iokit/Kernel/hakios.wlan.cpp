@@ -97,6 +97,7 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 	OSData * mac;
 	OSNumber * number;
 
+	IOLog("HakiosWLAN: start for %s, platform %p\n", interface, platform);
 	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
 		OSSafeReleaseNULL(controller);
 		OSSafeReleaseNULL(wlan);
@@ -131,6 +132,7 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 	if (publish(wlan, controller, "HakiosWLAN") == NULL) {
 		IOLog("HakiosWLAN: the service did not start\n");
 	} else {
+		IOLog("HakiosWLAN: %s is in the registry (IO80211Controller + IONetworkInterface)\n", interface);
 		wlan->release();
 	}
 	controller->release();

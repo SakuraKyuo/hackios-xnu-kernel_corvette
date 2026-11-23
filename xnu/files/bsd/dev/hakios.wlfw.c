@@ -21,7 +21,7 @@
  * until hakios_wlfw_stop(), which sends the mode "off" as ath11k does when it stops.
  *
  * What the phone said (13 October, firmware WLAN.MSL.1.0.1-01277): every request is answered
- * with success; the regulatory database goes down in 4 pieces and bd_m20gl.elf in 10; "init
+ * with success; the regulatory database goes down in 4 pieces and bdwlan.elf in 10; "init
  * done" comes 283 ms after the first request. The firmware gives no board id (ath11k then takes
  * 0xff), chip id 1 of family 0xb, and the radio's registers at 0x61e00000, 2 MB. Left alone
  * after that, it does not say "ready" (10 s waited): that waits for a mode. Asked for cold-boot
@@ -476,8 +476,8 @@ hakios_wlfw_exchange(uint32_t step)
 	 * the board's data. ath11k would look in "board-2.bin" for an entry named after the ids above
 	 * and fall back to "board.bin"; here it is the file this phone's Android sends.
 	 */
-	send_file("the regulatory database", "regdb_xiaomi.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
-	board = send_file("the board's data", "bd_m20gl.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
+	send_file("the regulatory database", "regdb.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
+	board = send_file("the board's data", "bdwlan.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
 	if (!board) {
 		goto out;
 	}

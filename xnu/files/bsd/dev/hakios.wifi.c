@@ -875,7 +875,7 @@ step_mailbox(void)
 /* ---- step 3: RPMh -------------------------------------------------------------------------------------- */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c; as in hakios.adreno.c) */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             0x81c60000UL     /* dt: aop_cmd_db_region@81c60000 (redwood's 0x80860000 is not this soc) */
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -3986,7 +3986,7 @@ hakios_wifi_dsp_is_up(void)
 const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
-	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	static const char *const files[][2] = { { "board.bin", "bdwlan.elf" }, { "regdb.bin", "regdb.bin" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
@@ -4256,17 +4256,3746 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* ---- another phone: the OnePlus Ace 3 Pro (corvette) --------------------------------------------------------
+ *
+ * Its radio is a WCN7850 ("Kiwi"), a PCIe device: the firmware runs inside the chip, and the application
+ * processor loads it over PCIe's MHI. Every register the steps above touch -- the WPSS's memory, TrustZone's
+ * image ids, SMEM's items, the AOP's mailbox -- belongs to redwood's WCN6750 and has no counterpart here, so
+ * none of them may be run on this phone.
+ *
+ * wifi_s0=1 is the first look, and it writes nothing: the pins the radio and PCIe0 are wired to, and what the
+ * boot loader left of PCIe0's clocks, power domain, reset and link. Reads only, each announced before it is
+ * made, and nothing is read whose block is known to be off (a read there can end the kernel: see the top of
+ * hakios.goodix.c on the same hazard).
+ */
+
+#define CORVETTE_TLMM_PHYS      0x0f100000      /* (redwood's TLMM is at 0x0f000000, one megabyte lower) */
+#define CORVETTE_TLMM_SIZE      0x80000
+
+#define CORVETTE_S1_MAPS          64
+
+struct corvette_s1_mapping {
+	vm_offset_t physical;
+	vm_size_t size;
+	vm_offset_t virtual;
+};
+
+static struct corvette_s1_mapping corvette_s1_mappings[CORVETTE_S1_MAPS];
+static unsigned corvette_s1_mapping_count;
+LCK_MTX_DECLARE(corvette_s1_mapping_lock, &wifi_lock_group);
+
+/* The kernel's permanent I/O submap is only 8 MiB; S1 helpers must share these device mappings. */
+static vm_offset_t
+corvette_s1_io_map(vm_offset_t physical, vm_size_t size)
+{
+	vm_offset_t virtual;
+
+	lck_mtx_lock(&corvette_s1_mapping_lock);
+	for (unsigned i = 0; i < corvette_s1_mapping_count; i++) {
+		struct corvette_s1_mapping *mapping = &corvette_s1_mappings[i];
+		if (physical >= mapping->physical && physical - mapping->physical <= mapping->size &&
+		    size <= mapping->size - (physical - mapping->physical)) {
+			virtual = mapping->virtual + (physical - mapping->physical);
+			lck_mtx_unlock(&corvette_s1_mapping_lock);
+			return virtual;
+		}
+	}
+	if (corvette_s1_mapping_count == CORVETTE_S1_MAPS) {
+		lck_mtx_unlock(&corvette_s1_mapping_lock);
+		printf("wifi: corvette MMIO map cache full; refusing another permanent mapping\n");
+		return 0;
+	}
+	virtual = ml_io_map(physical, size);
+	corvette_s1_mappings[corvette_s1_mapping_count++] = (struct corvette_s1_mapping) {
+		.physical = physical, .size = size, .virtual = virtual
+	};
+	lck_mtx_unlock(&corvette_s1_mapping_lock);
+	return virtual;
+}
+
+/* The pins, from the phone's own device tree: qcom,cnss-kiwi@b0000000's wlan-en/bt-en/sw-ctrl, and
+ * qcom,pcie@1c00000's perst (94) and clkreq (95). wlan_en_active drives GPIO 16 high, wlan_en_sleep low. */
+static void
+kiwi_s0_pins(void)
+{
+	static const struct {
+		uint32_t pin;
+		const char *name;
+	} pins[] = { { 16, "wlan-en" }, { 17, "bt-en" }, { 18, "sw-ctrl" }, { 19, "wlan-sw-ctrl" },
+		     { 94, "pcie0 perst" }, { 95, "pcie0 clkreq" } };
+	vm_offset_t tlmm;
+
+	printf("wifi: s0: the pins, at TLMM %#x, read only\n", CORVETTE_TLMM_PHYS);
+	tlmm = corvette_s1_io_map(CORVETTE_TLMM_PHYS, CORVETTE_TLMM_SIZE);
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		vm_offset_t config_at = tlmm + 0x1000 * (vm_offset_t)pins[i].pin;
+		uint32_t config = rd(config_at), io = rd(config_at + 4);
+
+		printf("wifi: s0:   pin %u %-14s config %#x: function %u, %s, pull %u, drive %u; "
+		    "io %#x: in %u, out %u\n", pins[i].pin, pins[i].name, config, (config >> 2) & 0xf,
+		    (config & (1u << 9)) ? "output" : "input", config & 3, (config >> 6) & 7, io, io & 1,
+		    (io >> 1) & 1);
+	}
+}
+
+/*
+ * PCIe0, from the phone's device tree (qcom,pcie@1c00000): parf 0x01c00000 (0x3000), phy 0x01c06000
+ * (0x2000), dm_core 0x60000000 (the core's own config space, 0xf1d), elbi 0x60000f20 (0xa8), and conf
+ * 0x60100000 (0x100000 of ECAM: a megabyte to the bus, so bus 0 is at 0x60100000 and bus 1 at 0x60200000).
+ *
+ * All of it is dark until the clocks below run and the power domain is up; reading any of it while it is
+ * not has ended kernels on this family of SoC (a bus timeout that the always-on processor answers with a
+ * reset). So the clocks and the power domain are looked at first, and the hardware after them only if the
+ * boot loader has left it all on, which it does not do for us: it is there to be read, not relied on.
+ */
+#define CORVETTE_GCC_PHYS               0x00100000
+#define CORVETTE_GCC_SIZE               0x70000         /* (the whole of GCC is 0x1f4200, but the PCIe0 end is below 0x70000) */
+
+/* The seven branch clocks of PCIe0 are voted on in two registers (Linux's gcc-sm8650.c), and each has a
+ * halt bit of its own: reading that bit 0 as 1 means the clock is not running yet. */
+#define CORVETTE_PCIE0_VOTE             0x52008         /* bit 0 slv_axi, 1 mstr_axi, 2 cfg_ahb, 3 aux, 4 pipe, 5 slv_q2a, 6 cnoc_pcie_sf_axi */
+#define CORVETTE_PCIE0_VOTE_RCHNG       0x52000         /* bit 22 phy_rchng */
+#define CORVETTE_PCIE0_GDSCR            0x6b004
+#define CORVETTE_PCIE0_PHY_GDSCR        0x6c000
+#define CORVETTE_PCIE0_BCR              0x6b000         /* bit 0: the core is held in reset */
+#define CORVETTE_PCIE0_PHY_BCR          0x6c01c         /* bit 0: the PHY is held in reset */
+
+#define CORVETTE_PCIE0_PARF             0x01c00000
+#define CORVETTE_PCIE0_PHY              0x01c06000
+#define CORVETTE_PCIE0_CORE             0x60000000
+#define CORVETTE_PCIE0_ELBI             0x60000f20
+#define CORVETTE_PCIE0_ECAM             0x60100000
+#define CORVETTE_PCIE0_MEM32            0x60300000
+#define CORVETTE_PCIE0_MEM32_SIZE       0x03d00000
+#define CORVETTE_PCIE_IATU_REGION_STRIDE 0x200
+#define CORVETTE_IATU_CTRL1             0x00
+#define CORVETTE_IATU_CTRL2             0x04
+#define CORVETTE_IATU_LBAR              0x08
+#define CORVETTE_IATU_UBAR              0x0c
+#define CORVETTE_IATU_LAR               0x10
+#define CORVETTE_IATU_LTAR              0x14
+#define CORVETTE_IATU_UTAR              0x18
+#define CORVETTE_IATU_CFG0              0x04
+#define CORVETTE_IATU_MEM               0x00
+#define CORVETTE_IATU_ENABLE             (1u << 31)
+#define CORVETTE_CFG0_BUS1_DEV0          0x01000000u
+
+static uint32_t corvette_s2_iatu_saved[2][7];
+static bool corvette_s2_iatu_saved_valid;
+
+/* Linux's gdsc.c: bit 31 is the status (1: powered), bit 16 the "power up complete" of the handshake, and
+ * bit 0 the software collapse that turns a domain off. */
+#define CORVETTE_GDSC_POWER_ON          (1u << 31)
+#define CORVETTE_GDSC_UP_COMPLETE       (1u << 16)
+#define CORVETTE_GDSC_SW_COLLAPSE       (1u << 0)
+
+/* Both PCIe0 domains have dt's qcom,support-cfg-gdscr, which is Linux's POLL_CFG_GDSCR (gdsc.c): the
+ * handshake's bits are in the register four bytes after the GDSCR (CFG_GDSCR, CFG_GDSCR_OFFSET), not in
+ * the GDSCR itself. There, bit 16 is "power up complete" and bit 15 "power down complete". */
+#define CORVETTE_GDSC_CFG               0x4
+#define CORVETTE_GDSC_CFG_UP_COMPLETE   (1u << 16)
+#define CORVETTE_GDSC_CFG_DOWN_COMPLETE (1u << 15)
+
+/*
+ * The reads below are only made when the clocks run and the power domain answers, which the caller has
+ * just checked. The offsets are mainline's (drivers/pci/controller/dwc/pcie-qcom.c): PARF_PHY_REFCLK 0x4c,
+ * PARF_LTSSM 0x1b0 (its state in bits 5:0), ELBI's SYS_CTRL 0x04 (bit 0: link training enabled) and
+ * SYS_STTS 0x08 (the bridge's own LTSSM state in bits 17:12). The PHY's status is the phone's device tree's
+ * qcom,phy-status-offset 0x214, bit 6 (qcom,phy-status-bit); its power-down register is 0x240.
+ */
+static void
+kiwi_s0_pcie(bool phy_on)
+{
+	vm_offset_t parf = corvette_s1_io_map(CORVETTE_PCIE0_PARF, 0x8000);      /* (the PHY's 0x2000 comes after the PARF's 0x3000) */
+	vm_offset_t core = corvette_s1_io_map(CORVETTE_PCIE0_CORE, 0x10000);     /* (0xf1d of config space, then the ELBI at 0xf20) */
+	vm_offset_t ecam = corvette_s1_io_map(CORVETTE_PCIE0_ECAM, 0x100000);    /* (bus 0 only: bus 1 is the bridge's to reach) */
+	uint32_t ltssm = rd(parf + 0x1b0), control = rd(core + 0xf20 + 0x04);
+	uint32_t state = rd(core + 0xf20 + 0x08), id = rd(ecam);
+
+	printf("wifi: s0:   parf %#x: ltssm %#x (state %u), phy refclk %#x, [0x24] %#x, [0x28] %#x, testbus %u\n",
+	    CORVETTE_PCIE0_PARF, ltssm, ltssm & 0x3f, rd(parf + 0x4c), rd(parf + 0x24), rd(parf + 0x28),
+	    rd(parf + 0x224));
+	printf("wifi: s0:   elbi %#x: control %#x (link training enabled %u), status %#x (ltssm %u)\n",
+	    CORVETTE_PCIE0_ELBI, control, control & 1, state, (state >> 12) & 0x3f);
+	if (phy_on) {
+		uint32_t status = rd(parf + 0x6000 + 0x214);
+
+		printf("wifi: s0:   phy %#x: status %#x (ready %u), power down %#x\n", CORVETTE_PCIE0_PHY, status,
+		    (status >> 6) & 1, rd(parf + 0x6000 + 0x240));
+	} else {
+		printf("wifi: s0:   the PHY's power domain is off, so its registers are not read\n");
+	}
+	printf("wifi: s0:   the core's own config space %#x: %#x (vendor %#x, device %#x), class/revision %#x\n",
+	    CORVETTE_PCIE0_CORE, id, id & 0xffff, id >> 16, rd(core + 8));
+	printf("wifi: s0:   ECAM's bus 0, the root complex: %#x (vendor %#x, device %#x); the radio answers at "
+	    "its own bus through the bridge, once the link is up\n", id, id & 0xffff, id >> 16);
+}
+
+static void
+kiwi_s0_gcc(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t halt;
+	} clocks[] = { { "slv_q2a", 0x6b01c }, { "slv_axi", 0x6b020 }, { "mstr_axi", 0x6b02c },
+		       { "cfg_ahb", 0x6b038 }, { "aux", 0x6b03c }, { "pipe", 0x6b048 },
+		       { "phy_rchng", 0x6b054 }, { "cnoc_pcie_sf_axi", 0x10058 } };
+	vm_offset_t gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+	uint32_t vote = rd(gcc + CORVETTE_PCIE0_VOTE), vote_rchng = rd(gcc + CORVETTE_PCIE0_VOTE_RCHNG);
+	uint32_t core = rd(gcc + CORVETTE_PCIE0_GDSCR), phy = rd(gcc + CORVETTE_PCIE0_PHY_GDSCR);
+	bool running = true;
+
+	printf("wifi: s0: PCIe0's clocks, at GCC %#x, read only: what the boot loader left\n", CORVETTE_GCC_PHYS);
+	printf("wifi: s0:   votes %#x (slv_axi %u, mstr_axi %u, cfg_ahb %u, aux %u, pipe %u, slv_q2a %u, "
+	    "cnoc_pcie_sf_axi %u) and %#x bit 22 (phy_rchng %u)\n", vote, vote & 1, (vote >> 1) & 1, (vote >> 2) & 1,
+	    (vote >> 3) & 1, (vote >> 4) & 1, (vote >> 5) & 1, (vote >> 6) & 1, vote_rchng, (vote_rchng >> 22) & 1);
+	printf("wifi: s0:   halted");
+	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		uint32_t halted = rd(gcc + clocks[i].halt) & 1;
+
+		printf("%s %s %u", i == 0 ? " (1 = not running):" : ",", clocks[i].name, halted);
+		if (halted) {
+			running = false;
+		}
+	}
+	printf("\n");
+	printf("wifi: s0:   pcie_0_gdsc %#x: power on %u, up complete %u, collapse %u; pcie_0_phy_gdsc %#x: "
+	    "power on %u, up complete %u, collapse %u\n", core, (core & CORVETTE_GDSC_POWER_ON) ? 1 : 0,
+	    (core & CORVETTE_GDSC_UP_COMPLETE) ? 1 : 0, (core & CORVETTE_GDSC_SW_COLLAPSE) ? 1 : 0, phy,
+	    (phy & CORVETTE_GDSC_POWER_ON) ? 1 : 0, (phy & CORVETTE_GDSC_UP_COMPLETE) ? 1 : 0,
+	    (phy & CORVETTE_GDSC_SW_COLLAPSE) ? 1 : 0);
+	printf("wifi: s0:   resets: pcie_0_core %#x (held %u), pcie_0_phy %#x (held %u)\n",
+	    rd(gcc + CORVETTE_PCIE0_BCR), rd(gcc + CORVETTE_PCIE0_BCR) & 1, rd(gcc + CORVETTE_PCIE0_PHY_BCR),
+	    rd(gcc + CORVETTE_PCIE0_PHY_BCR) & 1);
+
+	if (!running || !(core & CORVETTE_GDSC_POWER_ON)) {
+		printf("wifi: s0: PCIe0 is off, so nothing below it is read: a register there does not answer, and "
+		    "the kernel that waits for it is not the one that comes back. Turning it on is the next step "
+		    "(wifi_s1), not this one\n");
+		return;
+	}
+	kiwi_s0_pcie(phy & CORVETTE_GDSC_POWER_ON);
+}
+
+static void
+kiwi_s0(void)
+{
+	printf("wifi: s0: corvette: a WCN7850 behind PCIe0. Nothing is written; each read is announced first\n");
+	kiwi_s0_pins();
+	kiwi_s0_gcc();
+	printf("wifi: s0: done\n");
+}
+
+/* ---- the same phone, S1: turning PCIe0 on ---------------------------------------------------------------
+ *
+ * S0 left the picture clear: the seven branch clocks of PCIe0 are not voted, both of its power domains are
+ * collapsed, its two resets are released, and every pin it and the radio are wired to still sits at the
+ * reset default. So nothing below the controller answers, and the radio behind it has no link to anything.
+ *
+ * This turns the controller on and looks after every write: the value it overwrites is printed first and the
+ * register read back at once, so the last line of the log names the step that stopped. The order is the one
+ * Linux's gcc-sm8650.c, gdsc.c and pcie-qcom.c take: the clocks, then the domains they feed, then the
+ * resets' state, then the pins that power the radio and hold it in reset, then the PHY's own sequence, then
+ * the link's training. The radio's firmware, MHI and its own config space belong to S2: nothing of those is
+ * touched here, and no register below the controller is read until training has reached L0 (a read there
+ * ends the kernel, see S0's note above).
+ */
+
+#define CORVETTE_PCIE0_COLLAPSE         0x5214c         /* bit 0: pcie_0_gdsc, bit 3: pcie_0_phy_gdsc (set = collapsed) */
+#define CORVETTE_PCIE0_PARF_SIZE        0x8000          /* (PARF's 0x3000, then the PHY's 0x2000, in one mapping) */
+#define CORVETTE_PCIE0_PHY_AT           0x6000          /* the PHY, from the start of that mapping */
+#define CORVETTE_PHY_STATUS_OFFSET      0x214           /* dt: qcom,phy-status-offset ... */
+#define CORVETTE_PHY_STATUS_READY       (1u << 6)       /* ... and qcom,phy-status-bit */
+#define CORVETTE_PARF_PHY_REFCLK        0x4c            /* (mainline's PARF_PHY_REFCLK: bit 16 ss, bit 12 use-pad) */
+#define CORVETTE_PARF_LTSSM_OFFSET      0x1b0           /* (PARF_LTSSM: state in bits 5:0) */
+#define CORVETTE_PARF_SYS_CTRL          0x00            /* (PARF_SYS_CTRL: the wake-up and clock-gating bits) */
+#define CORVETTE_PARF_PHY_CTRL          0x40            /* bit 0: the PHY held in its lowest power state */
+#define CORVETTE_PHY_TEST_PWR_DOWN      (1u << 0)
+#define CORVETTE_PARF_MAC_PHY_PWR_MUX   (1u << 29)      /* (PARF_SYS_CTRL: lets the PHY's power-down be driven) */
+#define CORVETTE_PARF_MHI_CLOCK_RESET   0x174           /* bit 0 ahb clk, bit 1 mstr axi clk, bit 4 bypass */
+#define CORVETTE_PARF_Q2A_FLUSH_OFFSET  0x1ac
+#define CORVETTE_PARF_PM_CTRL           0x20            /* bit 5: L1 is not to be entered */
+#define CORVETTE_PARF_REQ_NOT_ENTR_L1   (1u << 5)
+#define CORVETTE_PARF_AXI_HALT_V2       0x1a8
+#define CORVETTE_PARF_AXI_HALT_EN       (1u << 31)
+#define CORVETTE_PARF_DEVICE_TYPE_OFF   0x1000          /* 4 is a root complex */
+#define CORVETTE_PARF_DEVICE_TYPE_RC    0x4
+#define CORVETTE_PARF_MHI_ON            ((1u << 4) | (1u << 1) | (1u << 0))
+#define CORVETTE_PARF_SYS_CTRL_ON       0x365E          /* the vendor msm_pcie_enable_link() writes this exact
+                                                 * value: MST/SLV_WAKEUP_EN, MSTR_ACLK_CGC_DIS, CORE_CLK_CGC_DIS,
+                                                 * AUX_PWR_DET, L23/L1_CLK_RMV_DIS, plus bit8 and bit3 (the AUX/Core
+                                                 * clk sync for L1ss). S1 used 0x3656 -- bit9(SLV_ACLK_CGC_DIS) in
+                                                 * place of bit8+bit3 -- which is NOT what the vendor writes. */
+#define CORVETTE_PARF_LTSSM_EN          (1u << 8)
+#define CORVETTE_REFCLK_USE_PAD         (1u << 12)      /* (PARF_PHY_REFCLK: take the clock from the pad) */
+#define CORVETTE_PCIE0_SM               0x1d07000       /* dt: the link's own state machine (reg-name pcie_sm) */
+#define CORVETTE_PCIE0_SM_SIZE          0x7000
+/* SM8550 and after have the V2 pair for the DBI's and the ATU's base (pcie-qcom.c's
+ * PARF_DBI_BASE_ADDR_V2 / PARF_ATU_BASE_ADDR), and the older single registers (0x168/0x16c) read 0
+ * on this SoC -- so they are the ones that matter here. The device tree's reg-names give the two
+ * addresses: dm_core 0x60000000 (the core's own config space) and iatu 0x60001000. */
+#define CORVETTE_PARF_DBI_BASE_V2       0x350
+#define CORVETTE_PARF_DBI_BASE_V2_HI    0x354
+#define CORVETTE_PARF_SLV_SIZE_V2       0x358
+#define CORVETTE_PARF_SLV_SIZE_V2_HI    0x35c
+#define CORVETTE_PARF_ATU_BASE          0x634
+#define CORVETTE_PARF_ATU_BASE_HI       0x638
+#define CORVETTE_PARF_SLV_SIZE          0x4000000       /* (dt: qcom,slv-addr-space-size; the vendor writes this exact value) */
+/* The core's own config space (DBI), as Linux's dw_pcie_setup_rc() and dw_pcie_setup() fill it in. The
+ * port was told nothing: PORT_LINK_CONTROL read 0, which is a port with no lanes at all, and a DWC LTSSM
+ * does not leave detect for a port it believes has none. */
+#define CORVETTE_DBI_COMMAND            0x04            /* bit 1 memory, bit 2 master, bit 8 serr */
+#define CORVETTE_DBI_CLASS              0x08            /* revision | prog-if | subclass | class */
+#define CORVETTE_DBI_PRIMARY_BUS        0x18
+#define CORVETTE_DBI_PORT_LINK_CONTROL  0x710           /* bits 21:16 the lanes, bit 5 the dll's link enable */
+#define CORVETTE_DBI_LINK_WIDTH_SPEED   0x80c           /* bits 15:8 the link's own width */
+#define CORVETTE_DBI_DEBUG1             0x72c
+#define CORVETTE_DBI_MISC_CONTROL_1     0x8bc           /* bit 0: writes to the read-only half are taken */
+#define CORVETTE_LINK_LANES_MASK        (0x3fu << 16)
+#define CORVETTE_LINK_ONE_LANE          (1u << 16)
+#define CORVETTE_LINK_DLL_ENABLE        (1u << 5)
+#define CORVETTE_LINK_WIDTH_MASK        (0xffu << 8)
+#define CORVETTE_LINK_WIDTH_ONE_LANE    (1u << 8)
+#define CORVETTE_SPEED_CHANGE           (1u << 17)      /* (link width/speed: ask the link to retrain) */
+#define CORVETTE_BUS_NUMBERS            0x00ff0100      /* (primary 0, secondary 1, subordinate 0xff) */
+#define CORVETTE_COMMAND_BITS           0x107           /* (io, memory, master, serr) */
+#define CORVETTE_CLASS_PCI_BRIDGE       0x06040000      /* (class 6, subclass 4: a PCI-to-PCI bridge) */
+#define CORVETTE_ELBI_SYS_CTRL_OFFSET   0x04            /* (bit 0: link training enabled) */
+#define CORVETTE_ELBI_SYS_STTS_OFFSET   0x08            /* (bits 17:12: the bridge's LTSSM state) */
+#define CORVETTE_PIN_WLAN_EN            16              /* dt: qcom,cnss-kiwi@b0000000's wlan-en-gpio */
+#define CORVETTE_PIN_PERST              94              /* dt: qcom,pcie@1c00000's perst-gpio */
+#define CORVETTE_PIN_CLKREQ             95             /* dt: qcom,pcie@1c00000's clkreq-gpio */
+/*
+ * The clock request pin is NOT a GPIO. The device tree gives it function "pcie0_clk_req_n" in the
+ * pcie0_clkreq_default pinctrl state, which is the first non-GPIO function of pin 95 (mux value 1),
+ * and only that function routes the signal into the PCIe controller. As a plain GPIO the level could
+ * be read, but the controller never saw the endpoint asking for its clock, so the reference clock was
+ * never driven out to it and its PHY never came up. pull-up(3) | function 1 (bits 4:2) | 2 mA (bits
+ * 7:6 = 0) | input (bit 9 clear) = 0x7, matching pcie0_clkreq_default (drive-strength 2, bias-pull-up).
+ */
+#define CORVETTE_PIN_CLKREQ_N          0x7
+/*
+ * And the same pin as the device tree reads it in its sleep state: pcie0_clkreq_sleep is plain gpio
+ * with bias-pull-up, so pull-up (bits 1:0 = 3) | function 0 | 2 mA | input = 0x3.
+ */
+#define CORVETTE_PIN_CLKREQ_SLEEP      0x3
+#define CORVETTE_PIN_OUTPUT_8MA         0x2c0           /* function 0, no pull, drive 3 (8 mA), output: as hakios.goodix.c */
+
+/* dw_pcie_ltssm: the names of the states this link can be seen in (the rest are printed by number). */
+static const char *
+kiwi_s1_ltssm_name(uint32_t state)
+{
+	switch (state) {
+	case 0x00: return "detect.quiet";
+	case 0x01: return "detect.active";
+	case 0x02: return "polling.active";
+	case 0x03: return "polling.compliance";
+	case 0x04: return "polling.configuration";
+	case 0x05: return "pre-detect.quiet";
+	case 0x06: return "detect.wait";
+	case 0x07: return "configuration.linkwidth.start";
+	case 0x08: return "configuration.linkwidth.accept";
+	case 0x09: return "configuration.lanenum.wait";
+	case 0x0a: return "configuration.lanenum.accept";
+	case 0x0b: return "configuration.complete";
+	case 0x0c: return "configuration.idle";
+	case 0x0d: return "recovery.lock";
+	case 0x0e: return "recovery.speed";
+	case 0x0f: return "recovery.receiver-config";
+	case 0x10: return "recovery.idle";
+	case 0x11: return "L0";
+	case 0x12: return "L0s";
+	case 0x13: return "sending electrical idle";
+	case 0x14: return "L1.idle";
+	case 0x15: return "L1 (sending electrical idle)";
+	case 0x16: return "L2.idle";
+	case 0x17: return "L2 (sending electrical idle)";
+	case 0x18: return "disabled.entry";
+	case 0x19: return "disabled.idle";
+	case 0x1a: return "disabled";
+	case 0x1b: return "hot reset.entry";
+	case 0x1c: return "hot reset";
+	case 0x1d: case 0x1e: case 0x1f: case 0x20: return "recovery.equalization";
+	default: return NULL;
+	}
+}
+
+/* A read, with the register it came from: the step it belongs to is the last line before the next one. */
+static uint32_t
+kiwi_s1_read(const char *what, uint32_t offset, vm_offset_t at)
+{
+	uint32_t value = rd(at);
+
+	printf("wifi: s1:   %-24s +%#05x: %#x\n", what, offset, value);
+	return value;
+}
+
+/* A write: what it overwrote, what was written, and what the register says the moment after. */
+static void
+kiwi_s1_write(const char *what, uint32_t offset, vm_offset_t at, uint32_t value)
+{
+	uint32_t before = rd(at);
+
+	/*
+	 * Said before it is made, and read back on the next line: a store to an address that does not answer
+	 * ends the kernel at once, and then the last line of the log is the one that names the register.
+	 */
+	printf("wifi: s1:   %-24s +%#05x: %#x -> %#x\n", what, offset, before, value);
+	wr(at, value);
+	printf("wifi: s1:   %-24s +%#05x reads %#x\n", "", offset, rd(at));
+}
+
+/* 1/7: the seven branch clocks of PCIe0, in two votes (Linux's gcc-sm8650.c). */
+static bool
+kiwi_s1_clocks(vm_offset_t gcc)
+{
+	static const struct {
+		const char *name;
+		uint32_t halt;
+	} clocks[] = { { "slv_q2a", 0x6b01c }, { "slv_axi", 0x6b020 }, { "mstr_axi", 0x6b02c },
+		       { "cfg_ahb", 0x6b038 }, { "aux", 0x6b03c }, { "pipe", 0x6b048 },
+		       { "phy_rchng", 0x6b054 }, { "cnoc_pcie_sf_axi", 0x10058 } };
+	uint32_t vote = rd(gcc + CORVETTE_PCIE0_VOTE), rchng = rd(gcc + CORVETTE_PCIE0_VOTE_RCHNG);
+	bool running = true;
+
+	printf("wifi: s1: 1/7: the branch clocks of PCIe0, at GCC %#x\n", CORVETTE_GCC_PHYS);
+	kiwi_s1_write("vote (7 branches)", CORVETTE_PCIE0_VOTE, gcc + CORVETTE_PCIE0_VOTE, vote | 0x7f);
+	kiwi_s1_write("vote (phy_rchng)", CORVETTE_PCIE0_VOTE_RCHNG, gcc + CORVETTE_PCIE0_VOTE_RCHNG, rchng | (1u << 22));
+	sleep_ms(2);
+
+	printf("wifi: s1:   halted (1 = not running):");
+	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		uint32_t halted = rd(gcc + clocks[i].halt) & 1;
+
+		printf("%s %s %u", i == 0 ? "" : ",", clocks[i].name, halted);
+		if (halted) {
+			running = false;
+		}
+	}
+	printf("\n");
+	printf("wifi: s1:   %s\n", running ? "1/7: the seven run" :
+	    "1/7: some are halted; with the power domains still down that proves nothing, and 2b/7 looks again");
+	return running;
+}
+
+/* 2/7: one power domain, taken out of collapse, with its power-up handshake waited for. */
+static bool
+kiwi_s1_gdsc(const char *name, vm_offset_t gcc, uint32_t gdscr, uint32_t collapse_bit)
+{
+	uint32_t value = rd(gcc + gdscr), cfg = rd(gcc + gdscr + CORVETTE_GDSC_CFG), now = value, polls;
+
+	/*
+	 * The handshake is in CFG_GDSCR, not in the GDSCR: S1's first run waited for bit 16 of the GDSCR and
+	 * read 0 for ever while the domain was in fact up (its bit 31 said so), and the whole chain after this
+	 * step was never reached. The GDSCR's bit 31 is the state of the domain, its bit 0 the software
+	 * collapse; CFG_GDSCR's bit 16 is the power-up handshake and bit 15 the power-down one.
+	 */
+	printf("wifi: s1: 2/7: %s at +%#x: gdscr %#x (power on %u, collapse %u), cfg %#x (up complete %u, "
+	    "down complete %u)\n", name, gdscr, value, value >> 31, value & 1, cfg,
+	    (cfg & CORVETTE_GDSC_CFG_UP_COMPLETE) ? 1 : 0, (cfg & CORVETTE_GDSC_CFG_DOWN_COMPLETE) ? 1 : 0);
+	if ((cfg & CORVETTE_GDSC_CFG_UP_COMPLETE) && (value & CORVETTE_GDSC_POWER_ON)) {
+		printf("wifi: s1:   already up: nothing is written\n");
+	} else {
+		/*
+		 * A votable domain is held by its collapse bit in 0x5214c (gcc-sm8650.c's .collapse_ctrl and
+		 * .collapse_mask: bit 0 the core's, bit 3 the PHY's), and that is what Linux clears; the GDSCR's
+		 * own software collapse goes with it. Both are printed before they are written.
+		 */
+		uint32_t collapse = kiwi_s1_read("collapse bits", CORVETTE_PCIE0_COLLAPSE, gcc + CORVETTE_PCIE0_COLLAPSE);
+
+		if (collapse & (1u << collapse_bit)) {
+			kiwi_s1_write("collapse: cleared", CORVETTE_PCIE0_COLLAPSE, gcc + CORVETTE_PCIE0_COLLAPSE,
+			    collapse & ~(1u << collapse_bit));
+		} else {
+			printf("wifi: s1:   this domain's collapse bit is already clear\n");
+		}
+		if (value & CORVETTE_GDSC_SW_COLLAPSE) {
+			kiwi_s1_write(name, gdscr, gcc + gdscr, value & ~CORVETTE_GDSC_SW_COLLAPSE);
+		}
+	}
+	/*
+	 * The handshake, waited for with the bit this SoC actually uses. Linux polls the same pair and gives it
+	 * 100 tries of 100 microseconds.
+	 */
+	for (polls = 0; polls < 100; polls++) {
+		now = rd(gcc + gdscr);
+		cfg = rd(gcc + gdscr + CORVETTE_GDSC_CFG);
+		if ((cfg & CORVETTE_GDSC_CFG_UP_COMPLETE) && (now & CORVETTE_GDSC_POWER_ON)) {
+			break;
+		}
+		sleep_us(100);
+	}
+	printf("wifi: s1:   %s after %u x 100 us: power on %u, up complete %u, collapse %u; gdscr %#x, cfg %#x\n",
+	    name, polls, now >> 31, (cfg & CORVETTE_GDSC_CFG_UP_COMPLETE) ? 1 : 0, now & 1, now, cfg);
+	return (cfg & CORVETTE_GDSC_CFG_UP_COMPLETE) && (now & CORVETTE_GDSC_POWER_ON);
+}
+
+/* 2b/7: the same clock registers, read again now that both power domains are up. Before them a halt bit
+ * proves nothing -- a clock whose domain has no power is halted whatever its branch vote says. */
+static void
+kiwi_s1_clocks_again(vm_offset_t gcc)
+{
+	static const struct {
+		const char *name;
+		uint32_t halt;
+	} clocks[] = { { "slv_axi", 0x6b020 }, { "mstr_axi", 0x6b02c }, { "cfg_ahb", 0x6b038 },
+		       { "aux", 0x6b03c }, { "pipe", 0x6b048 }, { "slv_q2a", 0x6b01c },
+		       { "phy_rchng", 0x6b054 }, { "cnoc_pcie_sf_axi", 0x10058 } };
+	uint32_t halted = 0;
+
+	printf("wifi: s1: 2b/7: the clock registers again, with both power domains up\n");
+	printf("wifi: s1:   vote (7 branches)        +%#x: %#x\n", CORVETTE_PCIE0_VOTE, rd(gcc + CORVETTE_PCIE0_VOTE));
+	printf("wifi: s1:   vote (phy_rchng)         +%#x: %#x\n", CORVETTE_PCIE0_VOTE_RCHNG,
+	    rd(gcc + CORVETTE_PCIE0_VOTE_RCHNG));
+	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		printf("wifi: s1:   halt %-19s +%#x: %#x\n", clocks[i].name, clocks[i].halt, rd(gcc + clocks[i].halt));
+		halted |= rd(gcc + clocks[i].halt) & 1;
+	}
+	printf("wifi: s1:   %s\n", halted ? "a halt bit is still set: that clock's source is not running" :
+	    "2b/7: every halt bit is 0, so they run (the pipe one cannot answer: its halt_check is "
+	    "BRANCH_HALT_SKIP)");
+}
+
+/* 3/7: the two resets, pulsed as Linux's qcom_pcie_init_2_9_0 pulses them. Neither S0 nor S1's first runs
+ * did this, on the reading that a reset register reading 0 means "not held"; a core that has never been
+ * reset is not the same as a core that is out of reset, and this core's port logic looked exactly like the
+ * former. Asserted, two milliseconds, released, two milliseconds. */
+static void
+kiwi_s1_resets(vm_offset_t gcc)
+{
+	printf("wifi: s1: 3/7: the two resets\n");
+	printf("wifi: s1:   pcie_0_core reset        +%#x: %#x\n", CORVETTE_PCIE0_BCR, rd(gcc + CORVETTE_PCIE0_BCR));
+	printf("wifi: s1:   pcie_0_phy reset         +%#x: %#x\n", CORVETTE_PCIE0_PHY_BCR,
+	    rd(gcc + CORVETTE_PCIE0_PHY_BCR));
+	kiwi_s1_write("pcie_0_core reset: held", CORVETTE_PCIE0_BCR, gcc + CORVETTE_PCIE0_BCR, 1);
+	kiwi_s1_write("pcie_0_phy reset: held", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 1);
+	sleep_ms(2);
+	kiwi_s1_write("pcie_0_core reset: released", CORVETTE_PCIE0_BCR, gcc + CORVETTE_PCIE0_BCR, 0);
+	kiwi_s1_write("pcie_0_phy reset: released", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 0);
+	sleep_ms(2);
+	printf("wifi: s1: 3/7: pulsed: core %#x, phy %#x (bit 0 would be held)\n", rd(gcc + CORVETTE_PCIE0_BCR),
+	    rd(gcc + CORVETTE_PCIE0_PHY_BCR));
+
+	/*
+	 * And the three the device tree does not name. gcc-pineapple.c has five resets for this port, not two:
+	 *
+	 *	GCC_PCIE_0_BCR                    0x6b000   the core        (pulsed above)
+	 *	GCC_PCIE_0_PHY_BCR                0x6c01c   the phy         (pulsed above)
+	 *	GCC_PCIE_0_LINK_DOWN_BCR          0x6c014   link down       -- never touched by S1
+	 *	GCC_PCIE_0_NOCSR_COM_PHY_BCR      0x6c020   the SerDes' common block -- never touched
+	 *	GCC_PCIE_0_PHY_NOCSR_COM_PHY_BCR  0x6c028   and its NOC side     -- never touched
+	 *
+	 * The COM PHY is what holds the SerDes' PLL. A port whose COM PHY is still in reset answers every
+	 * register write, holds its power domain up, and never clears PHYSTATUS -- which is exactly what S1
+	 * has been looking at for five runs. They are read first, then pulsed the way an SBR does it.
+	 */
+	{
+		static const struct {
+			const char *name;
+			uint32_t at;
+		} more[] = { { "link down", 0x6c014 }, { "com phy", 0x6c020 }, { "com phy nocser", 0x6c028 },
+			     { "pcie phy", 0x6f000 }, { "pcie phy cfg ahb", 0x6f00c } };
+
+		printf("wifi: s1: 3b/7: the other resets of this port, and of the phy block beside it\n");
+		for (unsigned i = 0; i < sizeof(more) / sizeof(more[0]); i++) {
+			printf("wifi: s1:   %-19s +%#x: %#x%s\n", more[i].name, more[i].at,
+			    rd(gcc + more[i].at), rd(gcc + more[i].at) & 1 ? " (held)" : "");
+		}
+		for (unsigned i = 0; i < 3; i++) {
+			kiwi_s1_write("com phy reset: held", more[i].at, gcc + more[i].at, 1);
+			sleep_ms(1);
+			kiwi_s1_write("com phy reset: released", more[i].at, gcc + more[i].at, 0);
+			sleep_ms(1);
+		}
+		/* The two global ones are only released if they are held: pcie1 shares them. */
+		for (unsigned i = 3; i < sizeof(more) / sizeof(more[0]); i++) {
+			if (rd(gcc + more[i].at) & 1) {
+				kiwi_s1_write("phy block reset: released", more[i].at, gcc + more[i].at, 0);
+			}
+		}
+		printf("wifi: s1: 3b/7: com phy %#x %#x, link down %#x, phy block %#x %#x\n", rd(gcc + 0x6c020),
+		    rd(gcc + 0x6c028), rd(gcc + 0x6c014), rd(gcc + 0x6f000), rd(gcc + 0x6f00c));
+	}
+}
+
+/* 4/7: the two pins, with the offsets hakios.goodix.c uses for its own (TLMM + 0x1000 * pin, io four bytes
+ * in). wlan-en is driven high here; perst is held low and released in 6/7, one moment before training, the
+ * way Linux does it -- a radio that comes out of reset into a half-configured controller is worse off than
+ * one that waits. */
+static void
+kiwi_s1_pins(vm_offset_t tlmm)
+{
+	uint32_t wlan = 0x1000UL * CORVETTE_PIN_WLAN_EN, perst = 0x1000UL * CORVETTE_PIN_PERST;
+
+	printf("wifi: s1: 4/7: the pins, at TLMM %#x\n", CORVETTE_TLMM_PHYS);
+	printf("wifi: s1:   pin %u wlan-en config    +%#x: %#x\n", CORVETTE_PIN_WLAN_EN, wlan, rd(tlmm + wlan));
+	printf("wifi: s1:   pin %u wlan-en io        +%#x: %#x\n", CORVETTE_PIN_WLAN_EN, wlan + 4, rd(tlmm + wlan + 4));
+	kiwi_s1_write("pin 16 wlan-en io: keep radio disabled until rails are on", wlan + 4,
+	    tlmm + wlan + 4, 0);
+	kiwi_s1_write("pin 16 wlan-en config", wlan, tlmm + wlan, 0x2c0);
+	printf("wifi: s1:   pin %u is %s\n", CORVETTE_PIN_WLAN_EN, (rd(tlmm + wlan + 4) & 1) ? "high" : "low");
+	printf("wifi: s1:   pin %u perst config      +%#x: %#x\n", CORVETTE_PIN_PERST, perst, rd(tlmm + perst));
+	kiwi_s1_write("pin 94 perst io: low", perst + 4, tlmm + perst + 4, 0);
+	kiwi_s1_write("pin 94 perst config", perst, tlmm + perst, 0x2c0);
+	printf("wifi: s1:   pin %u is %s: held until the link is about to be started\n", CORVETTE_PIN_PERST,
+	    (rd(tlmm + perst + 4) & 1) ? "high" : "low");
+}
+
+/*
+ * 5/7: the PHY's own sequence, straight from the phone's device tree (qcom,phy-sequence): triples of
+ * register offset, value and a delay in milliseconds, 115 of them. Every write prints what it overwrote and
+ * what reads back, so a write that does not stick is the last line of the log rather than a mystery three
+ * steps later.
+ */
+/*
+ * The reference clock, out to the far end.
+ *
+ * The device tree gives this port fifteen clocks, and the one S1 had never heard of is the one that
+ * matters most: "pcie_clkref_en", which comes from the TCSR clock controller at 0x1f40000 and is the
+ * switch that drives the hundred megahertz reference clock out of the SoC onto the reference clock pins.
+ * The vendor's clock driver (drivers/clk/qcom/tcsrcc-pineapple.c) has it as tcsr_pcie_0_clkref_en: an
+ * enable register at 0xb1100, bit 0.
+ *
+ * Without it the radio, sitting at the far end of these lanes, has no reference clock at all. Its
+ * receiver cannot work, so it cannot answer the host's receiver detection, and the state machine on
+ * this side sends pulses into a wire that nothing is listening on -- which is what S1 has been seeing:
+ * the machine starts, says "detect.active", and falls back to "detect.quiet" because nobody answered.
+ *
+ * The device tree's numbering for this clock is ambiguous -- the entry sits in a list the decompiler
+ * merged out of several properties, and the id it carries is the second controller's -- so both of the
+ * controller's PCIe clock-reference enables are set. The second one belongs to the other PCIe port,
+ * which this board does not use for a radio; setting it turns on an output nothing reads.
+ */
+#define CORVETTE_TCSR_PHYS          0x1f40000      /* dt: clock-controller@1f40000, qcom,pineapple-tcsrcc */
+#define CORVETTE_TCSR_SIZE          0xc0000
+#define CORVETTE_TCSR_CLKREF_EN_0   0xb1100        /* tcsr_pcie_0_clkref_en */
+#define CORVETTE_TCSR_CLKREF_EN_1   0xb1114        /* tcsr_pcie_1_clkref_en */
+
+static void
+kiwi_s1_clkref(void)
+{
+	vm_offset_t tcsr = corvette_s1_io_map(CORVETTE_TCSR_PHYS, CORVETTE_TCSR_SIZE);
+
+	printf("wifi: s1: 5/7: the reference clock out to the radio (tcsr %#x)\n", CORVETTE_TCSR_PHYS);
+	kiwi_s1_write("tcsr pcie 0 clock reference enable", CORVETTE_TCSR_CLKREF_EN_0,
+	    tcsr + CORVETTE_TCSR_CLKREF_EN_0, rd(tcsr + CORVETTE_TCSR_CLKREF_EN_0) | 1u);
+	kiwi_s1_write("tcsr pcie 1 clock reference enable", CORVETTE_TCSR_CLKREF_EN_1,
+	    tcsr + CORVETTE_TCSR_CLKREF_EN_1, rd(tcsr + CORVETTE_TCSR_CLKREF_EN_1) | 1u);
+	printf("wifi: s1:   the clock reference enables now: pcie 0 %#x, pcie 1 %#x\n",
+	    rd(tcsr + CORVETTE_TCSR_CLKREF_EN_0), rd(tcsr + CORVETTE_TCSR_CLKREF_EN_1));
+}
+
+/* dt: qcom,phy-sequence: 115 triples of (offset, value, delay in ms), written in this order by the
+ * vendor's pcie_phy_init() (pci-msm.c:4697-4709). The existing 5/7 step and the vendor port below share
+ * the one table. */
+static const uint32_t kiwi_phy_sequence[] = {
+	0x240, 0x03, 0x00, 0x0c0, 0x01, 0x00, 0x0cc, 0x62, 0x00, 0x0d0, 0x02, 0x00, 0x060, 0xf8, 0x00,
+	0x064, 0x01, 0x00, 0x000, 0x93, 0x00, 0x004, 0x01, 0x00, 0x0e0, 0x90, 0x00, 0x0e4, 0x82, 0x00,
+	0x0f4, 0x07, 0x00, 0x070, 0x02, 0x00, 0x010, 0x02, 0x00, 0x074, 0x16, 0x00, 0x014, 0x16, 0x00,
+	0x078, 0x36, 0x00, 0x018, 0x36, 0x00, 0x110, 0x08, 0x00, 0x0bc, 0x0a, 0x00, 0x120, 0x42, 0x00,
+	0x080, 0x04, 0x00, 0x084, 0x0d, 0x00, 0x020, 0x0a, 0x00, 0x024, 0x1a, 0x00, 0x088, 0x41, 0x00,
+	0x028, 0x34, 0x00, 0x090, 0xab, 0x00, 0x094, 0xaa, 0x00, 0x098, 0x01, 0x00, 0x030, 0x55, 0x00,
+	0x034, 0x55, 0x00, 0x038, 0x01, 0x00, 0x140, 0x14, 0x00, 0x164, 0x34, 0x00, 0x03c, 0x01, 0x00,
+	0x01c, 0x04, 0x00, 0x174, 0x16, 0x00, 0x1bc, 0x0f, 0x00, 0x170, 0xa0, 0x00, 0x11a4, 0x38, 0x00,
+	0x10dc, 0x11, 0x00, 0x1160, 0xbf, 0x00, 0x1164, 0xbf, 0x00, 0x1168, 0xb7, 0x00,
+	0x116c, 0xea, 0x00, 0x115c, 0x3f, 0x00, 0x1174, 0x5c, 0x00, 0x1178, 0x9c, 0x00,
+	0x117c, 0x1a, 0x00, 0x1180, 0x89, 0x00, 0x1170, 0xdc, 0x00, 0x1188, 0x94, 0x00,
+	0x118c, 0x5b, 0x00, 0x1190, 0x1a, 0x00, 0x1194, 0x89, 0x00, 0x10cc, 0x00, 0x00,
+	0x1008, 0x09, 0x00, 0x1014, 0x05, 0x00, 0x104c, 0x08, 0x00, 0x1050, 0x08, 0x00,
+	0x10d8, 0x0f, 0x00, 0x1118, 0x1c, 0x00, 0x10f8, 0x07, 0x00, 0x11f8, 0x08, 0x00,
+	0x1600, 0x00, 0x00, 0xe84, 0x15, 0x00, 0xe90, 0x3f, 0x00, 0xee4, 0x02, 0x00, 0xe40, 0x09, 0x00,
+	0xe3c, 0x15, 0x00, 0x19a4, 0x38, 0x00, 0x18dc, 0x11, 0x00, 0x1960, 0xbf, 0x00,
+	0x1964, 0xbf, 0x00, 0x1968, 0xb7, 0x00, 0x196c, 0xea, 0x00, 0x195c, 0x3f, 0x00,
+	0x1974, 0x5c, 0x00, 0x1978, 0x9c, 0x00, 0x197c, 0x1a, 0x00, 0x1980, 0x89, 0x00,
+	0x1970, 0xdc, 0x00, 0x1988, 0x94, 0x00, 0x198c, 0x5b, 0x00, 0x1990, 0x1a, 0x00,
+	0x1994, 0x89, 0x00, 0x18cc, 0x00, 0x00, 0x1808, 0x09, 0x00, 0x1814, 0x05, 0x00,
+	0x184c, 0x08, 0x00, 0x1850, 0x08, 0x00, 0x18d8, 0x0f, 0x00, 0x1918, 0x1c, 0x00,
+	0x18f8, 0x07, 0x00, 0x19f8, 0x08, 0x00, 0x1684, 0x15, 0x00, 0x1690, 0x3f, 0x00,
+	0x16e4, 0x02, 0x00, 0x1640, 0x09, 0x00, 0x163c, 0x15, 0x00, 0x2dc, 0x05, 0x00,
+	0x388, 0x77, 0x00, 0x398, 0x0b, 0x00, 0x6a4, 0x1e, 0x00, 0x6f4, 0x27, 0x00, 0x3e0, 0x0f, 0x00,
+	0x60c, 0x1d, 0x00, 0x614, 0x07, 0x00, 0x620, 0xc1, 0x00, 0x694, 0x00, 0x00, 0x3d0, 0x8c, 0x00,
+	0x368, 0x17, 0x00, 0x370, 0x2e, 0x00, 0x200, 0x00, 0x00, 0x244, 0x03, 0x00
+};
+#define KIWI_PHY_SEQUENCE_WRITES (sizeof(kiwi_phy_sequence) / sizeof(kiwi_phy_sequence[0]) / 3)
+
+static bool
+kiwi_s1_phy(vm_offset_t parf)
+{
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	uint32_t writes = KIWI_PHY_SEQUENCE_WRITES, status = 0, polls;
+
+	/* the reference clock the radio needs, before the PHY is given its tables */
+	kiwi_s1_clkref();
+
+	/* The device type has to be RC before the PHY is given its tables. The vendor's
+	 * msm_pcie_enable_link() writes DEVICE_TYPE = 0x4 at its very top and only calls
+	 * pcie_phy_init() later; S1 used to run the whole PHY sequence in 5/7 and only set the device
+	 * type afterwards in 5b/7, so the PHY initialised without knowing it is the root complex. */
+	if ((rd(parf + CORVETTE_PARF_DEVICE_TYPE_OFF) & 0xf) != CORVETTE_PARF_DEVICE_TYPE_RC) {
+		kiwi_s1_write("device type: RC before the PHY tables", CORVETTE_PARF_DEVICE_TYPE_OFF,
+		    parf + CORVETTE_PARF_DEVICE_TYPE_OFF, CORVETTE_PARF_DEVICE_TYPE_RC);
+	} else {
+		printf("wifi: s1: 5/7: device type is already RC (%#x) before the PHY tables\n",
+		    rd(parf + CORVETTE_PARF_DEVICE_TYPE_OFF));
+	}
+
+	printf("wifi: s1: 5/7: the PHY's sequence, %u writes from %#x (dt: qcom,phy-sequence)\n", writes,
+	    CORVETTE_PCIE0_PHY);
+	for (uint32_t i = 0; i < writes; i++) {
+		uint32_t offset = kiwi_phy_sequence[3 * i], value = kiwi_phy_sequence[3 * i + 1],
+		    delay = kiwi_phy_sequence[3 * i + 2];
+		uint32_t before = rd(phy + offset);
+
+		printf("wifi: s1:   phy %3u/%u +%#05x: %#x -> %#x\n", i + 1, writes, offset, before, value);
+		wr(phy + offset, value);
+		printf("wifi: s1:                  +%#05x reads %#x\n", offset, rd(phy + offset));
+		if (delay) {
+			sleep_ms(delay);
+		}
+	}
+	/*
+	 * PHYSTATUS is bit 6 of 0x214, and it means the opposite of what S1 assumed for eleven runs: Linux's
+	 * qmp_pcie_power_on() polls it and waits for it to be CLEAR, and so does the vendor's
+	 * pcie_phy_is_ready() -- "if (readl(phy + phy_status_offset) & BIT(phy_status_bit)) return false;".
+	 * Every run so far printed "ready 1" and went on; the PHY was in fact timed out, which is why no pipe
+	 * clock ever came out of it and why the link state machine never left detect.quiet.
+	 */
+	for (polls = 0; polls < 200; polls++) {
+		status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+		if (!(status & CORVETTE_PHY_STATUS_READY)) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	printf("wifi: s1:   phy +%#x = %#x: %s after %u ms; power down %#x, start %#x\n",
+	    CORVETTE_PHY_STATUS_OFFSET, status,
+	    (status & CORVETTE_PHY_STATUS_READY) ? "NOT READY (bit 6 still set)" : "ready (bit 6 clear)", polls,
+	    rd(phy + 0x240), rd(phy + 0x244));
+	/* The state registers the phone's own device tree lists for debugging (qcom,phy-debug-reg): they say
+	 * whether the SerDes' PLL locked and whether the PCS started, which the one "ready" bit does not. */
+	printf("wifi: s1:   the phy's own debug: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
+	    rd(phy + 0x214), rd(phy + 0x218), rd(phy + 0x21c), rd(phy + 0x220), rd(phy + 0x224), rd(phy + 0x228),
+	    rd(phy + 0x22c), rd(phy + 0x230), rd(phy + 0x234), rd(phy + 0x238), rd(phy + 0x600));
+
+	/*
+	 * If it is not ready, 0x240 comes next -- and its polarity is the opposite of what S1 assumed. Linux
+	 * clears those two bits in qmp_pcie_power_off() with the comment "Put PHY into POWER DOWN state:
+	 * active low", and qmp_pcie_init() sets them. So 3 is powered and 0 is powered down; the sequence's
+	 * first write of 3 is the PHY being switched on, and every "powered up" write S1 made before this one
+	 * wrote 0, which switched it off. That also means the reference-clock experiments of the earlier runs
+	 * were all done on a PHY that had just been powered down, and their verdict has to be taken again.
+	 */
+	if (status & CORVETTE_PHY_STATUS_READY) {
+		kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+		kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+		sleep_ms(1);
+		kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		for (polls = 0; polls < 200; polls++) {
+			status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+			if (!(status & CORVETTE_PHY_STATUS_READY)) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("wifi: s1:   after it: %#x (bit 6 %u) after %u ms; 0x218 %#x, 0x21c %#x, 0x600 %#x\n", status,
+		    (status >> 6) & 1, polls, rd(phy + 0x218), rd(phy + 0x21c), rd(phy + 0x600));
+	}
+	if (status & CORVETTE_PHY_STATUS_READY) {
+		/* Then the variant that keeps the reference-clock driver disabled, for a PHY fed from the pad. */
+		kiwi_s1_write("phy 0x240: still powered", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+		sleep_ms(1);
+		kiwi_s1_write("phy 0x244: start again", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		for (polls = 0; polls < 200; polls++) {
+			status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+			if (!(status & CORVETTE_PHY_STATUS_READY)) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("wifi: s1:   after that: %#x (bit 6 %u) after %u ms\n", status, (status >> 6) & 1, polls);
+	}
+	printf("wifi: s1:   5/7: the phy is %s. S1 goes on either way, so one run still ends with everything "
+	    "else reported.\n", (status & CORVETTE_PHY_STATUS_READY) ?
+	    "NOT ready: no pipe clock can come out of it and the link cannot train" : "ready");
+	return true;
+}
+
+/*
+ * The 43 offsets the phone's own device tree lists for this PHY (qcom,phy-debug-reg), one per line so that
+ * the offset is already in the log when the value is read -- if one of the SerDes windows aborts, the log
+ * names the register that caused it.
+ *
+ * Air183 read this set once, in 5i/7, which is before the RPMh vote for the PHY's two parent rails. Air184
+ * reads it at both points: the run showed the link state only starts moving after the vote and the second
+ * sequence, so the set taken then is the one that describes a PHY that works.
+ */
+static void
+kiwi_s1_phy_regs(vm_offset_t parf, const char *when)
+{
+	static const uint32_t debug[] = {
+	    0x1cc, 0x1d0, 0x1d4, 0x1d8, 0x1dc, 0x1e0, 0x1e4, 0x1f8,
+	    0xed0, 0x16d0, 0xedc, 0x16dc, 0x11e0, 0x19e0, 0xa00, 0x1200,
+	    0xa04, 0x1204, 0xa08, 0x1208, 0xa0c, 0x120c, 0xa10, 0x1210,
+	    0xa14, 0x1214, 0xa18, 0x1218, 0xc20, 0x1420, 0x214, 0x218,
+	    0x21c, 0x220, 0x224, 0x228, 0x22c, 0x230, 0x234, 0x238,
+	    0x23c, 0x600, 0x604,
+	};
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	unsigned count = sizeof(debug) / sizeof(debug[0]);
+
+	printf("wifi: s1:   the phy's debug set %s, %u offsets from qcom,phy-debug-reg, one per line:\n", when,
+	    count);
+	for (unsigned i = 0; i < count; i++) {
+		printf("wifi: s1:   +%#05x = ", debug[i]);
+		printf("%#x\n", rd(phy + debug[i]));
+	}
+}
+
+/*
+ * 5i/7: the PHY's own opinion, and the two things that could still be missing.
+ *
+ * 5/7 establishes that PHYSTATUS (bit 6 of 0x214) never clears, and that neither power-down control nor a
+ * second start changes it. The device tree names a whole set of registers for exactly this (qcom,phy-debug-reg,
+ * 43 of them, PCS and SerDes), so they are read first: whether the SerDes' PLL locked is in there, and a PLL
+ * that has not locked explains PHYSTATUS staying set whatever else is written.
+ *
+ * Then the two candidates that a PLL needs:
+ *
+ *  - the reference clock. PARF 0x4c bit 12 says whether the PHY takes it from the pad or from the SoC's own
+ *    source; both are tried, and PHYSTATUS is the observer this time -- unlike a link state that cannot move
+ *    without a pipe clock, this bit answers on its own.
+ *  - the PHY's reset, pulsed here rather than in 3/7: some PHYs latch their configuration only when the reset
+ *    goes away after the tables are in, and 3/7 lets it go before.
+ */
+static void
+kiwi_s1_phy_deep(vm_offset_t gcc, vm_offset_t parf)
+{
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	uint32_t refclk = rd(parf + CORVETTE_PARF_PHY_REFCLK), polls;
+	/* Read before anything else: the reference-clock loop below asks whether the PHY is still down, and
+	 * an uninitialised answer would let it skip all four combinations and report a ready PHY that is not. */
+	uint32_t status = rd(parf + CORVETTE_PCIE0_PHY_AT + CORVETTE_PHY_STATUS_OFFSET);
+
+	/*
+	 * The experiments come first and the reading last. S1's twenty-second run went 900E here: reading the
+	 * whole qcom,phy-debug-reg set while the PHY is powered down is not safe -- the SerDes' own window
+	 * answers only when it is clocked, and an unclocked window on this NoC aborts instead of reading zero.
+	 * So the twelve registers that have answered in every run are read first, one per line and after the
+	 * offset is printed, and the rest of the set is read only once PHYSTATUS says the PHY is up.
+	 */
+	{
+		static const uint32_t always[] = { 0x214, 0x218, 0x21c, 0x600, 0x604 };
+
+		printf("wifi: s1:   the registers that have always answered, one per line so that the offset is in "
+		    "the log before it is read:\n");
+		for (unsigned i = 0; i < sizeof(always) / sizeof(always[0]); i++) {
+			printf("wifi: s1:   +%#05x = ", always[i]);
+			printf("%#x\n", rd(phy + always[i]));
+		}
+	}
+
+	/*
+	 * The reference clock: bit 9 and bit 12 of PARF 0x4c, all four ways. mainline calls bit 12 USE_PAD and
+	 * bit 16 the spread-spectrum enable; several vendor trees put USE_PAD at bit 9 and the external clock
+	 * at 12. Nothing here decides which is right -- the four combinations are tried, with 0x240 held at 3
+	 * throughout so that the PHY is powered while it is asked, and PHYSTATUS is the judge.
+	 */
+	printf("wifi: s1:   parf refclk %#x: bit 9 %u, bit 12 %u; trying all four\n", refclk, (refclk >> 9) & 1,
+	    (refclk >> 12) & 1);
+	for (unsigned bits = 0; bits < 4 && (status & CORVETTE_PHY_STATUS_READY); bits++) {
+		uint32_t want = (refclk & ~((1u << 9) | (1u << 12))) | ((bits & 1u) << 9) | (((bits >> 1) & 1u) << 12);
+
+		kiwi_s1_write("refclk: a combination", CORVETTE_PARF_PHY_REFCLK, parf + CORVETTE_PARF_PHY_REFCLK, want);
+		sleep_ms(2);
+		kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+		kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+		kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		for (polls = 0; polls < 100; polls++) {
+			status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+			if (!(status & CORVETTE_PHY_STATUS_READY)) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("wifi: s1:   with refclk bit9 %u bit12 %u: phy %#x after %u ms, 0x240 %#x, 0x244 %#x\n",
+		    (want >> 9) & 1, (want >> 12) & 1, status, polls, rd(phy + 0x240), rd(phy + 0x244));
+	}
+	if (status & CORVETTE_PHY_STATUS_READY) {
+		/* Neither source helped. Put the bits back where they were and try the reset behind the tables. */
+		kiwi_s1_write("refclk: as it was", CORVETTE_PARF_PHY_REFCLK, parf + CORVETTE_PARF_PHY_REFCLK, refclk);
+		kiwi_s1_write("pcie_0_phy reset: held", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 1);
+		sleep_ms(2);
+		kiwi_s1_write("pcie_0_phy reset: released", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 0);
+		sleep_ms(2);
+		kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+		kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+		kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		for (polls = 0; polls < 200; polls++) {
+			status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+			if (!(status & CORVETTE_PHY_STATUS_READY)) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("wifi: s1:   after a reset behind the tables: phy %#x after %u ms\n", status, polls);
+	}
+	printf("wifi: s1:   5i/7: the phy is %s\n", (status & CORVETTE_PHY_STATUS_READY) ?
+	    "still not ready: its reference clock or its supply is missing, not its configuration" : "ready");
+
+	/*
+	 * Air183: the whole set is read whether or not PHYSTATUS cleared.
+	 *
+	 * Runs up to air182 skipped it whenever bit 6 of 0x214 was still set, so the only SerDes registers this
+	 * port ever saw were the five that answer cold. Air184 keeps that, and adds a second read of the same
+	 * set in 5k/7, after the PHY's parent rails have been voted.
+	 */
+	if (status & CORVETTE_PHY_STATUS_READY) {
+		kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+		kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+		kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		sleep_ms(5);
+		printf("wifi: s1:   the phy is still down (0x214 %#x, 0x240 %#x); the set is read anyway\n",
+		    rd(phy + CORVETTE_PHY_STATUS_OFFSET), rd(phy + 0x240));
+	}
+	kiwi_s1_phy_regs(parf, "after the sequence, before the rails are voted");
+}
+
+/*
+ * 5j/7: the two rails this port hangs from, read-only.
+ *
+ * The device tree settles it: gcc_pcie_0_gdsc's parent-supply is pm_v8_s8_level and gcc_pcie_0_phy_gdsc's is
+ * pm_v8_s3_level, both "qcom,rpmh-arc-regulator", and the nodes they sit in carry qcom,resource-name
+ * "cx.lvl" and "mx.lvl". A GDSC on a rail that nobody has voted answers its own handshake bits -- which is
+ * what 2/7 has read for twenty runs -- while the domain behind it has no supply at all. That is the shape
+ * of every symptom here: the PHY's registers take writes and read back, the PCS reports, and the SerDes'
+ * PLL never starts because there is no power under it.
+ *
+ * Nothing is written here. Linux votes these rails through RPMh's ARC drivers; this reads what the boot
+ * loader's own votes left in the sleep and wake sets of the sequencer, which is what a vote looks like
+ * when it is in place, and the level tables so that the vote can be written on the next run and not
+ * guessed at. The first set is not read: its slots are transient and reading them has cost this project a
+ * 900E before.
+ */
+static void
+kiwi_s1_rpmh(void)
+{
+	static const char *const names[2] = { "cx.lvl", "mx.lvl" };
+
+	printf("wifi: s1: 5j/7: the rails under gcc_pcie_0_gdsc (pm_v8_s8_level -> cx.lvl) and under "
+	    "gcc_pcie_0_phy_gdsc (pm_v8_s3_level -> mx.lvl)\n");
+	if (!cmd_db_there()) {
+		printf("wifi: s1:   the boot loader's list of RPMh resources is not there\n");
+		return;
+	}
+	for (unsigned n = 0; n < 2; n++) {
+		const struct cmd_db_entry *entry = rpmh_resource(names[n], 0);
+		char levels[160];
+		int at = 0;
+
+		if (entry == NULL) {
+			printf("wifi: s1:   RPMh has no \"%s\"\n", names[n]);
+			continue;
+		}
+		levels[0] = 0;
+		for (unsigned s = 0; s < 8; s++) {
+			const struct cmd_db_slave *slave = &cmd_db->slave[s];
+			const struct cmd_db_entry *first =
+			    (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+			const uint8_t *data;
+
+			if (entry < first || entry >= first + slave->count ||
+			    (unsigned)slave->data_offset + entry->offset + entry->length > CMD_DB_SIZE - 0x1000) {
+				continue;
+			}
+			data = cmd_db->data + slave->data_offset + entry->offset;
+			at = snprintf(levels, sizeof(levels), ", levels:");
+			for (unsigned l = 0; l < entry->length / 2u && l < 16 && at < (int)sizeof(levels) - 8; l++) {
+				unsigned level = data[2 * l] | data[2 * l + 1] << 8;
+
+				if (l > 0 && level == 0) {
+					break;
+				}
+				at += snprintf(levels + at, sizeof(levels) - (size_t)at, " %u", level);
+			}
+		}
+		printf("wifi: s1:   %s at %#x%s\n", names[n], entry->address, levels);
+	}
+
+	/*
+	 * The sequencer itself. corvette's apps_rsc is at 0x17a00000 with three DRVs of 0x10000 each and the
+	 * operating system's is the third (dt: reg-names drv-0..drv-2, drv@2), whose TCSs start at 0xd00 and
+	 * number five (qcom,tcs-config = <2 3 0 2 1 2 3 0 4 1>: two at-once, two asleep, one awake). The
+	 * 0x18220000 the rest of this file uses is redwood's, and reading it here is what S1's twenty-fifth run
+	 * died of. The first two TCSs are not read: they hold requests in flight.
+	 */
+	{
+		struct block apps = { "apps rsc", 0x17a20000, 0x10000 };
+
+		need(&apps);
+		rsc.base = apps.base;
+	}
+	printf("wifi: s1:   what the last votes left in the sleep and wake sets (TCS 2..4 of drv-2):\n");
+	for (unsigned t = 2; t < 5; t++) {
+		uint32_t enabled = rd(rsc.base + RSC_TCS(t) + TCS_ENABLED);
+
+		if (enabled == 0) {
+			printf("wifi: s1:   tcs %u: nothing enabled\n", t);
+			continue;
+		}
+		for (unsigned c = 0; c < 16; c++) {
+			const struct cmd_db_entry *entry;
+			uint32_t address;
+
+			if (!(enabled & (1u << c))) {
+				continue;
+			}
+			address = rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c) + 4);
+			entry = rpmh_resource(NULL, address);
+			printf("wifi: s1:   tcs %u cmd %u: %#x = %#x (%s)\n", t, c, address,
+			    rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c) + 8),
+			    entry != NULL ? entry->id : "not in the list");
+		}
+	}
+	printf("wifi: s1:   5j/7: nothing was written; the next run votes these two by level, with the numbers "
+	    "above\n");
+}
+
+/*
+ * 5k/7: the vote itself.
+ *
+ * 5j/7 answered what was missing: cx.lvl sits at 0x30000 and mx.lvl at 0x30010, both with the level table
+ * 0 16 64 128 192 256 320 384 416 480, and no TCS of the sleep or wake set holds a vote -- the boot loader
+ * left none. So the two parents of this port's power domains have never been asked for anything, and a GDSC
+ * whose parent rail is unvoted reports its own handshake while the domain behind it has no supply. That is
+ * the whole of the PHY's behaviour for twenty runs.
+ *
+ * The command is written the way hakios.mpss.c writes the modem's, which is the one path on this phone that
+ * has been seen to work: one command, in the first of the two "at once" TCSs, waited for, and the TCS put
+ * back as it was found. The value is the position of the level in the rail's own table, not the level
+ * itself, which is what that path sends.
+ *
+ * The level is 384: the modem asks for it for cx and mss on this phone, and it is the highest entry below
+ * the two turbo ones, so nothing is being pushed beyond what this SoC already runs at.
+ *
+ * The PHY's sequence is written again afterwards, because it was written while the rail was down: whatever
+ * it put into the SerDes was put into a block that had no supply under it.
+ */
+#define CORVETTE_RSC_PHYS       0x17a20000      /* dt: apps_rsc rsc@17a00000, drv@2 (reg-names "drv-2") */
+#define CORVETTE_RSC_IRQ_STATUS (0xd00 + 0x04)
+#define CORVETTE_RSC_IRQ_CLEAR  (0xd00 + 0x08)
+#define CORVETTE_TCS_ACTIVE     (1u << 16)
+#define CORVETTE_TCS_TRIGGER    (1u << 24)
+#define CORVETTE_MSGID_WRITE    (8u | 1u << 8 | 1u << 16)       /* four bytes, an answer wanted, a write */
+#define CORVETTE_RAIL_LEVEL     384              /* the level the modem path asks cx and mss for */
+
+/*
+ * Where a TCS's registers are depends on the RSC's major version, and drivers/soc/qcom/rpmh-rsc.c has two
+ * tables for it: version 2.7 has a command stride of 20 bytes with CONTROL at 0x14, version 3.0 has 24 with
+ * CONTROL at 0x24. S1's twenty-eighth run wrote the 2.7 layout and read back a control register of 0 and a
+ * command status of 0x6023e28f -- which is not a status at all, it is another register. The version is in
+ * the DRV's first word, bits [23:16].
+ */
+struct kiwi_tcs {
+	uint32_t stride;        /* bytes between commands */
+	uint32_t control;
+	uint32_t status;
+	uint32_t enable;
+	uint32_t msgid;
+	uint32_t addr;
+	uint32_t data;
+	uint32_t cmdsts;
+	uint32_t wait;
+	uint32_t resp;
+};
+
+static const struct kiwi_tcs kiwi_tcs_2_7 = { 20, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38, 0x3c, 0x10, 0x40 };
+static const struct kiwi_tcs kiwi_tcs_3_0 = { 24, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c, 0x40, 0x20, 0x44 };
+
+static const struct kiwi_tcs *
+kiwi_s1_tcs_layout(vm_offset_t base)
+{
+	static const struct kiwi_tcs *chosen;   /* (one controller, so the answer does not change) */
+
+	if (chosen == NULL) {
+		uint32_t id = rd(base);
+
+		printf("wifi: s1:   the sequencer's drv: id %#x (major %u), %u TCSs\n", id, (id >> 16) & 0xff,
+		    (id >> 6) & 0x3f);
+		chosen = ((id >> 16) & 0xff) >= 3 ? &kiwi_tcs_3_0 : &kiwi_tcs_2_7;
+	}
+	return chosen;
+}
+
+/* The position of that level in the rail's own table: what RPMh is given, not the level. */
+static int
+kiwi_s1_rail_position(const struct cmd_db_entry *entry, uint32_t level)
+{
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *first = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+		const uint8_t *data;
+
+		if (entry < first || entry >= first + slave->count) {
+			continue;
+		}
+		if ((unsigned)slave->data_offset + entry->offset + entry->length > CMD_DB_SIZE - 0x1000) {
+			continue;
+		}
+		data = cmd_db->data + slave->data_offset + entry->offset;
+		for (unsigned l = 0; l < entry->length / 2u && l < 16; l++) {
+			unsigned got = data[2 * l] | data[2 * l + 1] << 8;
+
+			if (got == level) {
+				return (int)l;
+			}
+			if (got == 0 && l > 0) {
+				break;
+			}
+		}
+	}
+	return -1;
+}
+
+/*
+ * One command, in one TCS: cleared, written, enabled, triggered with MODE_ENABLE|TRIGGER, and then the
+ * command's own status word is polled for COMPLETE (bit 16) -- the interrupt is not used, so nothing depends
+ * on an IRQ that this kernel has no table for.
+ */
+static bool
+kiwi_s1_vote(const char *name, uint32_t level, vm_offset_t base, uint32_t tcs)
+{
+	const struct cmd_db_entry *entry = rpmh_resource(name, 0);
+	const struct kiwi_tcs *t = kiwi_s1_tcs_layout(base);
+	vm_offset_t at, irq;
+	uint32_t address, status = 0, polls;
+	uint64_t began;
+	int position;
+
+	if (entry == NULL) {
+		printf("wifi: s1:   RPMh has no \"%s\": not voted\n", name);
+		return false;
+	}
+	position = kiwi_s1_rail_position(entry, level);
+	if (position < 0) {
+		printf("wifi: s1:   %s has no level %u in its table: not voted\n", name, level);
+		return false;
+	}
+	address = entry->address;
+	at = base + 0xd00 + 672 * tcs;
+	irq = base + 0xd00;
+	printf("wifi: s1: 5k/7: %s at %#x = position %d (level %u), one command in TCS %u (control at %#x)\n",
+	    name, address, position, level, tcs, t->control);
+
+	wr(irq + 0x08, 1u << tcs);                              /* clear this TCS's done bit */
+	wr(at + t->enable, 0);
+	wr(at + t->control, 0);
+	wr(at + t->msgid, CORVETTE_MSGID_WRITE);
+	wr(at + t->addr, address);
+	wr(at + t->data, (uint32_t)position);
+	wr(at + t->enable, 1);
+	sleep_us(10);
+	wr(at + t->control, CORVETTE_TCS_ACTIVE | CORVETTE_TCS_TRIGGER);
+
+	began = now_us();
+	for (polls = 0; polls < 2000; polls++) {
+		status = rd(at + t->cmdsts);
+		if (status & (1u << 16)) {                      /* the command says it is done */
+			break;
+		}
+		sleep_us(50);
+	}
+	printf("wifi: s1:   %s after %llu us: the command's status %#x (done %u), the TCS's %#x, control %#x\n",
+	    (status & (1u << 16)) ? "RPMh HAS DONE IT" : "RPMh HAS NOT SAID DONE", now_us() - began, status,
+	    (status >> 16) & 1, rd(at + t->status), rd(at + t->control));
+	wr(irq + 0x08, 1u << tcs);
+	wr(at + t->control, 0);
+	wr(at + t->enable, 0);
+	return (status & (1u << 16)) != 0;
+}
+
+static bool
+kiwi_s1_rail(const char *name, vm_offset_t base)
+{
+	for (uint32_t tcs = 0; tcs < 2; tcs++) {
+		if (kiwi_s1_vote(name, CORVETTE_RAIL_LEVEL, base, tcs)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The GPU's bring-up (hakios.adreno.c) needs one vote of its own: gpu_cc_gx_gdsc's parent rail is
+ * gfx.lvl and the vendor's gdsc_toggle_logic() enables that supply before it clears the collapse bit.
+ * Same sequencer, same two TCS of the awake set that S1's cx and mx votes went through.
+ */
+bool
+hakios_rpmh_level(const char *name, uint32_t level)
+{
+	vm_offset_t base = corvette_s1_io_map(CORVETTE_RSC_PHYS, 0x10000);
+
+	for (uint32_t tcs = 0; tcs < 2; tcs++) {
+		if (kiwi_s1_vote(name, level, base, tcs)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The reference clock, searched rather than guessed.
+ *
+ * PARF 0x4c decides where the PHY takes its hundred megahertz from, and S1 has only ever read it
+ * (0x1019: use-pad set, bit 9 clear). The one time the four combinations were tried, the PHY was in
+ * the wrong power state and the observation was a single sample of a bit that reads differently from one
+ * boot to the next -- so the answer was never really found.
+ *
+ * What is flaky is the PHY's own lock: the same code reports 0x214 = 0x86 (bit 6 clear, ready) on one
+ * boot and 0x41 on the next. A PLL that locks sometimes is a PLL whose reference clock is marginal, and
+ * the reference clock is the one thing here that has two possible sources and no evidence for either.
+ *
+ * So the four combinations are tried again, each one with the PHY started afresh, and each one judged
+ * by how many of fifty samples over two hundred milliseconds say the PHY is ready. A single sample
+ * cannot tell a locked PLL from a lucky one; fifty can.
+ */
+static void
+kiwi_s1_refclk_search(vm_offset_t parf)
+{
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	uint32_t base = rd(parf + CORVETTE_PARF_PHY_REFCLK);
+	uint32_t best = base, best_ready = 0, value, ready, i, j;
+
+	printf("wifi: s1: 5k/7: the reference clock, searched: parf 0x4c reads %#x (bit 9 %u, bit 12 %u)\n", base,
+	    (base >> 9) & 1, (base >> 12) & 1);
+	for (i = 0; i < 4; i++) {
+		value = (base & ~((1u << 9) | (1u << 12))) | ((i & 1u) ? (1u << 9) : 0) | ((i & 2u) ? (1u << 12) : 0);
+		kiwi_s1_write("refclk: a combination", CORVETTE_PARF_PHY_REFCLK, parf + CORVETTE_PARF_PHY_REFCLK,
+		    value);
+		kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+		kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+		ready = 0;
+		for (j = 0; j < 50; j++) {
+			if (!(rd(phy + CORVETTE_PHY_STATUS_OFFSET) & CORVETTE_PHY_STATUS_READY)) {
+				ready++;
+			}
+			sleep_ms(4);
+		}
+		printf("wifi: s1:   refclk %#x (bit 9 %u, bit 12 %u): %u of 50 samples say the phy is ready\n", value,
+		    (value >> 9) & 1, (value >> 12) & 1, ready);
+		if (ready > best_ready) {
+			best_ready = ready;
+			best = value;
+		}
+	}
+	/* The four combinations are only observed. The vendor's msm_pcie_enable_link() never writes
+	 * 0x4c, so whatever scored highest is discarded and the boot firmware's value (0x1019) goes
+	 * back -- that is the value the working vendor kernel trains the link with. */
+	printf("wifi: s1:   best was %#x (%u of 50 ready), but %#x goes back: the vendor never writes this register\n",
+	    best, best_ready, base);
+	kiwi_s1_write("refclk: the boot firmware's value back", CORVETTE_PARF_PHY_REFCLK,
+	    parf + CORVETTE_PARF_PHY_REFCLK, base);
+	kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+	kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+
+	/*
+	 * PARF 0x4c is left exactly as the boot firmware set it (0x1019). The vendor's own
+	 * msm_pcie_enable_link() never writes 0x4c: it relies on the PHY sequence (0x240=3 and
+	 * 0x620=0xc1) plus the TCSR clkref_en to drive the reference clock out. mainline pcie-qcom.c
+	 * clears USE_PAD(12) and sets SSP_EN(16), but that is the mainline tree's own behaviour and the
+	 * vendor kernel brings the radio up with 0x1019 in place -- so S1 must not overwrite it. S1 used
+	 * to write 0x10019 (use pad off, ssp on), the opposite of the working vendor register value.
+	 */
+	value = rd(parf + CORVETTE_PARF_PHY_REFCLK);
+	printf("wifi: s1:   parf refclk reads %#x: use pad %u, ssp %u; left as the boot firmware and the vendor's kernel leave it\n",
+	    value, (value >> 12) & 1, (value >> 16) & 1);
+	kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+	kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+}
+
+/*
+ * Air189: read the radio's clock request pin, then put it back on the PCIe function.  The pin is only
+ * readable as a plain GPIO, so it is switched for the duration of one read and switched back.
+ */
+static uint32_t
+kiwi_s1_clkreq_level(vm_offset_t tlmm)
+{
+	uint32_t level;
+
+	wr(tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ, CORVETTE_PIN_CLKREQ_SLEEP);
+	level = rd(tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ + 4) & 1;
+	wr(tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ, CORVETTE_PIN_CLKREQ_N);
+	return level;
+}
+
+static void
+kiwi_s1_rails(vm_offset_t gcc, vm_offset_t parf)
+{
+	vm_offset_t base = corvette_s1_io_map(CORVETTE_RSC_PHYS, 0x10000);
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	uint32_t status, polls;
+
+	printf("wifi: s1: 5k/7: asking RPMh for the two rails under this port, at level %u\n",
+	    CORVETTE_RAIL_LEVEL);
+	if (!cmd_db_there()) {
+		printf("wifi: s1:   the list of RPMh resources is not there: not voted\n");
+		return;
+	}
+	kiwi_s1_rail("cx.lvl", base);
+	sleep_ms(5);
+	kiwi_s1_rail("mx.lvl", base);
+	sleep_ms(5);
+
+	printf("wifi: s1:   the domains again: core %#x %#x, phy %#x %#x\n", rd(gcc + CORVETTE_PCIE0_GDSCR),
+	    rd(gcc + CORVETTE_PCIE0_GDSCR + CORVETTE_GDSC_CFG), rd(gcc + CORVETTE_PCIE0_PHY_GDSCR),
+	    rd(gcc + CORVETTE_PCIE0_PHY_GDSCR + CORVETTE_GDSC_CFG));
+
+	printf("wifi: s1:   the phy's sequence again, now that its rail has been asked for\n");
+	kiwi_s1_phy(parf);
+	kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+	kiwi_s1_write("phy 0x200: reset off", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+	kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+	for (polls = 0; polls < 300; polls++) {
+		status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+		if (!(status & CORVETTE_PHY_STATUS_READY)) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	printf("wifi: s1:   5k/7: after the vote and the sequence: phy %#x %s after %u ms\n", status,
+	    (status & CORVETTE_PHY_STATUS_READY) ? "NOT ready" : "READY", polls);
+	kiwi_s1_phy_regs(parf, "after the rails were voted and the sequence written again");
+	/*
+	 * The clock request. The device tree gives this port its own clkreq pin (95), and that pin is an
+	 * input: it is the far end that asks for the reference clock, not the host that gives it. So the pin
+	 * is read here, never driven -- and the controller's own override (PARF 0x2b0, CLKREQ_IN_ENABLE bit 1
+	 * and CLKREQ_IN_VALUE bit 3) is what decides what the controller makes of it. Driving it as an output,
+	 * which is what this used to do, is backwards.
+	 *
+	 * It runs whether the PHY is ready or not: for twenty runs it only ever ran when the PHY was down,
+	 * so the one case where it could have mattered was the one case it never saw.
+	 */
+	{
+		vm_offset_t tlmm = corvette_s1_io_map(CORVETTE_TLMM_PHYS, CORVETTE_TLMM_SIZE);
+		uint32_t clkreq = 0x1000UL * CORVETTE_PIN_CLKREQ;
+
+		/*
+		 * The clock request is the far end pulling pin 95 low, and it reaches the PCIe controller only
+		 * when the pin carries function 1 (pcie0_clk_req_n), not as a GPIO. With the pin a GPIO the level
+		 * read back is real but useless: the controller never sees it, so it never drives the reference
+		 * clock out and the radio's PHY never comes up.
+		 */
+		kiwi_s1_write("pin 95 clkreq: pcie0_clk_req_n", clkreq, tlmm + clkreq, CORVETTE_PIN_CLKREQ_N);
+		printf("wifi: s1:   clkreq: pin %u cfg %#x io %#x (in %u, out %u); parf 0x2b0 %#x\n",
+		    CORVETTE_PIN_CLKREQ, rd(tlmm + clkreq), rd(tlmm + clkreq + 4), rd(tlmm + clkreq + 4) & 1,
+		    (rd(tlmm + clkreq + 4) >> 1) & 1, rd(parf + 0x2b0));
+		printf("wifi: s1:   clkreq reads %u: %s\n", rd(tlmm + clkreq + 4) & 1,
+		    (rd(tlmm + clkreq + 4) & 1) ? "the radio is not asking for a clock" :
+		    "THE RADIO IS ASKING FOR A CLOCK");
+		for (unsigned value = 0; value <= 2; value++) {
+			uint32_t over = value == 0 ? 0 : (value == 1 ? (1u << 1) : ((1u << 1) | (1u << 3)));
+
+			kiwi_s1_write(value == 0 ? "parf clkreq: the input is left alone" :
+			    (value == 1 ? "parf clkreq: taken over, low" : "parf clkreq: taken over, high"),
+			    0x2b0, parf + 0x2b0, over);
+			kiwi_s1_write("phy 0x240: powered (three is on)", 0x240, phy + 0x240, rd(phy + 0x240) | 3u);
+			kiwi_s1_write("phy 0x244: start", 0x244, phy + 0x244, rd(phy + 0x244) | 3u);
+			for (polls = 0; polls < 100; polls++) {
+				status = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+				if (!(status & CORVETTE_PHY_STATUS_READY)) {
+					break;
+				}
+				sleep_ms(1);
+			}
+			printf("wifi: s1:   with clkreq %s: phy %#x %s after %u ms; pin 95 in %u\n",
+			    value == 0 ? "left alone" : (value == 1 ? "taken over low" : "taken over high"), status,
+			    (status & CORVETTE_PHY_STATUS_READY) ? "NOT ready" : "READY", polls,
+			    rd(tlmm + clkreq + 4) & 1);
+		}
+		kiwi_s1_write("parf clkreq: its input back", 0x2b0, parf + 0x2b0, 0);
+		printf("wifi: s1:   5k/7: clkreq leaves the phy %#x %s, parf 0x2b0 %#x\n", status,
+		    (status & CORVETTE_PHY_STATUS_READY) ? "NOT ready" : "READY", rd(parf + 0x2b0));
+	}
+
+	/* and last of all, the reference clock: the one thing with two sources and no evidence for either */
+	kiwi_s1_refclk_search(parf);
+}
+
+/* 5b/7: the core's own configuration, in PARF (Linux's qcom_pcie_post_init_2_9_0). The ELBI is inside the
+ * core at 0x60000000, and until PARF passes the core's AHB clock through (BYPASS together with AHB_CLK_EN) a
+ * write to ELBI_SYS_CTRL is dropped and reads back 0 -- which is what S1's second run saw with the PHY ready,
+ * both power domains up and the pins right. The registers are read before they are written, and the DBI's
+ * base, the address space's size and the ECAM's base are read only: they say whether the bus will answer. */
+static bool
+kiwi_s1_core(vm_offset_t parf)
+{
+	uint32_t device, mhi, ctrl, flush;
+
+	kiwi_s1_read("parf sys ctrl", CORVETTE_PARF_SYS_CTRL, parf + CORVETTE_PARF_SYS_CTRL);
+	kiwi_s1_read("parf mhi clock/reset", CORVETTE_PARF_MHI_CLOCK_RESET, parf + CORVETTE_PARF_MHI_CLOCK_RESET);
+	kiwi_s1_read("parf q2a flush", CORVETTE_PARF_Q2A_FLUSH_OFFSET, parf + CORVETTE_PARF_Q2A_FLUSH_OFFSET);
+	kiwi_s1_read("parf dbi base", 0x168, parf + 0x168);
+	kiwi_s1_read("parf slv space size", 0x16c, parf + 0x16c);
+	kiwi_s1_read("parf ecam base", 0x380, parf + 0x380);
+	device = kiwi_s1_read("parf device type", CORVETTE_PARF_DEVICE_TYPE_OFF, parf + CORVETTE_PARF_DEVICE_TYPE_OFF);
+
+	printf("wifi: s1: 5b/7: the core's own configuration (a root complex is device type %#x)\n",
+	    CORVETTE_PARF_DEVICE_TYPE_RC);
+	if ((device & 0xf) != CORVETTE_PARF_DEVICE_TYPE_RC) {
+		kiwi_s1_write("device type: RC", CORVETTE_PARF_DEVICE_TYPE_OFF, parf + CORVETTE_PARF_DEVICE_TYPE_OFF,
+		    CORVETTE_PARF_DEVICE_TYPE_RC);
+	} else {
+		printf("wifi: s1:   it is a root complex already\n");
+	}
+
+	/*
+	 * "Force PHY out of lowest power state" (Linux's qcom_pcie_init_2_7_0, the sequence this SoC's
+	 * configuration uses): PARF_PHY_CTRL bit 0 holds the PHY down, and qcom_pcie_deinit_2_7_0 sets it
+	 * again when the controller is torn down -- so it is a real gate, not a debugging knob. Nothing in S1
+	 * has ever cleared it, and a PHY held down still answers its own status registers (its "ready" bit is
+	 * the end of the sequence, not a clock) while handing the core no pipe clock at all, which is exactly
+	 * a link whose LTSSM cannot leave detect.
+	 */
+	{
+		uint32_t phy_control = rd(parf + CORVETTE_PARF_PHY_CTRL);
+
+		if (phy_control & CORVETTE_PHY_TEST_PWR_DOWN) {
+			kiwi_s1_write("parf phy ctrl: awake", CORVETTE_PARF_PHY_CTRL, parf + CORVETTE_PARF_PHY_CTRL,
+			    phy_control & ~CORVETTE_PHY_TEST_PWR_DOWN);
+		} else {
+			printf("wifi: s1:   parf phy ctrl %#x: the PHY is not held down\n", phy_control);
+		}
+	}
+
+	mhi = rd(parf + CORVETTE_PARF_MHI_CLOCK_RESET);
+	if ((mhi & CORVETTE_PARF_MHI_ON) != CORVETTE_PARF_MHI_ON) {
+		kiwi_s1_write("mhi clock/reset: on", CORVETTE_PARF_MHI_CLOCK_RESET,
+		    parf + CORVETTE_PARF_MHI_CLOCK_RESET, mhi | CORVETTE_PARF_MHI_ON);
+	} else {
+		printf("wifi: s1:   mhi clock/reset %#x already passes them: bypass %u, ahb clk %u, mstr axi clk %u\n",
+		    mhi, (mhi >> 4) & 1, mhi & 1, (mhi >> 1) & 1);
+	}
+
+	/*
+	 * The wake-up and clock-gating bits, and one cleared: MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN, which upstream
+	 * clears for the same reason it clears the bit above -- it is the mux through which something else can
+	 * put the PHY's MAC side back to sleep.
+	 */
+	ctrl = rd(parf + CORVETTE_PARF_SYS_CTRL);
+	if ((ctrl & CORVETTE_PARF_SYS_CTRL_ON) != CORVETTE_PARF_SYS_CTRL_ON || (ctrl & CORVETTE_PARF_MAC_PHY_PWR_MUX)) {
+		kiwi_s1_write("sys ctrl: awake", CORVETTE_PARF_SYS_CTRL, parf + CORVETTE_PARF_SYS_CTRL,
+		    (ctrl | CORVETTE_PARF_SYS_CTRL_ON) & ~CORVETTE_PARF_MAC_PHY_PWR_MUX);
+	} else {
+		printf("wifi: s1:   sys ctrl %#x already has them, and the phy's power-down mux is off\n", ctrl);
+	}
+
+	/*
+	 * The rest of Linux's qcom_pcie_init_2_7_0, which S1 has never done either: L1 is allowed in (PM_CTRL's
+	 * REQ_NOT_ENTR_L1 cleared), and the AXI master's writes are let through (AXI_MSTR_WR_ADDR_HALT_V2's EN,
+	 * bit 31). Neither starts a link on its own; both are what the vendor's own bring-up writes.
+	 */
+	{
+		uint32_t pm = rd(parf + CORVETTE_PARF_PM_CTRL);
+
+		if (pm & CORVETTE_PARF_REQ_NOT_ENTR_L1) {
+			kiwi_s1_write("pm ctrl: L1 allowed", CORVETTE_PARF_PM_CTRL, parf + CORVETTE_PARF_PM_CTRL,
+			    pm & ~CORVETTE_PARF_REQ_NOT_ENTR_L1);
+		} else {
+			printf("wifi: s1:   pm ctrl %#x: L1 is allowed already\n", pm);
+		}
+	}
+	{
+		uint32_t halt = rd(parf + CORVETTE_PARF_AXI_HALT_V2);
+
+		if (!(halt & CORVETTE_PARF_AXI_HALT_EN)) {
+			kiwi_s1_write("axi writes: let through", CORVETTE_PARF_AXI_HALT_V2, parf + CORVETTE_PARF_AXI_HALT_V2,
+			    halt | CORVETTE_PARF_AXI_HALT_EN);
+		} else {
+			printf("wifi: s1:   axi halt v2 %#x: writes are let through already\n", halt);
+		}
+	}
+
+	flush = rd(parf + CORVETTE_PARF_Q2A_FLUSH_OFFSET);
+	if (flush != 0) {
+		kiwi_s1_write("q2a flush: cleared", CORVETTE_PARF_Q2A_FLUSH_OFFSET,
+		    parf + CORVETTE_PARF_Q2A_FLUSH_OFFSET, 0);
+	} else {
+		printf("wifi: s1:   q2a flush is already clear\n");
+	}
+
+	device = rd(parf + CORVETTE_PARF_DEVICE_TYPE_OFF);
+	mhi = rd(parf + CORVETTE_PARF_MHI_CLOCK_RESET);
+	printf("wifi: s1:   5b/7: device type now %#x, mhi clock/reset now %#x (bypass %u)\n", device, mhi,
+	    (mhi >> 4) & 1);
+	return (device & 0xf) == CORVETTE_PARF_DEVICE_TYPE_RC;
+}
+
+/* 5c/7: the core's base addresses, and whether the core answers at all. The device tree's dm_core
+ * (0x60000000) is where the core's own config space is; PARF_DBI_BASE_ADDR_V2 points the core at it, and
+ * ATU_BASE_ADDR at the iATU (0x60001000). Read first: S1's third run found the older pair (0x168/0x16c) at
+ * zero, and these two, if they are at zero as well, mean nothing has ever told the core where it lives --
+ * which is why every read below 0x60000f20 came back 0 and the ELBI took no write. */
+static void
+kiwi_s1_dbi(vm_offset_t parf, vm_offset_t dm_core)
+{
+	uint32_t id;
+
+	kiwi_s1_read("parf dbi base v2", CORVETTE_PARF_DBI_BASE_V2, parf + CORVETTE_PARF_DBI_BASE_V2);
+	kiwi_s1_read("parf dbi base v2 hi", CORVETTE_PARF_DBI_BASE_V2_HI, parf + CORVETTE_PARF_DBI_BASE_V2_HI);
+	kiwi_s1_read("parf atu base", CORVETTE_PARF_ATU_BASE, parf + CORVETTE_PARF_ATU_BASE);
+	kiwi_s1_read("parf slv size v2", CORVETTE_PARF_SLV_SIZE_V2, parf + CORVETTE_PARF_SLV_SIZE_V2);
+	kiwi_s1_read("parf slv size v2 hi", CORVETTE_PARF_SLV_SIZE_V2_HI, parf + CORVETTE_PARF_SLV_SIZE_V2_HI);
+	id = kiwi_s1_read("core's config space", 0, dm_core);
+
+	printf("wifi: s1: 5c/7: the core's base addresses (dm_core %#x, iatu %#x, from the device tree)\n",
+	    CORVETTE_PCIE0_CORE, CORVETTE_PCIE0_CORE + 0x1000);
+	/* The vendor's msm_pcie_enable_link() writes 0 to DBI_BASE_ADDR_V2 ("change DBI base
+	 * address"); the bootloader's 0 is the offset the core already decodes at. Writing the
+	 * mainline absolute 0x60000000 here makes the core stop decoding its own config space
+	 * (reads 0xffffffff), so every port/link write never reached the core and the link stayed
+	 * in detect.quiet. This was the bug behind the endless detect.quiet. */
+	if (rd(parf + CORVETTE_PARF_DBI_BASE_V2) != 0) {
+		kiwi_s1_write("dbi base v2: 0", CORVETTE_PARF_DBI_BASE_V2, parf + CORVETTE_PARF_DBI_BASE_V2, 0);
+	}
+	if (rd(parf + CORVETTE_PARF_DBI_BASE_V2_HI) != 0) {
+		kiwi_s1_write("dbi base v2: hi 0", CORVETTE_PARF_DBI_BASE_V2_HI, parf + CORVETTE_PARF_DBI_BASE_V2_HI, 0);
+	}
+	/* The vendor never touches ATU_BASE; the bootloader leaves it at 0x1000 (an offset into
+	 * the DBI window, not the mainline absolute address). Leave it as the bootloader had it. */
+	if (rd(parf + CORVETTE_PARF_ATU_BASE) != 0x1000) {
+		kiwi_s1_write("atu base: 0x1000", CORVETTE_PARF_ATU_BASE, parf + CORVETTE_PARF_ATU_BASE, 0x1000);
+	}
+	if (rd(parf + CORVETTE_PARF_ATU_BASE_HI) != 0) {
+		kiwi_s1_write("atu base: hi 0", CORVETTE_PARF_ATU_BASE_HI, parf + CORVETTE_PARF_ATU_BASE_HI, 0);
+	}
+	/* The vendor writes the DT's slv-addr-space-size into the low word and leaves the high word 0.
+	 * S1 used to write 0 into the low word and 2 GB into the high one, which is a 2^63 window that
+	 * nothing decodes; with it wrong, ECAM reads would fail even after the link came up. */
+	if (rd(parf + CORVETTE_PARF_SLV_SIZE_V2) != CORVETTE_PARF_SLV_SIZE) {
+		kiwi_s1_write("slv size v2: 64 MB", CORVETTE_PARF_SLV_SIZE_V2, parf + CORVETTE_PARF_SLV_SIZE_V2,
+		    CORVETTE_PARF_SLV_SIZE);
+	}
+	if (rd(parf + CORVETTE_PARF_SLV_SIZE_V2_HI) != 0) {
+		kiwi_s1_write("slv size v2: hi 0", CORVETTE_PARF_SLV_SIZE_V2_HI, parf + CORVETTE_PARF_SLV_SIZE_V2_HI,
+		    0);
+	}
+
+	id = rd(dm_core);
+	printf("wifi: s1:   5c/7: the core's config space %#x now reads %#x (vendor %#x, device %#x), class/revision "
+	    "%#x\n", CORVETTE_PCIE0_CORE, id, id & 0xffff, id >> 16, rd(dm_core + 8));
+	printf("wifi: s1:   %s\n", (id == 0 || id == 0xffffffff) ?
+	    "it still reads nothing: the core is not decoding its own config space" :
+	    "the core answers");
+}
+
+/* 5d/7: the port itself, as Linux's dw_pcie_setup_rc() leaves it: bus numbers, the command register, the
+ * class code (which read 0xff, i.e. unconfigured), and above all the number of lanes -- PORT_LINK_CONTROL
+ * read 0, and a DWC port that is told it has no lanes keeps its LTSSM in detect for ever, which is exactly
+ * what the last second of every run so far has shown. One lane is right here: the radio is an x1 device. */
+static void
+kiwi_s1_port(vm_offset_t dm_core)
+{
+	uint32_t command = kiwi_s1_read("dbi command", CORVETTE_DBI_COMMAND, dm_core + CORVETTE_DBI_COMMAND);
+	uint32_t class = kiwi_s1_read("dbi class/revision", CORVETTE_DBI_CLASS, dm_core + CORVETTE_DBI_CLASS);
+	uint32_t bus = kiwi_s1_read("dbi bus numbers", CORVETTE_DBI_PRIMARY_BUS, dm_core + CORVETTE_DBI_PRIMARY_BUS);
+	uint32_t link = kiwi_s1_read("dbi port link control", CORVETTE_DBI_PORT_LINK_CONTROL,
+	    dm_core + CORVETTE_DBI_PORT_LINK_CONTROL);
+	uint32_t width = kiwi_s1_read("dbi link width/speed", CORVETTE_DBI_LINK_WIDTH_SPEED,
+	    dm_core + CORVETTE_DBI_LINK_WIDTH_SPEED);
+	uint32_t misc = kiwi_s1_read("dbi misc control 1", CORVETTE_DBI_MISC_CONTROL_1,
+	    dm_core + CORVETTE_DBI_MISC_CONTROL_1);
+
+	printf("wifi: s1: 5d/7: the port: %u lanes configured, class %#x, command %#x; the radio is an x1 device\n",
+	    (link >> 16) & 0x3f, class >> 16, command);
+	kiwi_s1_write("misc control 1: ro on", CORVETTE_DBI_MISC_CONTROL_1, dm_core + CORVETTE_DBI_MISC_CONTROL_1,
+	    misc | 1);
+	kiwi_s1_write("dbi bus numbers", CORVETTE_DBI_PRIMARY_BUS, dm_core + CORVETTE_DBI_PRIMARY_BUS,
+	    (bus & 0xff000000) | CORVETTE_BUS_NUMBERS);
+	kiwi_s1_write("dbi command", CORVETTE_DBI_COMMAND, dm_core + CORVETTE_DBI_COMMAND,
+	    (command & 0xffff0000) | CORVETTE_COMMAND_BITS);
+	kiwi_s1_write("dbi class: pci bridge", CORVETTE_DBI_CLASS, dm_core + CORVETTE_DBI_CLASS,
+	    (class & 0xffff) | CORVETTE_CLASS_PCI_BRIDGE);
+	/*
+	 * Neither of these is written, and that is the vendor's own behaviour rather than an omission. pcie0's
+	 * node has no qcom,target-link-width and no num-lanes, so msm_pcie_enable_link() never reaches
+	 * msm_pcie_set_link_width() and msm_pcie_link_train() never touches 0x710 or the width field: what the
+	 * bootloader left there -- x2 in the lane field, 0x130290 in the width/speed word -- is what Android
+	 * trains with. S1 used to force both to one lane, which no vendor path ever does. The one write
+	 * link_train() does make to this word is the field at bits 12:8, and 5h/7 does that.
+	 */
+	printf("wifi: s1:   port link control and width/speed left as the bootloader had them: lanes %u, width %#x\n",
+	    (link >> 16) & 0x3f, width);
+	kiwi_s1_write("misc control 1: ro off", CORVETTE_DBI_MISC_CONTROL_1, dm_core + CORVETTE_DBI_MISC_CONTROL_1, misc);
+
+	printf("wifi: s1:   5d/7: port link control now %#x (%u lanes, dll link %u), link width/speed %#x (%u lanes)\n",
+	    rd(dm_core + CORVETTE_DBI_PORT_LINK_CONTROL), (rd(dm_core + CORVETTE_DBI_PORT_LINK_CONTROL) >> 16) & 0x3f,
+	    (rd(dm_core + CORVETTE_DBI_PORT_LINK_CONTROL) >> 5) & 1, rd(dm_core + CORVETTE_DBI_LINK_WIDTH_SPEED),
+	    (rd(dm_core + CORVETTE_DBI_LINK_WIDTH_SPEED) >> 8) & 0xff);
+}
+
+/* Walks the capability list the core answers with and returns the PCIe capability's offset (0 if there is
+ * none). The list starts at the DBI's 0x34; this is the same walk Linux's dw_pcie_find_capability() makes,
+ * and it matters: the first entry on this core is the power management capability at 0x40, which has no link
+ * registers at all, and S1's sixth run read the link's status out of it and called the link down. */
+static uint32_t
+kiwi_s1_capability(vm_offset_t dm_core)
+{
+	uint32_t at = rd(dm_core + 0x34) & 0xfc;
+
+	for (unsigned i = 0; i < 8 && at >= 0x40 && at <= 0xfc; i++) {
+		uint32_t word = rd(dm_core + at);
+
+		printf("wifi: s1:   capability at %#x: id %#x, next %#x\n", at, word & 0xff, (word >> 8) & 0xfc);
+		if ((word & 0xff) == 0x10) {
+			return at;
+		}
+		at = (word >> 8) & 0xfc;
+	}
+	return 0;
+}
+
+/*
+ * The link's state for a while: every change printed, the last state returned.
+ *
+ * The state is taken from PARF_LTSSM bits 5:0, NOT from the ELBI. On this generation (the 1.9.0 ops
+ * that sm8550/sm8650 bind) the ELBI's status register is not wired to the state machine at all -- it
+ * reads 0x1 here, so its "state" field is always 0 -- which is why every earlier run reported
+ * detect.quiet whatever the link was doing. Linux reads PARF_LTSSM for this SoC for the same reason.
+ * The ELBI is sampled once, so that the log shows what it is worth.
+ */
+static uint32_t
+kiwi_s1_watch(vm_offset_t elbi, uint32_t ms)
+{
+	vm_offset_t parf = corvette_s1_io_map(CORVETTE_PCIE0_PARF, CORVETTE_PCIE0_PARF_SIZE);
+	static bool told;
+	uint32_t elbi_status = rd(elbi + CORVETTE_ELBI_SYS_STTS_OFFSET);
+	uint32_t state = 0xffffffff, last = 0xffffffff, milliseconds;
+
+	if (!told) {
+		told = true;
+		printf("wifi: s1:   elbi +0x08 reads %#x (its state field %#x): on this generation the state is "
+		    "not there, it is in parf +0x1b0 bits 5:0, which is what is watched from here on\n",
+		    elbi_status, (elbi_status >> 12) & 0x3f);
+	}
+	for (milliseconds = 0; milliseconds < ms; milliseconds++) {
+		state = rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f;
+		if (state != last) {
+			printf("wifi: s1:   ltssm %#x %s, %u ms in\n", state,
+			    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)", milliseconds);
+			last = state;
+		}
+		if (state == 0x11) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	return state;
+}
+
+/*
+ * 5l/7: the radio's own supplies.
+ *
+ * The supplies come first, so that nothing behind the link can be blamed for a link that does not
+ * train. (The "it keeps falling back to detect.quiet" that sent earlier runs down this road was a
+ * misreading of the ELBI -- see kiwi_s1_watch -- so what the link actually does is not known yet.)
+ *
+ * This board feeds the radio from seven regulators of the PMICs, named by qcom,cnss-kiwi in its
+ * vdd-wlan*-supply properties, and nothing outside the vendor's own WLAN driver ever switches them on.
+ * Each is one command: a regulator's enable register sits four bytes into its RPMh address, so the
+ * request is a single write of 1 -- the shape the touch panel's own supply takes, and the only shape
+ * this controller was seen to accept (three commands at once took the device down once already).
+ *
+ * The names below are the resources of the command database; they come from the qcom,resource-name of
+ * the regulator node each supply points at, not from the node's own name.
+ */
+#define CORVETTE_VRM_VOLTAGE    0               /* a regulator's registers, from its RPMh address */
+#define CORVETTE_VRM_ENABLE     (1 * 4)
+#define CORVETTE_VRM_MODE       (2 * 4)
+#define CORVETTE_MSGID_WRITE_4  0x10008u        /* four bytes, no answer wanted, a write */
+#define CORVETTE_MSGID_READ_4   0x00108u        /* ... and a read, whose answer is the whole point */
+#define CORVETTE_MSGID_RESPONSE 0x100u
+
+#define CORVETTE_PIN_BT_EN      17              /* dt: qcom,bt-en-gpio */
+#define CORVETTE_PIN_SW_CTRL    18              /* dt: qcom,sw-ctrl-gpio: the radio drives it when it is up */
+
+struct kiwi_rail {
+	const char *supply;                             /* what qcom,cnss-kiwi calls it */
+	const char *resource;                           /* its name in the command database */
+	uint32_t microvolts;                            /* what the device tree asks for, for the log only */
+	uint32_t mode;                                  /* the hpm mode its node initialises it to, or 0 */
+};
+
+/*
+ * All seven are voted HPM -- pmic_mode 7 -- between the voltage and the enable. Only ldob15 and ldoc3
+ * name a mode in this board's device tree (qcom,init-mode = <4>), but the working OnePlus 13 loader
+ * (ios-dodge, op13_wifi_link_probe) votes mode 7 on every WLAN rail, LDOs and SMPS alike, and then
+ * reads the endpoint's own config space back, so the whole rail set is voted here the same way. A rail
+ * still sitting in the PMIC's own low-power mode is the one platform-level difference that air163 did
+ * not rule out; the readback below says whether each vote took.
+ */
+static const struct kiwi_rail kiwi_rails[] = {
+	{ "vdd-wlan-io", "ldob15", 1800000, 7 },
+	{ "vdd-wlan-io12", "ldoc3", 1200000, 7 },
+	{ "vdd-wlan", "smpi4", 940000, 7 },
+	{ "vdd-wlan-aon", "smpc2", 976000, 7 },
+	{ "vdd-wlan-dig", "smpc3", 915000, 7 },
+	{ "vdd-wlan-rfa1", "smpc6", 1864000, 7 },
+	{ "vdd-wlan-rfa2", "smpc1", 1316000, 7 },
+};
+
+/*
+ * One command in one slot set, and whether the controller finished it. A write is fire and forget, the
+ * way Linux sends them; a read asks for an answer and it lands in the command's own response word. The
+ * done bit belongs to the whole controller -- one per slot set -- so it is read at the base of the slot
+ * area, without the per-set stride.
+ */
+static bool
+kiwi_s1_command(vm_offset_t base, uint32_t tcs, uint32_t address, uint32_t msgid, uint32_t data,
+    bool wants_answer, uint32_t *answer)
+{
+	const struct kiwi_tcs *t = kiwi_s1_tcs_layout(base);
+	vm_offset_t at = base + 0xd00 + 672 * tcs, irq = base + 0xd00;
+	uint32_t irq_enable, polls;
+
+	irq_enable = rd(irq);
+	wr(irq + 0x08, 1u << tcs);
+	wr(at + t->control, 0);
+	wr(at + t->enable, 0);
+	for (polls = 0; polls < 500; polls++) {          /* (the set is asked to be idle before it is written) */
+		if (rd(at + t->status) != 0) {
+			break;
+		}
+		sleep_us(100);
+	}
+	wr(at + t->msgid, msgid);
+	wr(at + t->addr, address);
+	wr(at + t->data, data);
+	wr(at + t->wait, wants_answer ? 1 : 0);
+	wr(irq, irq_enable | (1u << tcs));
+	wr(at + t->enable, 1);
+	sleep_us(10);
+	wr(at + t->control, CORVETTE_TCS_ACTIVE | CORVETTE_TCS_TRIGGER);
+
+	for (polls = 0; polls < 2000; polls++) {
+		if (rd(irq + 0x04) & (1u << tcs)) {
+			break;
+		}
+		sleep_us(50);
+	}
+	if (answer != NULL) {
+		*answer = rd(at + t->resp);
+	}
+	wr(irq + 0x08, 1u << tcs);
+	wr(at + t->control, 0);
+	wr(at + t->enable, 0);
+	wr(irq, irq_enable);
+	return polls < 2000;
+}
+
+/*
+ * The seven supplies, one at a time, each read first -- so that the log says what the boot loader left
+ * and what the command changed -- and then the chip is given its own power-on edge: wlan-en was raised
+ * in 4/7, before any of these rails existed, and a chip that never saw its enable rise after its
+ * supplies came up has not been through a power-on reset.
+ */
+static void
+kiwi_s1_radio(vm_offset_t parf, vm_offset_t tlmm)
+{
+	vm_offset_t base = corvette_s1_io_map(CORVETTE_RSC_PHYS, 0x10000);
+	const unsigned count = sizeof(kiwi_rails) / sizeof(kiwi_rails[0]);
+	unsigned found = 0, on = 0;
+	uint32_t wlan_en = 0x1000UL * CORVETTE_PIN_WLAN_EN;
+	uint32_t sw_ctrl = 0x1000UL * CORVETTE_PIN_SW_CTRL;
+	uint32_t bt_en = 0x1000UL * CORVETTE_PIN_BT_EN;
+
+	printf("wifi: s1: 5l/7: the radio's %u supplies, one command each (dt: qcom,cnss-kiwi)\n", count);
+	printf("wifi: s1:   before: pin 16 wlan-en %#x, pin 18 sw-ctrl %#x, pin 17 bt-en %#x\n", rd(tlmm + wlan_en + 4),
+	    rd(tlmm + sw_ctrl + 4), rd(tlmm + bt_en + 4));
+	if (!cmd_db_there()) {
+		printf("wifi: s1:   the list of RPMh resources is not there: the radio stays unpowered\n");
+		return;
+	}
+	for (unsigned r = 0; r < count; r++) {
+		const struct kiwi_rail *rail = &kiwi_rails[r];
+		const struct cmd_db_entry *entry = rpmh_resource(rail->resource, 0);
+		uint32_t address = entry == NULL ? 0 : entry->address;
+		uint32_t wanted = rail->microvolts / 1000, millivolts = 0, enable = 0;
+
+		/* (regulators carry 4 in bits 19:16 of their address; anything else is not one) */
+		if (address == 0 || ((address >> 16) & 0xf) != 4) {
+			printf("wifi: s1:   %s: no regulator called \"%s\" in the list (%#x): left alone\n", rail->supply,
+			    rail->resource, address);
+			continue;
+		}
+		found++;
+		kiwi_s1_command(base, 0, address + CORVETTE_VRM_VOLTAGE, CORVETTE_MSGID_READ_4 | CORVETTE_MSGID_RESPONSE,
+		    0, true, &millivolts);
+		kiwi_s1_command(base, 0, address + CORVETTE_VRM_ENABLE, CORVETTE_MSGID_READ_4 | CORVETTE_MSGID_RESPONSE,
+		    0, true, &enable);
+		printf("wifi: s1:   %s (%s) at %#x: reads %u mV, enable %u (dt asks %u mV)\n", rail->supply,
+		    rail->resource, address, millivolts, enable, wanted);
+		/*
+		 * The read back is not to be believed: these VRM resources answer with whatever happened to
+		 * sit in the response word, so one rail read "enable 2147483649" and was skipped on that
+		 * account while still being off. The voltage and the enable are therefore written
+		 * unconditionally, one command at a time -- the controller takes one per request, and three
+		 * at once once took the whole device down.
+		 */
+		if (kiwi_s1_command(base, 0, address + CORVETTE_VRM_VOLTAGE, CORVETTE_MSGID_WRITE_4, wanted, false,
+		    NULL)) {
+			printf("wifi: s1:   %s: voltage written %u mV\n", rail->supply, wanted);
+		} else {
+			printf("wifi: s1:   %s: the controller did not finish the voltage command\n", rail->supply);
+		}
+		sleep_ms(1);
+		if (rail->mode != 0) {
+			/* (mode first: the vendor reorders its requests for exactly this reason) */
+			if (kiwi_s1_command(base, 0, address + CORVETTE_VRM_MODE, CORVETTE_MSGID_WRITE_4,
+			    rail->mode, false, NULL)) {
+				printf("wifi: s1:   %s: mode %u (hpm) written\n", rail->supply, rail->mode);
+			} else {
+				printf("wifi: s1:   %s: the controller did not finish the mode command\n",
+				    rail->supply);
+			}
+			sleep_ms(1);
+		}
+		if (kiwi_s1_command(base, 0, address + CORVETTE_VRM_ENABLE, CORVETTE_MSGID_WRITE_4, 1, false, NULL)) {
+			printf("wifi: s1:   %s: enabled\n", rail->supply);
+			on++;
+		} else {
+			printf("wifi: s1:   %s: the controller did not finish the enable command\n", rail->supply);
+		}
+		sleep_ms(2);
+	}
+	/*
+	 * What the rails answer once the commands have gone through. Bit 31 of a response word is the
+	 * controller's own flag and not part of the value, so it is masked off here. A rail that still reads
+	 * back disabled, or at another voltage, is the only evidence available that the commands reached
+	 * the hardware at all -- and it is the one question the host side of the link cannot answer.
+	 */
+	for (unsigned r = 0; r < count; r++) {
+		const struct kiwi_rail *rail = &kiwi_rails[r];
+		const struct cmd_db_entry *entry = rpmh_resource(rail->resource, 0);
+		uint32_t address = entry == NULL ? 0 : entry->address;
+		uint32_t millivolts = 0, mode = 0, enable = 0;
+
+		if (address == 0 || ((address >> 16) & 0xf) != 4) {
+			continue;
+		}
+		kiwi_s1_command(base, 0, address + CORVETTE_VRM_VOLTAGE,
+		    CORVETTE_MSGID_READ_4 | CORVETTE_MSGID_RESPONSE, 0, true, &millivolts);
+		kiwi_s1_command(base, 0, address + CORVETTE_VRM_MODE,
+		    CORVETTE_MSGID_READ_4 | CORVETTE_MSGID_RESPONSE, 0, true, &mode);
+		kiwi_s1_command(base, 0, address + CORVETTE_VRM_ENABLE,
+		    CORVETTE_MSGID_READ_4 | CORVETTE_MSGID_RESPONSE, 0, true, &enable);
+		printf("wifi: s1:   %s reads back %u mV (%#x), mode %u, enable %u\n", rail->supply,
+		    millivolts & 0x7fffffff, millivolts, mode & 0x7fffffff, enable & 0x7fffffff);
+	}
+	printf("wifi: s1:   5l/7: %u of %u supplies are on (%u of them were found in the list)\n", on, count, found);
+	printf("wifi: s1:   after: pin 18 sw-ctrl %#x (the radio drives it when it is up)\n", rd(tlmm + sw_ctrl + 4));
+
+	kiwi_s1_write("pin 16 wlan-en io: low", 0, tlmm + wlan_en + 4, 0);
+	/* air198: hold the enable low 150 ms instead of 10, so the module goes through a real power-on
+	 * edge whatever the bootloader left running. The vendor's cnss2 timing is not in the sources
+	 * here; 150 ms is the low the working UniXNU board (WifiProbe.cpp) uses for exactly this reason. */
+	sleep_ms(150);
+	kiwi_s1_write("pin 16 wlan-en io: high", 0, tlmm + wlan_en + 4, 2);
+	/* (time for the chip to see its supplies and its enable before its reset is let go) */
+	/*
+	 * Air191: one and a half seconds instead of a hundred milliseconds.
+	 *
+	 * The vendor's PCIe driver never powers the wifi rails: in pci-msm.c msm_pcie_vreg_init() only
+	 * takes the supplies listed on the pcie node, while the seven vdd-wlan-* rails belong to the
+	 * cnss-kiwi node and are handled by a different driver.  On the phone those rails are therefore
+	 * already up long before the link is trained -- from the bootloader and from cnss2 -- and the
+	 * module's own PMU has had seconds to boot.  Here they are switched on a few hundred milliseconds
+	 * before perst is released, which is the one timing difference the register dumps cannot show.
+	 */
+	sleep_ms(1500);
+	printf("wifi: s1:   pin 16 io now %#x; pin 18 sw-ctrl %#x\n", rd(tlmm + wlan_en + 4), rd(tlmm + sw_ctrl + 4));
+	/*
+	 * Air193: the air189 control-line probe is gone.  It answered its question (the radio follows
+	 * wlan-en and drives clkreq), and lowering the radio's enable 50 ms before the PHY sequence is
+	 * something the vendor driver never does.  From here the flow is vendor-only.
+	 */
+}
+
+/*
+ * 5h/7: the rest of what the vendor's msm_pcie_enable_link() and msm_pcie_link_train() write, and
+ * nothing that S1 had touched so far.
+ *
+ * Reading drivers/pci/controller/pci-msm.c of the vendor's own kernel (the oneplus/sm8650_b_16.0.0_ace_3_pro
+ * branch) side by side with S1's steps shows four writes that the vendor does and S1 never did:
+ *
+ *  - PARF 0x2c4 (CFG_BITS_3) bit 0. The vendor's comment says what it is: "Disable override for fal10_veto
+ *    logic to de-assert Qactive signal". Qactive is the signal that tells the far end the link is wanted;
+ *    while the veto logic holds it, the endpoint never leaves its own reset and never answers a receiver
+ *    detection. Bit 8 of the same register goes with it, and the DWC's LANE_SKEW_OFF (0x714 bit 5) goes
+ *    with that: they are the three that have to be in place before the link is trained.
+ *  - the DWC's PCIE_GEN3_GEN2_CTRL (0x80c) bits 12 to 16, which the vendor sets right before it enables
+ *    link training.
+ *  - the DWC's AUX_CLK_FREQ (0xb40), which the vendor fills from the device tree's qcom,aux-clk-freq
+ *    (0x14 here, so twenty megahertz) and which the L1SS timeout arithmetic is done in.
+ *  - PARF 0x22c (INT_ALL_MASK), which the vendor clears so that the link's own events are not masked.
+ */
+#define CORVETTE_PARF_CFG_BITS_3        0x2c4           /* bit 0: the Qactive veto; bit 8: with it */
+#define CORVETTE_PARF_INT_ALL_MASK      0x22c
+#define CORVETTE_CORE_LANE_SKEW_OFF     0x714
+#define CORVETTE_CORE_GEN3_GEN2_CTRL    0x80c
+#define CORVETTE_CORE_DEVICE_CTRL_STATUS 0x78           /* bits 14:12 = max read request size */
+#define CORVETTE_CORE_AUX_CLK_FREQ      0xb40
+#define CORVETTE_AUX_CLK_FREQ_MHZ       20              /* dt: qcom,aux-clk-freq = <0x14> */
+
+static void
+kiwi_s1_vendor_extras(vm_offset_t parf, vm_offset_t core)
+{
+	uint32_t value;
+
+	printf("wifi: s1: 5h/7: the vendor's own writes, none of which S1 had done\n");
+	/*
+	 * Air186: the three PARF writes of msm_pcie_enable_link() that S1 still had not made, and that no
+	 * earlier log had even read. They come before everything else the vendor does, and two of them are
+	 * read-modify-writes whose result is only correct if the bits around them are kept.
+	 *
+	 *  0x40  bit 0 cleared -- the vendor's comment is "enable PCIe clocks and resets";
+	 *  0x174 bit 4 set     -- msm_pcie_write_mask(parf + MHI_CLOCK_RESET_CTRL, 0, BIT(4)), a set, not a
+	 *                         clear: the mask argument is 0 and the value is BIT(4);
+	 *  0x1a8 bit 31 set    -- PCIE20_PARF_AXI_MSTR_WR_ADDR_HALT, BIT(31) | the boot value. (0x4d0 is a
+	 *                         different register entirely: PCIE20_PARF_L1SS_SLEEP_MODE_HANDLER_STATUS.)
+	 */
+	value = rd(parf + 0x40);
+	printf("wifi: s1:   parf phy ctrl        +0x40: %#x (bit 0 %u)\n", value, value & 1);
+	kiwi_s1_write("parf phy ctrl: bit 0 off", 0x40, parf + 0x40, value & ~1u);
+	value = rd(parf + 0x174);
+	printf("wifi: s1:   mhi clock reset ctrl +0x174: %#x (bit 4 %u)\n", value, (value >> 4) & 1);
+	kiwi_s1_write("mhi clock reset ctrl: bit 4 on", 0x174, parf + 0x174, value | (1u << 4));
+	value = rd(parf + 0x1a8);
+	printf("wifi: s1:   axi write halt       +0x1a8: %#x\n", value);
+	kiwi_s1_write("axi write halt: bit 31 on", 0x1a8, parf + 0x1a8, value | (1u << 31));
+	value = rd(parf + CORVETTE_PARF_CFG_BITS_3);
+	printf("wifi: s1:   parf cfg bits 3      +0x2c4: %#x (qactive veto %u, bit 8 %u)\n", value, value & 1,
+	    (value >> 8) & 1);
+	kiwi_s1_write("parf cfg bits 3: the qactive veto off", CORVETTE_PARF_CFG_BITS_3,
+	    parf + CORVETTE_PARF_CFG_BITS_3, value & ~1u);
+	kiwi_s1_write("parf cfg bits 3: bit 8", CORVETTE_PARF_CFG_BITS_3,
+	    parf + CORVETTE_PARF_CFG_BITS_3, rd(parf + CORVETTE_PARF_CFG_BITS_3) | (1u << 8));
+
+	value = rd(core + CORVETTE_CORE_LANE_SKEW_OFF);
+	printf("wifi: s1:   lane skew off        +0x714: %#x (bit 5 %u)\n", value, (value >> 5) & 1);
+	kiwi_s1_write("lane skew off: on", CORVETTE_CORE_LANE_SKEW_OFF, core + CORVETTE_CORE_LANE_SKEW_OFF,
+	    value | (1u << 5));
+
+	/*
+	 * link_train()'s first write is write_reg_field(dm_core, 0x80c, 0x1f00, 1): the field at bits 12:8 is
+	 * cleared and then set to 1. S1 ORed 0x1f00 in instead, which leaves that field at 0x1f -- a value no
+	 * vendor path ever produces on this part. With the bootloader's 0x130290 this lands on 0x130190, which
+	 * is exactly what the vendor's own read-modify-write produces.
+	 */
+	value = rd(core + CORVETTE_CORE_GEN3_GEN2_CTRL);
+	printf("wifi: s1:   gen3/gen2 control    +0x80c: %#x (bits 12:16 %u)\n", value, (value >> 12) & 0x1f);
+	kiwi_s1_write("gen3/gen2 control: field 0x1f00 to 1", CORVETTE_CORE_GEN3_GEN2_CTRL,
+	    core + CORVETTE_CORE_GEN3_GEN2_CTRL, (value & ~0x1f00u) | 0x100u);
+
+	/* the max read request size, 2 KB, which the vendor's link_train writes after the gen3/gen2 word */
+	value = rd(core + CORVETTE_DBI_MISC_CONTROL_1);
+	kiwi_s1_write("misc control 1: ro on", CORVETTE_DBI_MISC_CONTROL_1, core + CORVETTE_DBI_MISC_CONTROL_1,
+	    value | 1);
+	value = rd(core + CORVETTE_CORE_DEVICE_CTRL_STATUS);
+	/*
+	 * link_train() writes dev->tlp_rd_size into this field, and pcie0's node has no qcom,tlp-rd-size, so
+	 * the vendor writes zero -- 128-byte reads, the reset value. S1 wrote 5, which is not even a legal
+	 * Max_Read_Request_Size encoding (1 is 256 B, 2, 3, 4 is 2 KB; 5 is reserved), so this now writes zero
+	 * as the vendor does.
+	 */
+	printf("wifi: s1:   device ctrl/status    +0x78: %#x (max read req size %u)\n", value, (value >> 12) & 7);
+	kiwi_s1_write("device ctrl/status: max read request size 0", CORVETTE_CORE_DEVICE_CTRL_STATUS,
+	    core + CORVETTE_CORE_DEVICE_CTRL_STATUS, value & ~0x7000u);
+
+	printf("wifi: s1:   aux clock frequency  +0xb40: %#x\n", rd(core + CORVETTE_CORE_AUX_CLK_FREQ));
+	kiwi_s1_write("aux clock frequency", CORVETTE_CORE_AUX_CLK_FREQ, core + CORVETTE_CORE_AUX_CLK_FREQ,
+	    CORVETTE_AUX_CLK_FREQ_MHZ);
+
+	printf("wifi: s1:   interrupt mask       +0x22c: %#x\n", rd(parf + CORVETTE_PARF_INT_ALL_MASK));
+	kiwi_s1_write("interrupt mask: nothing masked", CORVETTE_PARF_INT_ALL_MASK,
+	    parf + CORVETTE_PARF_INT_ALL_MASK, 0);
+	/*
+	 * Air191: the mask word a stock RC0 reads at L0 is 0x7f80d202 -- msm_pcie_enable_link() clears
+	 * the register and then sets only the events it serves.  Writing the observed word back makes
+	 * this port's interrupt state identical to the phone's.  It has no effect on training; it is
+	 * included because it was the only PARF difference left in the air188 diff.
+	 */
+	kiwi_s1_write("interrupt mask: the vendor's own bits", CORVETTE_PARF_INT_ALL_MASK,
+	    parf + CORVETTE_PARF_INT_ALL_MASK, 0x7f80d202u);
+}
+
+/*
+ * The vendor's own failure dump. msm_pcie.c prints three register lists taken from the device tree when the
+ * PHY or the link will not come up -- qcom,parf-debug-reg, qcom,dbi-debug-reg and qcom,phy-debug-reg, read by
+ * pcie_parf_dump(), pcie_dbi_dump() and pcie_phy_dump(). Printing the same lists here means this snapshot can
+ * be compared register for register against a vendor dump taken from Android on the same part, which is the
+ * only oracle left: every write this step makes is already the vendor's write.
+ *
+ * The order is the device tree's, with one change: the PHY's SerDes and PLL windows (0xed0, 0x16d0, 0x11e0,
+ * 0x19e0) are read last. Those are the only reads here that can fault on a PHY that is not powered, and by the
+ * time they are reached everything worth having has already been printed.
+ */
+static void
+kiwi_s1_vendor_dump(vm_offset_t parf, vm_offset_t core)
+{
+	static const uint32_t parf_regs[] = {
+		0x1b0, 0x24, 0x28, 0x224, 0x500, 0x4d0, 0x4d4, 0x3c0, 0x630, 0x230, 0x00,
+		/* Air188: the rest of the range a stock RC0 keeps at L0, so the two dumps can be diffed
+		 * offset by offset.  PARF is always on, so these reads are the same ones pcie_parf_dump()
+		 * makes and cannot reach a powered-down page. */
+		0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x2c, 0x30, 0x34, 0x38,
+		0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c,
+		0x1a4, 0x1a8, 0x1ac, 0x1b4, 0x1b8, 0x1bc, 0x1c0,
+		0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x220,
+		0x228, 0x22c, 0x234, 0x238, 0x23c,
+		0x2b0, 0x2b4, 0x2b8, 0x2bc, 0x2c0, 0x2c4, 0x2c8, 0x2cc,
+		0x2d0, 0x2d4, 0x2d8, 0x2dc, 0x2e0, 0x2e4, 0x2e8, 0x2ec
+	};
+	static const uint32_t dbi_regs[] = {
+		0x104, 0x110, 0x80, 0x1f4, 0x730, 0x734, 0x738, 0x73c
+	};
+	static const uint32_t phy_regs[] = {
+		0x214, 0x218, 0x21c, 0x220, 0x224, 0x228, 0x22c, 0x230, 0x234, 0x238, 0x23c,
+		0x1cc, 0x1d0, 0x1d4, 0x1d8, 0x1dc, 0x1e0, 0x1e4, 0x1f8,
+		0x600, 0x604,
+		0xa00, 0x1200, 0xa04, 0x1204, 0xa08, 0x1208, 0xa0c, 0x120c,
+		0xa10, 0x1210, 0xa14, 0x1214, 0xa18, 0x1218, 0xc20, 0x1420,
+		0xed0, 0x16d0, 0xedc, 0x16dc, 0x11e0, 0x19e0
+	};
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+
+	printf("wifi: s1:   dump: the vendor's parf / dbi / phy debug lists, as pcie_parf_dump() reads them\n");
+	for (uint32_t i = 0; i < sizeof(parf_regs) / sizeof(parf_regs[0]); i++) {
+		printf("wifi: s1:     parf +%#05x %#x\n", parf_regs[i], rd(parf + parf_regs[i]));
+	}
+	for (uint32_t i = 0; i < sizeof(dbi_regs) / sizeof(dbi_regs[0]); i++) {
+		printf("wifi: s1:     dbi  +%#05x %#x\n", dbi_regs[i], rd(core + dbi_regs[i]));
+	}
+	for (uint32_t i = 0; i < sizeof(phy_regs) / sizeof(phy_regs[0]); i++) {
+		printf("wifi: s1:     phy  +%#05x %#x\n", phy_regs[i], rd(phy + phy_regs[i]));
+	}
+}
+
+/* 6/7: the reference clock, the capability the link reports itself through, then training. */
+/*
+ * The PMIC, through the v7 observer.  See the top of this block for why the
+ * version 5 reader above cannot be used here.  Reads only: an APID's write
+ * channel is at chnls + 0x1000 * apid, and spmi-pmic-arb.c only uses one when
+ * the APID's owner (chnls + 0x104 + 0x1000 * apid) is this EE -- that table is
+ * in the region this environment cannot access, and a write there took a
+ * synchronous external abort in the loader.
+ */
+#define CORVETTE_ARB_CORE_PHYS  0x0c400000
+#define CORVETTE_ARB_CORE_SIZE  0x3000
+#define CORVETTE_ARB_OBS_PHYS   0x0c440000
+#define CORVETTE_ARB_OBS_SIZE   0x80000
+
+static int
+corvette_pmic_read(vm_offset_t obs, uint32_t apid, uint8_t reg, uint8_t *out)
+{
+	vm_offset_t channel = obs + 0x20 * (vm_offset_t)apid;   /* (ee 0: the dt's qcom,ee) */
+	uint32_t status = 0;
+	unsigned spin;
+
+	wr(channel + 0x00, (1u << 27) | ((uint32_t)reg << 4));
+	for (spin = 0; spin < 5000; spin++) {
+		status = rd(channel + 0x08);
+		if (status & 0x1u) {
+			break;
+		}
+	}
+	if (!(status & 0x1u) || (status & 0xeu)) {
+		return -1;
+	}
+	*out = (uint8_t)rd(channel + 0x18);
+	return 0;
+}
+
+/*
+ * Every regulator the arbiter's table names, printed as: ppid, kind, setpoint,
+ * enable, and whether the PMIC itself says it is in regulation.  The radio's
+ * rails are the SMPS of PM8550VS_C (s1c/s2c/s3c/s6c) and PM8550VS_I (s4i) plus
+ * PM8550's LDO15 (vdd-wlan-io) and the VS's LDO3 (vdd-wlan-io12).
+ */
+static void
+kiwi_s1_pmic(void)
+{
+	vm_offset_t core = corvette_s1_io_map(CORVETTE_ARB_CORE_PHYS, CORVETTE_ARB_CORE_SIZE);
+	vm_offset_t obs = corvette_s1_io_map(CORVETTE_ARB_OBS_PHYS, CORVETTE_ARB_OBS_SIZE);
+	uint32_t apids, n, answered = 0, regulators = 0, enabled = 0;
+
+	if (core == 0 || obs == 0) {
+		printf("wifi: s1: 6a/7: the arbiter's windows did not map; the supplies are not read\n");
+		return;
+	}
+	apids = rd(core + 0x04) & 0x7ff;
+	printf("wifi: s1: 6a/7: the pmic through the v7 observer (core %#x, obs %#x, %u apids)\n",
+	    CORVETTE_ARB_CORE_PHYS, CORVETTE_ARB_OBS_PHYS, apids);
+	if (apids == 0 || apids > 1024) {
+		printf("wifi: s1: 6a/7: the arbiter reports no usable apid table\n");
+		return;
+	}
+	for (n = 0; n < apids; n++) {
+		uint32_t map = rd(core + 0x2000 + 4 * n), ppid, mv;
+		uint8_t type = 0, status = 0, enable = 0, lo = 0, hi = 0;
+
+		if (map == 0) {
+			continue;
+		}
+		ppid = (map >> 8) & 0xfff;
+		if (corvette_pmic_read(obs, n, 0x04, &type) != 0) {
+			continue;
+		}
+		answered++;
+		if (type != 0x03 && type != 0x04) {
+			continue;
+		}
+		regulators++;
+		(void)corvette_pmic_read(obs, n, 0x08, &status);
+		(void)corvette_pmic_read(obs, n, 0x46, &enable);
+		(void)corvette_pmic_read(obs, n, 0x40, &lo);
+		(void)corvette_pmic_read(obs, n, 0x41, &hi);
+		mv = ((uint32_t)hi << 8) | lo;
+		if (enable & 0x80) {
+			enabled++;
+		}
+		printf("wifi: s1: 6a/7:   %#05x %s %2u: %u mV, enable %u, %s\n", ppid,
+		    type == 0x03 ? "smps" : "ldo",
+		    type == 0x03 ? ((ppid & 0xff) - 0x9b) / 3 + 1 : (ppid & 0xff) - 0x3f,
+		    mv, (enable >> 7) & 1, (status & 0x80) ? "in regulation" : "not in regulation");
+	}
+	/* air198: the sleep clock pin. The OEM DT (volcano-pmic-overlay.dtsi) puts alt_sleep_clk on
+	 * PMK8550 gpio5, func1, output-enable; the earlier probe read page 0xbb, which is another gpio
+	 * by every mapping in play. The peripheral base is not pinned down in the sources here, so all
+	 * four candidate pages are read: whichever is a GPIO (type 0x10) and what its mode/function say
+	 * is the sleep clock's actual state. Reads only -- the write channel aborts in this environment. */
+	{
+		static const uint32_t pages[] = { 0xba, 0xbb, 0xbc, 0xbd };
+		for (unsigned k = 0; k < 4; k++) {
+			int gapid = -1;
+			uint8_t gtype = 0xee, gsub = 0xee, mode2 = 0xee, mode1 = 0xee, pull = 0xee, func = 0xee, ena = 0xee;
+			for (uint32_t g = 0; g < apids; g++) {
+				uint32_t gmap = rd(core + 0x2000 + 4 * g);
+				if (gmap && ((gmap >> 8) & 0xfff) == pages[k]) {
+					gapid = (int)g;
+					break;
+				}
+			}
+			if (gapid < 0) {
+				printf("wifi: s1: 6a/7:   gpio page %#05x: not in the arbiter's table\n", pages[k]);
+				continue;
+			}
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x04, &gtype);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x05, &gsub);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x40, &mode2);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x41, &mode1);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x42, &pull);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x44, &func);
+			(void)corvette_pmic_read(obs, (uint32_t)gapid, 0x46, &ena);
+			printf("wifi: s1: 6a/7:   gpio page %#05x (apid %d): type %#x sub %#x, mode2 %#x mode1 %#x, "
+			    "pull %#x, func %#x, enable %#x\n", pages[k], gapid, gtype, gsub, mode2, mode1, pull,
+			    func, ena);
+		}
+	}
+	printf("wifi: s1: 6a/7: %u of %u answered, %u regulators, %u enabled\n", answered, apids,
+	    regulators, enabled);
+}
+
+	/*
+	 * air203: the mainline bring-up for this SoC and radio, as shennong_wlan.c (the Xiaomi 14 Pro
+	 * port -- the same SM8650 and WCN7850, booted the same way, Wi-Fi working) runs it, adapted to
+	 * this file's names. The vendor-specific layer is absent on purpose: no INT_ALL_MASK, no
+	 * PARF_SYS_CTRL 0x365E, no CESTA/CRM/pcie_sm/sm-seq, no 0x2b0 experiments. SLV 2 GiB, SYS_CTRL's
+	 * bit 29 only, PM_CTRL touched, the two RCGs programmed explicitly (0x001 / 0x605 -- the latter
+	 * is what the boot loader had left, minus its hardware-control bit), the pipe mux parked on the
+	 * crystal through the PHY's table writes and back on the PHY before the last two writes, PERST#
+	 * released at least 100 ms after the radio got power, and the link accepted by DBI debug1's
+	 * bit 4. Selected with pcie_mainline=1.
+	 */
+static bool
+kiwi_s1_mainline_port(vm_offset_t parf, vm_offset_t core, vm_offset_t tlmm, vm_offset_t gcc)
+{
+	uint32_t state, polls;
+	vm_offset_t tcsr = corvette_s1_io_map(CORVETTE_TCSR_PHYS, CORVETTE_TCSR_SIZE);
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+
+	printf("wifi: s1: 6m/7: the mainline bring-up, as shennong_wlan.c (the same SM8650 and WCN7850) runs it\n");
+
+	/* air205: the radio's own reference clock. shennong_wlan.c votes RPMH_RF_CLK1 ("clka1",
+	 * clk-rpmh.c sm8650) with VRM_ENABLE = 1 -- "the radio's 38.4 MHz" -- as the last of its
+	 * supplies, before any PCIe bring-up. The module asserts CLKREQ# asking for exactly this
+	 * clock (air200: pad low; air202: the gate never opened); without the vote its radio side
+	 * never runs and its PCIe PHY never presents a receiver. Our seven rails never included it:
+	 * it is a clock resource, not a regulator. */
+	{
+		vm_offset_t base = corvette_s1_io_map(CORVETTE_RSC_PHYS, 0x10000);
+		const struct cmd_db_entry *entry = rpmh_resource("clka1", 0);
+		uint32_t address = entry ? entry->address : 0;
+		printf("wifi: s1: 6m/7: clka1 (RPMH_RF_CLK1, the radio's 38.4 MHz) at %#x\n", address);
+		if (address == 0) {
+			printf("wifi: s1: 6m/7: clka1 is not in the command database: the clock is not voted\n");
+		} else if (kiwi_s1_command(base, 0, address + CORVETTE_VRM_ENABLE,
+		    CORVETTE_MSGID_WRITE_4, 1, false, NULL)) {
+			printf("wifi: s1: 6m/7: clka1 voted on\n");
+		} else {
+			printf("wifi: s1: 6m/7: clka1: RPMh did not take the vote\n");
+		}
+	}
+
+	/* shennong's step 3, after the two domains (2/7 has powered them): the mux parks on the
+	 * crystal, the two rcgs take their settings, the reference gate opens, then both blocks reset. */
+	kiwi_s1_write("6m pipe mux: the crystal", 0x6b070, gcc + 0x6b070,
+	    (rd(gcc + 0x6b070) & ~3u) | 2u);
+	kiwi_s1_write("6m aux rcg cfg", 0x6b078, gcc + 0x6b078,
+	    (rd(gcc + 0x6b078) & ~0x371fu) | 0x001u);
+	kiwi_s1_write("6m rchng rcg cfg", 0x6b05c, gcc + 0x6b05c,
+	    (rd(gcc + 0x6b05c) & ~0x371fu) | 0x605u);
+	kiwi_s1_write("6m aux rcg update", 0x6b074, gcc + 0x6b074,
+	    rd(gcc + 0x6b074) | 1u);
+	kiwi_s1_write("6m rchng rcg update", 0x6b058, gcc + 0x6b058,
+	    rd(gcc + 0x6b058) | 1u);
+	for (polls = 0; polls < 2000 && (rd(gcc + 0x6b074) & 1u); polls++) {
+		sleep_us(10);
+	}
+	for (polls = 0; polls < 2000 && (rd(gcc + 0x6b058) & 1u); polls++) {
+		sleep_us(10);
+	}
+	kiwi_s1_write("6m tcsr clkref: open", 0xb1100, tcsr + 0xb1100, rd(tcsr + 0xb1100) | 1u);
+	sleep_us(100);
+	kiwi_s1_write("6m bcr core: pulse", CORVETTE_PCIE0_BCR, gcc + CORVETTE_PCIE0_BCR, 1u);
+	sleep_us(1000);
+	kiwi_s1_write("6m bcr core: out", CORVETTE_PCIE0_BCR, gcc + CORVETTE_PCIE0_BCR, 0u);
+	sleep_us(1000);
+	kiwi_s1_write("6m bcr phy: pulse", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 1u);
+	sleep_us(1000);
+	kiwi_s1_write("6m bcr phy: out", CORVETTE_PCIE0_PHY_BCR, gcc + CORVETTE_PCIE0_PHY_BCR, 0u);
+	sleep_us(1000);
+
+	/* shennong's step 4, first half: the controller to root complex with the mainline register
+	 * set. PERST# is already held low, and CLKREQ#/WAKE# carry their pcie0 functions (4/7). */
+	kiwi_s1_write("6m device type: RC", 0x1000, parf + 0x1000, 4u);
+	kiwi_s1_write("6m phy ctrl: bit 0 off", 0x40, parf + 0x40, rd(parf + 0x40) & ~1u);
+	kiwi_s1_write("6m dbi base", 0x350, parf + 0x350, CORVETTE_PCIE0_CORE);
+	kiwi_s1_write("6m dbi base hi", 0x354, parf + 0x354, 0);
+	kiwi_s1_write("6m atu base", 0x634, parf + 0x634, CORVETTE_PCIE0_CORE + 0x1000);
+	kiwi_s1_write("6m atu base hi", 0x638, parf + 0x638, 0);
+	kiwi_s1_write("6m slv size: 2 GiB", 0x358, parf + 0x358, 0);
+	kiwi_s1_write("6m slv size hi", 0x35c, parf + 0x35c, 0x80000000u);
+	kiwi_s1_write("6m sys ctrl: bit 29 off", 0x00, parf + 0x00, rd(parf + 0x00) & ~(1u << 29));
+	kiwi_s1_write("6m mhi clock/reset: bit 4", 0x174, parf + 0x174, rd(parf + 0x174) | (1u << 4));
+	kiwi_s1_write("6m pm ctrl: bit 5 off", 0x20, parf + 0x20, rd(parf + 0x20) & ~(1u << 5));
+	kiwi_s1_write("6m axi halt: bit 31", 0x1a8, parf + 0x1a8, rd(parf + 0x1a8) | (1u << 31));
+
+	/* the phy's sequence, every write but the last two; then the pipe clock back to the phy, and
+	 * only then the last two (out of reset, started). The pipe branch was voted in 1/7. */
+	printf("wifi: s1: 6m/7: the phy's %u writes without its last two\n", KIWI_PHY_SEQUENCE_WRITES - 2);
+	for (uint32_t i = 0; i + 2 < KIWI_PHY_SEQUENCE_WRITES; i++) {
+		wr(parf + CORVETTE_PCIE0_PHY_AT + kiwi_phy_sequence[3 * i],
+		    kiwi_phy_sequence[3 * i + 1]);
+	}
+	kiwi_s1_write("6m pipe mux: the phy's", 0x6b070, gcc + 0x6b070,
+	    rd(gcc + 0x6b070) & ~3u);
+	for (uint32_t i = KIWI_PHY_SEQUENCE_WRITES - 2; i < KIWI_PHY_SEQUENCE_WRITES; i++) {
+		wr(parf + CORVETTE_PCIE0_PHY_AT + kiwi_phy_sequence[3 * i],
+		    kiwi_phy_sequence[3 * i + 1]);
+	}
+	for (polls = 0; polls < 2000 && (rd(phy + CORVETTE_PHY_STATUS_OFFSET) & (1u << 6)); polls++) {
+		sleep_us(10);
+	}
+	state = rd(phy + CORVETTE_PHY_STATUS_OFFSET);
+	printf("wifi: s1: 6m/7: the phy %s after %u x 10 us (0x214 %#x); pipe cbcr %#x; serdes locks "
+	    "0xa00 %#x, 0x1200 %#x\n", (state & (1u << 6)) ? "NOT ready" : "ready", polls, state,
+	    rd(gcc + 0x6b048), rd(phy + 0xa00), rd(phy + 0x1200));
+	if (state & (1u << 6)) {
+		return false;
+	}
+
+	/* the root port: buses 0/1/1, memory and bus mastering */
+	kiwi_s1_write("6m buses 0/1/1", 0x18, core + 0x18, 0x00010100u);
+	kiwi_s1_write("6m command: mem + master", 0x04, core + 0x04, rd(core + 0x04) | 0x6u);
+
+	/* PERST# release: the radio has had power for seconds (4/7 raised wlan-en), so the CEM's
+	 * 100 ms are long past. */
+	state = rd(tlmm + 0x1000UL * CORVETTE_PIN_PERST + 4);
+	kiwi_s1_write("6m perst: released", 0, tlmm + 0x1000UL * CORVETTE_PIN_PERST + 4, state | 2u);
+	sleep_us(1000);
+	kiwi_s1_write("6m ltssm: enable", CORVETTE_PARF_LTSSM_OFFSET, parf + CORVETTE_PARF_LTSSM_OFFSET,
+	    rd(parf + CORVETTE_PARF_LTSSM_OFFSET) | (1u << 8));
+	for (polls = 0; polls < 100; polls++) {
+		sleep_ms(50);
+		if ((rd(core + 0x72c) & ((1u << 4) | (1u << 29))) == (1u << 4)) {
+			break;
+		}
+		if (polls % 10 == 9) {
+			printf("wifi: s1: 6m/7:   +%u ms: debug0 %#x, debug1 %#x, serdes 0xa00 %#x, "
+			    "0x1200 %#x, pipe cbcr %#x\n", 50 * (polls + 1), rd(core + 0x728),
+			    rd(core + 0x72c), rd(phy + 0xa00), rd(phy + 0x1200), rd(gcc + 0x6b048));
+		}
+	}
+	printf("wifi: s1: 6m/7: the link %s after %u x 50 ms (debug0 %#x, debug1 %#x)\n",
+	    polls < 100 ? "up" : "NOT up after five seconds", polls, rd(core + 0x728),
+	    rd(core + 0x72c));
+	if (polls >= 100) {
+		printf("wifi: s1: 6m/7: at fail: serdes locks 0xa00 %#x, 0x1200 %#x; pipe cbcr %#x\n",
+		    rd(phy + 0xa00), rd(phy + 0x1200), rd(gcc + 0x6b048));
+		/* air204: the air188 control -- the mux to the crystal for a moment, to tell a state
+		 * machine frozen for the lack of the phy's pipe clock from one held for another reason;
+		 * then back to the phy's clock. */
+		kiwi_s1_write("6m air204 mux: the crystal", 0x6b070, gcc + 0x6b070,
+		    (rd(gcc + 0x6b070) & ~3u) | 2u);
+		sleep_ms(200);
+		printf("wifi: s1: 6m/7:   mux=2 control: ltssm %#x, serdes 0xa00 %#x, 0x1200 %#x\n",
+		    rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f, rd(phy + 0xa00), rd(phy + 0x1200));
+		kiwi_s1_write("6m air204 mux: the phy's", 0x6b070, gcc + 0x6b070,
+		    rd(gcc + 0x6b070) & ~3u);
+		return false;
+	}
+	sleep_ms(100);
+
+	/* air207: shennong's last line of step 4 -- the outbound iATU region 0 turns the conf
+	 * window into type-0 config requests for bus 1 device 0. Without it the conf window answers
+	 * 0xff (air206's reads sat at L0 and still saw nothing). */
+	{
+		vm_offset_t r = core + 0x1000;
+		wr(r + 0x08, (uint32_t)(CORVETTE_PCIE0_ECAM & 0xffffffffu));
+		wr(r + 0x0c, 0);
+		wr(r + 0x10, (uint32_t)(CORVETTE_PCIE0_ECAM + 0x100000 - 1));
+		wr(r + 0x14, 1u << 24);
+		wr(r + 0x18, 0);
+		wr(r + 0x00, 0x4);
+		wr(r + 0x04, 0x80000000u);
+		for (polls = 0; polls < 1000 && !(rd(r + 0x04) & 0x80000000u); polls++) {
+			sleep_us(10);
+		}
+		printf("wifi: s1: 6m/7: the iATU's config region %s\n",
+		    (rd(r + 0x04) & 0x80000000u) ? "enabled" : "stayed off");
+		/* shennong's step 5, first read: the radio's config space through the translated window. */
+		{
+			vm_offset_t conf = corvette_s1_io_map(CORVETTE_PCIE0_ECAM, 0x1000);
+			uint32_t id = rd(conf), cap;
+			printf("wifi: s1: 6m/7: the radio: %04x:%04x, revision %#x, class %#08x, bar0 %#x %#x\n",
+			    id & 0xffff, id >> 16, rd(conf + 8) & 0xff, rd(conf + 8) >> 8,
+			    rd(conf + 0x10), rd(conf + 0x14));
+			printf("wifi: s1: 6m/7: %s\n", id == 0x110717cb ? "THE RADIO ANSWERS" :
+			    (id == 0xffffffff || id == 0) ? "nobody answers at bus 1" : "this is not a WCN7850");
+			if (id == 0x110717cb) {
+				for (cap = rd(conf + 0x34) & 0xfc; cap != 0 && cap < 0x100;
+				     cap = rd(conf + cap) >> 8 & 0xfc) {
+					uint32_t head = rd(conf + cap);
+					if ((head & 0xff) == 0x10) {   /* PCI Express */
+						uint32_t ls = rd(conf + cap + 0x10) >> 16;
+						printf("wifi: s1: 6m/7: the radio's link status %#x: up %u, speed %u, "
+						    "width %u\n", ls, (ls >> 13) & 1, ls & 0xf, (ls >> 4) & 0x3f);
+						break;
+					}
+				}
+			}
+		}
+	}
+	return true;
+}
+
+/*
+ * The vendor's training path, ported whole: msm_pcie_enable_link() (pci-msm.c:6056-6211),
+ * msm_pcie_link_train() (5719-5815), and the two helpers they call, msm_pcie_config_controller_phy()
+ * (4840-4867) and msm_pcie_config_core_preset() (4781-4837). Lines are that file's.
+ *
+ * The power, clock, GDSC, reset and CETSA steps before it are the ones 1/7 to 5f/7 already make; this
+ * function starts where msm_pcie_enable_link() starts, at PARF_DEVICE_TYPE, and ends where its
+ * check_ep_access does -- at the endpoint's config space, which kiwi_s1()'s 7/7 (or s2) step reads.
+ *
+ * What it adds over the existing 6/7, and why it is worth one run: the vendor writes PARF_SYS_CTRL as an
+ * absolute 0x365E (6/7 ORs bits into whatever was there), writes the Secondary PCIe capability's preset
+ * registers, writes the vendor's DBI device word and AER bits, and polls with 5 ms x 20 instead of S1's
+ * one-millisecond sampling of PARF_LTSSM. Selected with pcie_vendor_port=1; without it nothing below is
+ * reached and 6/7 runs as before.
+ */
+static uint16_t
+kiwi_vendor_ext_capability(vm_offset_t core, uint16_t want)
+{
+	uint32_t pos = 0x100, header = rd(core + pos);
+
+	if (header == 0) {
+		return 0;
+	}
+	for (unsigned ttl = (0x1000 - 0x100) / 8; ttl > 0; ttl--) {
+		if ((header >> 16) == want) {
+			return (uint16_t)pos;
+		}
+		pos = (header >> 20) & 0xffc;
+		if (pos < 0x100) {
+			break;
+		}
+		header = rd(core + pos);
+	}
+	return 0;
+}
+
+/* 4840-4867: for every supported speed from 8.0 GT/s upwards, the Gen3/Gen4 rate shadow and the
+ * equalisation settings. Both device-tree properties it reads are absent from this node, so their
+ * values are the vendor's zero-initialised defaults. */
+static void
+kiwi_vendor_controller_phy(vm_offset_t core)
+{
+	uint32_t lnkcap = rd(core + 0x70), sls = lnkcap & 0xf, value;
+
+	printf("wifi: vendor:   controller/phy settings (lnkcap %#x: max speed %u, max width %u)\n", lnkcap, sls,
+	    (lnkcap >> 4) & 0x3f);
+	for (uint32_t speed = 3; speed <= sls; speed++) {
+		value = rd(core + 0x890);
+		kiwi_s1_write("related: rate shadow select", 0x890, core + 0x890,
+		    (value & ~0x3000000u) | ((speed - 3) << 24));
+		value = rd(core + 0x8a8);
+		kiwi_s1_write("eq control: pset request vector", 0x8a8, core + 0x8a8, value & ~0xffff00u);
+		value = rd(core + 0x890);
+		kiwi_s1_write("related: zrxdc noncompl clear", 0x890, core + 0x890, value & ~1u);
+		value = rd(core + 0x8ac);
+		kiwi_s1_write("eq fb: t min phase23", 0x8ac, core + 0x8ac, value & ~0x1fu);
+	}
+}
+
+/* 4781-4837: the preset hints, written into the Secondary PCIe extended capability (0xC in) for Gen3 and
+ * the 16.0 GT/s one (0x20 in) for Gen4, one dword per two (or four) lanes. This is the write no earlier
+ * round made; the value is qcom,core-preset, absent here, so the vendor's default 0x55555555. */
+static void
+kiwi_vendor_core_preset(vm_offset_t core)
+{
+	uint32_t lnkcap = rd(core + 0x70), sls = lnkcap & 0xf, mlw = (lnkcap >> 4) & 0x3f, value;
+	uint16_t cap;
+	uint32_t lanes, per;
+
+	value = rd(core + 0x8bc);
+	kiwi_s1_write("misc control: ro writes on", 0x8bc, core + 0x8bc, value | 1u);
+	if (sls >= 3) {
+		cap = kiwi_vendor_ext_capability(core, 0x19);   /* (PCI_EXT_CAP_ID_SECPCI) */
+		if (cap == 0) {
+			printf("wifi: vendor:   no Secondary PCIe extended capability: no Gen3 preset written\n");
+		} else {
+			for (lanes = 0, per = 2; lanes < (mlw + per - 1) / per; lanes++) {
+				kiwi_s1_write("secondary pcie preset", 0xc + 4 * lanes,
+				    core + cap + 0xc + 4 * lanes, 0x55555555u);
+			}
+		}
+	}
+	if (sls >= 4) {
+		cap = kiwi_vendor_ext_capability(core, 0x26);   /* (PCI_EXT_CAP_ID_PL_16GT) */
+		if (cap == 0) {
+			printf("wifi: vendor:   no Physical Layer 16.0 GT/s capability: no Gen4 preset written\n");
+		} else {
+			for (lanes = 0, per = 4; lanes < (mlw + per - 1) / per; lanes++) {
+				kiwi_s1_write("pl 16gt preset", 0x20 + 4 * lanes,
+				    core + cap + 0x20 + 4 * lanes, 0x55555555u);
+			}
+		}
+	}
+	value = rd(core + 0x8bc);
+	kiwi_s1_write("misc control: ro writes off", 0x8bc, core + 0x8bc, value & ~1u);
+}
+
+static bool
+kiwi_s1_vendor_port(vm_offset_t parf, vm_offset_t core, vm_offset_t tlmm, vm_offset_t gcc)
+{
+	vm_offset_t elbi = core + (CORVETTE_PCIE0_ELBI - CORVETTE_PCIE0_CORE);
+	uint32_t value, lnkcap, status = 0, state = 0, polls, link_status = 0;
+	bool up = false, vendor_up = false;
+
+	/* air201: msm_pcie_enable() calls msm_pcie_parf_cesta_config() between the core/PHY reset and
+	 * msm_pcie_enable_link(): with the pcie_sm present (stock's own bootargs enable it via
+	 * pci-msm-drv.pcie_sm_regs), it sets PARF_CESTA_CLKREQ_SEL (BIT(0)) and
+	 * PARF_CESTA_L1SUB_TIMEOUT_EXT_INT_EN (BIT(3)) at parf + qcom,pcie-clkreq-offset (0x2c48,
+	 * pineapple-pcie.dtsi L429) -- the vendor's comment says "Set clkreq to be accessed by CESTA".
+	 * Without that bit the power sequencer never sees the module's CLKREQ request: air200 read
+	 * clkreq-req 0 and the gate closed at both probes while the pad sat low, and the link held at
+	 * detect.active in every run before this. */
+	value = rd(parf + 0x2c48);
+	printf("wifi: vendor:   air201: parf cesta config 0x2c48 before %#x\n", value);
+	kiwi_s1_write("cesta clkreq sel", 0x2c48, parf + 0x2c48, value | 0x9u);
+	printf("wifi: vendor: the vendor's own training path, msm_pcie_enable_link() + "
+	    "msm_pcie_link_train() whole\n");
+	/* air198: the aux and rchng RCGs, read whole. air188 printed only the CMD words (0 = idle);
+	 * the CFG at cmd_rcgr+4 has never been read. The OEM end state (gcc-pineapple.c, ace3pro branch)
+	 * is CFG = 0 for both: aux has only bi_tcxo at 19.2 MHz, and stock's connection-state debugfs
+	 * says phy_rchng parent = bi_tcxo, rate 19200000. A non-zero CFG here means the bootloader left
+	 * the sources somewhere else, and no branch vote can make a wrong source tick. */
+	/* air200: the pcie_sm power sequencer's own view, read-only. Stock's bootargs enable the
+	 * same sequencer (pci-msm-drv.pcie_sm_regs=...); its program counter says whether the thirteen
+	 * loaded steps have run to the end, and its CLKREQ gate words say whether the module's request
+	 * for the reference clock was ever served. A detect.active that never falls back to quiet looks
+	 * like a link held for a clock, so the gate status is the first suspect. */
+	{
+		vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+		static const uint32_t sm_regs[14] = { 0x1040, 0x1048, 0x1050, 0x1058, 0x1060, 0x1068,
+			0x1070, 0x1078, 0x1080, 0x1088, 0x1090, 0x1094, 0x1098, 0x109c };
+		static const char *const sm_names[14] = {
+			"ovr-pwr-val", "ovr-pwr-mask", "ovr-wait-val", "ovr-wait-mask",
+			"ovr-br-val", "ovr-br-mask", "seq-pwr-sta", "seq-wait-sta",
+			"seq-br-sta", "seq-pc", "seq-start", "clkreq-gate", "clkreq-ungate", "clkreq-req"
+		};
+		for (unsigned k = 0; k < 14; k++) {
+			printf("wifi: vendor:   air200 probe: pcie_sm +0x%04x %-13s %#x\n", sm_regs[k],
+			    sm_names[k], rd(sm + sm_regs[k]));
+		}
+		printf("wifi: vendor:   air200 probe: pads perst 94 in %u, clkreq 95 in %u, wake 96 in %u\n",
+		    rd(tlmm + 94 * 0x1000 + 4) & 1u, rd(tlmm + 95 * 0x1000 + 4) & 1u,
+		    rd(tlmm + 96 * 0x1000 + 4) & 1u);
+		printf("wifi: vendor:   air200 probe: pcs 0x210 %#x 0x214 %#x 0x218 %#x 0x21c %#x, "
+		    "pwr-dn 0x240 %#x, start 0x244 %#x\n", rd(parf + CORVETTE_PCIE0_PHY_AT + 0x210),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x214), rd(parf + CORVETTE_PCIE0_PHY_AT + 0x218),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x21c), rd(parf + CORVETTE_PCIE0_PHY_AT + 0x240),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x244));
+		printf("wifi: vendor:   air200 probe: serdes 0x008 %#x 0x00c %#x 0x0d0 %#x 0x0d8 %#x "
+		    "0x14c %#x 0x150 %#x, gdsc core %#x phy %#x\n", rd(parf + CORVETTE_PCIE0_PHY_AT + 0x008),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x00c), rd(parf + CORVETTE_PCIE0_PHY_AT + 0x0d0),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x0d8), rd(parf + CORVETTE_PCIE0_PHY_AT + 0x14c),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x150), rd(gcc + CORVETTE_PCIE0_GDSCR),
+		    rd(gcc + CORVETTE_PCIE0_PHY_GDSCR));
+	}
+	printf("wifi: vendor:   air198 probe: aux rcg cmd +0x6b074 %#x cfg +0x6b078 %#x, rchng cmd +0x6b058 %#x "
+	    "cfg +0x6b05c %#x\n", rd(gcc + 0x6b074), rd(gcc + 0x6b078), rd(gcc + 0x6b058), rd(gcc + 0x6b05c));
+	printf("wifi: vendor:   air198 probe: branch halts aux +0x6b03c %#x, pipe +0x6b048 %#x, rchng +0x6b054 %#x "
+	    "(bit 31 set = halted)\n", rd(gcc + 0x6b03c), rd(gcc + 0x6b048), rd(gcc + 0x6b054));
+	/* air199: the bootloader leaves the rchng RCG on a source that is not in the OEM parent map at
+	 * all (air198 read CFG 0x100605: src 5, div 3, bit 16 set; the OEM parent_map_0 of this clock
+	 * is {BI_TCXO:0, GPLL0_MAIN:1, GPLL0_EVEN:6}). Stock's connection-state debugfs says phy_rchng
+	 * parent = bi_tcxo, rate 19200000 -- the CCF's safe config of an enable_safe_config rcg whose
+	 * freq_tbl starts at F(19200000, P_BI_TCXO, 1). This kernel has no CCF, so the leftover stood
+	 * through every earlier run. One register, one variable: park it on the OEM end state and let
+	 * the update land before the PHY is started. The aux RCG already reads CFG 0 and is untouched. */
+	printf("wifi: vendor:   air199: rchng cfg before %#x\n", rd(gcc + 0x6b05c));
+	kiwi_s1_write("rchng cfg: bi_tcxo", 0x6b05c, gcc + 0x6b05c, 0);
+	kiwi_s1_write("rchng update", 0x6b058, gcc + 0x6b058, rd(gcc + 0x6b058) | 1u);
+	for (polls = 0; polls < 100 && (rd(gcc + 0x6b058) & 1u); polls++) {
+		sleep_us(10);
+	}
+	printf("wifi: vendor:   rchng update landed after %u polls: cmd %#x, cfg now %#x\n", polls,
+	    rd(gcc + 0x6b058), rd(gcc + 0x6b05c));
+
+	/* 6063: configure PCIe to RC mode */
+	kiwi_s1_write("device type: RC", CORVETTE_PARF_DEVICE_TYPE_OFF, parf + CORVETTE_PARF_DEVICE_TYPE_OFF,
+	    CORVETTE_PARF_DEVICE_TYPE_RC);
+	/* 6066-6067 are skipped on purpose: dev->l1_supported is false unless debugfs sets it, so the vendor
+	 * does not touch PM_CTRL in this path either. */
+	/* 6070: enable PCIe clocks and resets */
+	value = rd(parf + CORVETTE_PARF_PHY_CTRL);
+	kiwi_s1_write("parf phy ctrl: bit 0 off", CORVETTE_PARF_PHY_CTRL, parf + CORVETTE_PARF_PHY_CTRL,
+	    value & ~1u);
+	/* 6073: change DBI base address */
+	kiwi_s1_write("dbi base: 0", CORVETTE_PARF_DBI_BASE_V2, parf + CORVETTE_PARF_DBI_BASE_V2, 0);
+	/* 6075: PARF_SYS_CTRL = 0x365E, an absolute value, not an OR of bits into the boot value */
+	kiwi_s1_write("parf sys ctrl: 0x365e", CORVETTE_PARF_SYS_CTRL, parf + CORVETTE_PARF_SYS_CTRL,
+	    CORVETTE_PARF_SYS_CTRL_ON);
+	/* 6077: MHI clock/reset, bit 4 set (write_mask(..., 0, BIT(4))) */
+	value = rd(parf + CORVETTE_PARF_MHI_CLOCK_RESET);
+	kiwi_s1_write("mhi clock/reset: bit 4", CORVETTE_PARF_MHI_CLOCK_RESET,
+	    parf + CORVETTE_PARF_MHI_CLOCK_RESET, value | (1u << 4));
+	/* 6081-6096: the mask is cleared, then the events the vendor serves are set. The bits are the
+	 * file's enum msm_pcie_irq_event: LINK_DOWN 1, L1SUB_TIMEOUT 9, BRIDGE_FLUSH_N 12, AER_LEGACY 14,
+	 * AER_ERR 15, MSI_0..MSI_7 23..30, i.e. 0x7f80d202 - the value stock prints in dmesg and the 6/7
+	 * branch above already writes. air195 read the bits as 8/11/12-13/21-28 and wrote 0x1fe03902. */
+	kiwi_s1_write("interrupt mask: cleared", CORVETTE_PARF_INT_ALL_MASK, parf + CORVETTE_PARF_INT_ALL_MASK, 0);
+	kiwi_s1_write("interrupt mask: the vendor's events", CORVETTE_PARF_INT_ALL_MASK,
+	    parf + CORVETTE_PARF_INT_ALL_MASK, 0x7f80d202u);
+	/* 6102: the slave address space's size (qcom,slv-addr-space-size) */
+	kiwi_s1_write("slv size: 64 MB", CORVETTE_PARF_SLV_SIZE_V2, parf + CORVETTE_PARF_SLV_SIZE_V2,
+	    CORVETTE_PARF_SLV_SIZE);
+	/* 6115-6120: no qcom,wr-halt-size on this node, so the vendor keeps the register and sets bit 31 */
+	value = rd(parf + CORVETTE_PARF_AXI_HALT_V2);
+	kiwi_s1_write("axi write halt: bit 31", CORVETTE_PARF_AXI_HALT_V2, parf + CORVETTE_PARF_AXI_HALT_V2,
+	    value | (1u << 31));
+	/* 6128-6130 pcie_tcsr_init() has no qcom,tcsr-config here; 5/7's clkref write already made it. */
+	/* 6133 + 4697-4709: pcie_phy_init()'s sequence */
+	printf("wifi: vendor:   pcie_phy_init(): %u sequence writes\n", KIWI_PHY_SEQUENCE_WRITES);
+	for (unsigned i = 0; i < KIWI_PHY_SEQUENCE_WRITES; i++) {
+		uint32_t offset = kiwi_phy_sequence[3 * i], written = kiwi_phy_sequence[3 * i + 1];
+
+		kiwi_s1_write("phy sequence", offset, parf + CORVETTE_PCIE0_PHY_AT + offset, written);
+		if (kiwi_phy_sequence[3 * i + 2]) {
+			sleep_ms(kiwi_phy_sequence[3 * i + 2]);
+		}
+	}
+	/* 4711-4712: PHY_STABILIZATION_DELAY 995-1005 us */
+	sleep_us(1000);
+	/* 4715 and 4721: the pipe clock is one of the seven branches voted in 1/7, and 3/7 cycled both pipe
+	 * resets; there is no clock framework in the kernel to repeat either call. */
+	/* 4727-4743: wait for the PHY's ready bit, ten tries of a millisecond */
+	for (polls = 0; polls < 10; polls++) {
+		status = rd(parf + CORVETTE_PCIE0_PHY_AT + CORVETTE_PHY_STATUS_OFFSET);
+		if (!(status & CORVETTE_PHY_STATUS_READY)) {
+			break;
+		}
+		sleep_us(1000);
+	}
+	printf("wifi: vendor:   phy +%#x = %#x: %s after %u tries\n", CORVETTE_PHY_STATUS_OFFSET, status,
+	    (status & CORVETTE_PHY_STATUS_READY) ? "NOT ready" : "ready", polls);
+	if (status & CORVETTE_PHY_STATUS_READY) {
+		printf("wifi: vendor:   the vendor returns -ENODEV here; the link is not trained\n");
+		return false;
+	}
+	/* 6138-6139: phy_aux_clk_mux has no qcom,phy-aux-clk-mux on this node */
+	/* 6141: usleep_range(ep_latency * 1000) with qcom,ep-latency = 10 */
+	sleep_ms(10);
+	/* 6143-6145: no qcom,ep-gpio on this node */
+	/* 6147-6158: the maximum width, and no qcom,target-link-width, so no link-width write */
+	lnkcap = rd(core + 0x70);
+	printf("wifi: vendor:   lnkcap %#x: max speed %u, max width %u; no qcom,target-link-width\n", lnkcap,
+	    lnkcap & 0xf, (lnkcap >> 4) & 0x3f);
+	/* 6161: disable the fal10 veto's override, so Qactive is de-asserted */
+	value = rd(parf + CORVETTE_PARF_CFG_BITS_3);
+	kiwi_s1_write("parf cfg bits 3: qactive veto off", CORVETTE_PARF_CFG_BITS_3,
+	    parf + CORVETTE_PARF_CFG_BITS_3, value & ~1u);
+	/* 6167: and bit 8 of the same register */
+	kiwi_s1_write("parf cfg bits 3: bit 8", CORVETTE_PARF_CFG_BITS_3, parf + CORVETTE_PARF_CFG_BITS_3,
+	    rd(parf + CORVETTE_PARF_CFG_BITS_3) | (1u << 8));
+	/* 6168: the DWC's LANE_SKEW_OFF bit 5 */
+	value = rd(core + CORVETTE_CORE_LANE_SKEW_OFF);
+	kiwi_s1_write("lane skew off: bit 5", CORVETTE_CORE_LANE_SKEW_OFF, core + CORVETTE_CORE_LANE_SKEW_OFF,
+	    value | (1u << 5));
+	/* air196: the capability on both sides of the endpoint's reset. The vendor reads it only after the
+	 * release; in air195 that read said max speed 0, while every earlier run, which read it before the
+	 * release, said 0x7a4c23 (max speed 3). */
+	lnkcap = rd(core + 0x70);
+	printf("wifi: vendor:   lnkcap before the endpoint's reset: %#x (max speed %u, max width %u)\n",
+	    lnkcap, lnkcap & 0xf, (lnkcap >> 4) & 0x3f);
+	/* 6170-6176: release the endpoint's reset, then PERST_PROPAGATION_DELAY 1000-1005 us */
+	printf("wifi: vendor:   releasing the endpoint's reset (pin 94)\n");
+	kiwi_s1_write("pin 94 perst: high", 0, tlmm + 0x1000UL * CORVETTE_PIN_PERST + 4, 2);
+	sleep_us(1000);
+
+	lnkcap = rd(core + 0x70);
+	printf("wifi: vendor:   lnkcap after the endpoint's reset: %#x (max speed %u, max width %u)\n",
+	    lnkcap, lnkcap & 0xf, (lnkcap >> 4) & 0x3f);
+	/* 5719: msm_pcie_link_train() */
+	printf("wifi: vendor: msm_pcie_link_train()\n");
+	/* 5724-5725: PCIE_GEN3_GEN2_CTRL's field at bits 12:8, cleared and then set to 1 */
+	value = rd(core + CORVETTE_CORE_GEN3_GEN2_CTRL);
+	kiwi_s1_write("gen3/gen2 control: field 0x1f00 to 1", CORVETTE_CORE_GEN3_GEN2_CTRL,
+	    core + CORVETTE_CORE_GEN3_GEN2_CTRL, (value & ~0x1f00u) | 0x100u);
+	kiwi_vendor_controller_phy(core);
+	kiwi_vendor_core_preset(core);
+	/* 5733-5736: target_link_speed is qcom,target-link-speed, absent, so LNKCTL2 is not written */
+	printf("wifi: vendor:   qcom,target-link-speed is absent, so LNKCTL2 is not written\n");
+	/* 5739-5740: max TLP read size, PCIE_TLP_RD_SIZE's default 5 */
+	value = rd(core + CORVETTE_CORE_DEVICE_CTRL_STATUS);
+	kiwi_s1_write("device control: max read request 5", CORVETTE_CORE_DEVICE_CTRL_STATUS,
+	    core + CORVETTE_CORE_DEVICE_CTRL_STATUS, (value & ~0x7000u) | (5u << 12));
+	/* air196: the vendor gets the pipe clock from the clock framework's pcie_pipe_clk_init(); there is
+	 * no clock framework here. 6b/7 found this mux at 0 (PHY PIPE, unclocked on this board) and moved it
+	 * to 2 (BI_TCXO), the only action that ever took LTSSM out of detect.quiet. Read it, and write only
+	 * when it is not already 2, so the log says which of the two it found. */
+	value = rd(gcc + 0x6b070) & 3u;
+	printf("wifi: vendor:   pipe mux before LTSSM: %#x (%s)\n", value,
+	    value == 2 ? "BI_TCXO" : value == 0 ? "PHY PIPE" : "other");
+	if (value != 2) {
+		kiwi_s1_write("pipe mux: BI_TCXO", 0x6b070, gcc + 0x6b070, (rd(gcc + 0x6b070) & ~3u) | 2u);
+	}
+	/* 5743: one read-modify-write, then poll; the enable is never disturbed again */
+	kiwi_s1_write("parf ltssm: enable", CORVETTE_PARF_LTSSM_OFFSET, parf + CORVETTE_PARF_LTSSM_OFFSET,
+	    rd(parf + CORVETTE_PARF_LTSSM_OFFSET) | CORVETTE_PARF_LTSSM_EN);
+	/* 5748-5754: the vendor's poll, LINK_UP_TIMEOUT 5000-5101 us and at most 20 checks, on ELBI's link-up
+	 * bit (0x400) together with the DLL's active bit. */
+	for (polls = 0; polls <= 20; polls++) {
+		sleep_us(5000);
+		value = rd(elbi + CORVETTE_ELBI_SYS_STTS_OFFSET);
+		link_status = rd(core + 0x70 + 0x10);
+		state = rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f;
+		printf("wifi: vendor:   poll %u: elbi +0x08 %#x (link up %u), link status %#x (dll %u), parf "
+		    "state %#x %s, mux %#x\n", polls, value, (value >> 10) & 1, link_status >> 16,
+		    (link_status >> 29) & 1, state,
+		    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)",
+		    rd(gcc + 0x6b070) & 3u);
+		if ((value & 0x400) && (link_status & (1u << 29))) {
+			vendor_up = true;
+			break;
+		}
+	}
+	if (vendor_up) {
+		printf("wifi: vendor:   the vendor's own criterion is met: ELBI link-up and DLL active\n");
+		up = true;
+	} else if (state == 0x11 || (link_status & (1u << 13))) {
+		printf("wifi: vendor:   the vendor's criterion is not met, but parf state %#x / link status %#x say "
+		    "the link is up: ELBI's link-up bit does not follow this wrapper, as 6/7's note says\n", state,
+		    link_status >> 16);
+		up = true;
+	} else {
+		printf("wifi: vendor:   the link is not up: parf state %#x %s, link status %#x (dll %u), elbi %#x\n",
+		    state, kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)", link_status >> 16,
+		    (link_status >> 29) & 1, value);
+	}
+	/* air196: the vendor allows 100 ms. If the mux was the missing piece LTSSM should move within tens
+	 * of milliseconds; this window records a further second and accepts the same two signs of a link the
+	 * branch above accepts, so a link that arrives late still lets 7/7 report the endpoint. */
+	if (!up) {
+		printf("wifi: vendor:   the vendor's 100 ms are over; 40 more samples at 25 ms, recording only\n");
+		for (unsigned extra = 0; extra < 40; extra++) {
+			sleep_us(25000);
+			state = rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f;
+			link_status = rd(core + 0x70 + 0x10);
+			printf("wifi: vendor:   +%u ms: parf state %#x %s, link status %#x (dll %u), mux %#x\n",
+			    25 * (extra + 1), state,
+			    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)",
+			    link_status >> 16, (link_status >> 29) & 1, rd(gcc + 0x6b070) & 3u);
+			if (state == 0x11 || (link_status & (1u << 29)) || (link_status & (1u << 13))) {
+				printf("wifi: vendor:   +%u ms: the link is up by the same signs\n", 25 * (extra + 1));
+				up = true;
+				break;
+			}
+		}
+	}
+	/* air200: the same sequencer and PCS words at failure time, to be compared with the entry
+	 * probe: a program counter that moved says the sequencer ran; one that did not, or a CLKREQ
+	 * gate still closed, says what held the link. */
+	{
+		vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+		printf("wifi: vendor:   air200 fail: seq-pc %#x, pwr-ctrl-sta %#x, wait-ev-sta %#x, "
+		    "br-ev-sta %#x, clkreq gate %u ungate %u req %#x\n", rd(sm + 0x1088), rd(sm + 0x1070),
+		    rd(sm + 0x1078), rd(sm + 0x1080), rd(sm + 0x1094) & 1u, rd(sm + 0x1098) & 1u,
+		    rd(sm + 0x109c));
+		printf("wifi: vendor:   air200 fail: pcs 0x214 %#x, pads perst %u clkreq %u wake %u, "
+		    "gdsc core %#x phy %#x\n", rd(parf + CORVETTE_PCIE0_PHY_AT + 0x214),
+		    rd(tlmm + 94 * 0x1000 + 4) & 1u, rd(tlmm + 95 * 0x1000 + 4) & 1u,
+		    rd(tlmm + 96 * 0x1000 + 4) & 1u, rd(gcc + CORVETTE_PCIE0_GDSCR),
+		    rd(gcc + CORVETTE_PCIE0_PHY_GDSCR));
+		printf("wifi: vendor:   air201 fail: cesta cfg 0x2c48 %#x, parf clkreq 0x2b0 %#x\n",
+		    rd(parf + 0x2c48), rd(parf + 0x2b0));
+	}
+	/* air198: the DesignWare port debug words, an independent read of the LTSSM the parf state
+	 * already reports. The working UniXNU board accepts a link only when debug0's bits 5:0 are 0x11
+	 * and debug1's bit 4 is set. */
+	printf("wifi: vendor:   air198 probe: port debug0 %#x (ltssm %u), debug1 %#x (bit 4 %u)\n",
+	    rd(core + 0x728), rd(core + 0x728) & 0x3f, rd(core + 0x72c), (rd(core + 0x72c) >> 4) & 1);
+	status = link_status >> 16;
+	printf("wifi: vendor:   link status %#x: up %u, speed %u, width %u\n", status, (status >> 13) & 1,
+	    status & 0xf, (status >> 4) & 0x3f);
+
+	/* air202: the sequencer parked at step 8 never served the module's CLKREQ request (air200:
+	 * gate 0, req 0, pad low at both probes; air201's CLKREQ_SEL was already set by the boot
+	 * loader, and its BIT(3) did not stick). Do the machine's step by hand: issue SEQ_CLKREQ_UNGATE
+	 * (0x1098) and watch the link for half a second. If the reference clock reaching the module
+	 * wakes its PHY, detect completes and 7/7 reads the endpoint; if nothing moves, the module is
+	 * deaf outside this machine. */
+	{
+		vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+		printf("wifi: vendor:   air202: before ungate: gate %#x ungate %#x req %#x\n",
+		    rd(sm + 0x1094), rd(sm + 0x1098), rd(sm + 0x109c));
+		kiwi_s1_write("air202 clkreq ungate", 0x1098, sm + 0x1098, 1u);
+		sleep_us(100);
+		printf("wifi: vendor:   air202: after ungate: gate %#x ungate %#x req %#x\n",
+		    rd(sm + 0x1094), rd(sm + 0x1098), rd(sm + 0x109c));
+		for (unsigned extra = 0; extra < 20; extra++) {
+			sleep_us(25000);
+			state = rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f;
+			link_status = rd(core + 0x70 + 0x10);
+			printf("wifi: vendor:   air202 +%u ms: parf state %#x %s, link status %#x, 0x2b0 %#x\n",
+			    25 * (extra + 1), state,
+			    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)",
+			    link_status >> 16, rd(parf + 0x2b0));
+			if (state == 0x11 || (link_status & (1u << 13))) {
+				printf("wifi: vendor:   air202 +%u ms: the link woke\n", 25 * (extra + 1));
+				up = true;
+				break;
+			}
+		}
+		printf("wifi: vendor:   air202: cesta cfg 0x2c48 %#x, parf 0x2b0 %#x after the watch\n",
+		    rd(parf + 0x2c48), rd(parf + 0x2b0));
+	}
+
+	/* 6206 msm_pcie_config_sid() fills the BDF-to-SID tables for the SMMU, which is S2's subject; the
+	 * iATU's CFG0 region is 7/7's or s2's. The rest of msm_pcie_config_controller() is these four. */
+	value = rd(core + 0x70c);
+	kiwi_s1_write("ack f aspm: n fts bit", 0x70c, core + 0x70c, value | (1u << 15));
+	kiwi_s1_write("aux clock frequency: 20 MHz", CORVETTE_CORE_AUX_CLK_FREQ, core + CORVETTE_CORE_AUX_CLK_FREQ,
+	    CORVETTE_AUX_CLK_FREQ_MHZ);
+	/* 4904: cpl_timeout has no device-tree property and bridge_found is not known before enumeration */
+	value = rd(core + 0x3c);
+	kiwi_s1_write("bridge control: aer", 0x3c, core + 0x3c, value | (3u << 16));
+	value = rd(core + CORVETTE_CORE_DEVICE_CTRL_STATUS);
+	kiwi_s1_write("device control: aer", CORVETTE_CORE_DEVICE_CTRL_STATUS, core + CORVETTE_CORE_DEVICE_CTRL_STATUS,
+	    value | 0xfu);
+	/* 6209 msm_pcie_check_ep_access() is the read of the endpoint's config space that kiwi_s1() makes
+	 * after this returns; it is not repeated here (a read of ECAM on an untrained link ends the kernel). */
+	return up;
+}
+
+static bool
+kiwi_s1_link(vm_offset_t parf, vm_offset_t core, vm_offset_t tlmm)
+{
+	vm_offset_t elbi = core + (CORVETTE_PCIE0_ELBI - CORVETTE_PCIE0_CORE);
+	uint32_t refclk = kiwi_s1_read("parf refclk", CORVETTE_PARF_PHY_REFCLK, parf + CORVETTE_PARF_PHY_REFCLK);
+	uint32_t ltssm = kiwi_s1_read("parf ltssm", CORVETTE_PARF_LTSSM_OFFSET, parf + CORVETTE_PARF_LTSSM_OFFSET);
+	uint32_t capability, status = 0, state, value;
+
+	printf("wifi: s1: 6/7: refclk %#x: use pad %u, spread spectrum %u; ltssm %#x (state %#x)\n", refclk,
+	    (refclk >> 12) & 1, (refclk >> 16) & 1, ltssm, ltssm & 0x3f);
+
+	capability = kiwi_s1_capability(core);
+	if (capability != 0) {
+		status = rd(core + capability + 0x10) >> 16;
+		printf("wifi: s1:   link capability %#x (max speed %u, max width %u), link status %#x (up %u, speed %u, "
+		    "width %u) before training\n", rd(core + capability + 0x0c), rd(core + capability + 0x0c) & 0xf,
+		    (rd(core + capability + 0x0c) >> 4) & 0x3f, status, (status >> 13) & 1, status & 0xf,
+		    (status >> 4) & 0x3f);
+	}
+
+	/*
+	 * The ELBI, all of it, and the core's debug registers beside it. S1's ninth run found PORT_DEBUG0 reading
+	 * 0 -- the core's own view of "train!" never went high -- while PARF's own ltssm enable (bit 8) took the
+	 * write and stayed. So either the ELBI is not where mainline puts it, or it is not clocked, or the
+	 * wrapper takes that enable from somewhere else; a whole-window read says which of the first two.
+	 */
+	printf("wifi: s1:   the elbi, all of it, at %#x (about to read 16 words):\n", CORVETTE_PCIE0_ELBI);
+	printf("wifi: s1:     %#x %#x %#x %#x %#x %#x %#x %#x\n", rd(elbi), rd(elbi + 4), rd(elbi + 8), rd(elbi + 0xc),
+	    rd(elbi + 0x10), rd(elbi + 0x14), rd(elbi + 0x18), rd(elbi + 0x1c));
+	printf("wifi: s1:     %#x %#x %#x %#x %#x %#x %#x %#x\n", rd(elbi + 0x20), rd(elbi + 0x24), rd(elbi + 0x28),
+	    rd(elbi + 0x2c), rd(elbi + 0x30), rd(elbi + 0x34), rd(elbi + 0x38), rd(elbi + 0x3c));
+	printf("wifi: s1:   the port's own registers: link control %#x, debug0 %#x, debug1 %#x\n",
+	    rd(core + 0x710), rd(core + 0x728), rd(core + 0x72c));
+
+	/*
+	 * The enable. Nine runs have written ELBI_SYS_CTRL at +0x04 and never had it read back; the whole window
+	 * shows why: +0x00 and +0x08 answer (+0x00 reads 0x1280, +0x08 reads 1) and +0x04 is dead. So this
+	 * wrapper's ELBI is not laid out as mainline's, and the control register is the first one, not the
+	 * fourth. Both are written here -- +0x00 with its own value plus bit 0, +0x04 the way mainline does it --
+	 * and the log says which of the two reads back.
+	 */
+	/*
+	 * The endpoint's reset is released here, as Linux does it: after the controller's init, after the PHY's
+	 * own sequence, and one moment before training is started -- so that the radio comes out of reset into a
+	 * controller that is ready for it, rather than ten milliseconds into an init that has not happened yet.
+	 */
+	/* the vendor's own writes, before the endpoint's reset is let go */
+	kiwi_s1_vendor_extras(parf, core);
+
+	/*
+	 * The clock request. Under function 1 (pcie0_clk_req_n) the pin belongs to the controller and its
+	 * GPIO input bit means nothing, which is why "clkreq reads 0, the radio is asking for a clock"
+	 * was never a reading at all. The level is taken with the pin as a plain input carrying the
+	 * device tree's pull-up, and the pin is then handed back to the controller. A radio that wants a
+	 * clock holds the line low.
+	 */
+	kiwi_s1_write("pin 95 clkreq: read as a gpio with a pull-up", 0x1000UL * CORVETTE_PIN_CLKREQ,
+	    tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ, CORVETTE_PIN_CLKREQ_SLEEP);
+	{
+		uint32_t level = rd(tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ + 4) & 1;
+
+		printf("wifi: s1:   clkreq before the endpoint's reset is released: %u %s\n", level,
+		    level ? "high, the radio is not asking for a clock" : "LOW, the radio is asking for one");
+	}
+	/* the clock request must reach the controller, so the pin carries function 1, not GPIO */
+	kiwi_s1_write("pin 95 clkreq: pcie0_clk_req_n", 0x1000UL * CORVETTE_PIN_CLKREQ,
+	    tlmm + 0x1000UL * CORVETTE_PIN_CLKREQ, CORVETTE_PIN_CLKREQ_N);
+	/*
+	 * Air180: 2/7 left the mux at BI_TCXO and 2c/7 still read 2, but by the time training started the
+	 * register read 0 again -- the core/PHY reset in 3/7 (or the PHY's own pipe handshake) puts it back
+	 * to its default. So air179's experiment never ran. Set it here, after every reset and before the
+	 * endpoint's reset is released, so the whole attempt is clocked by the crystal, and say what it read
+	 * both before and after the write.
+	 */
+	{
+		vm_offset_t gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+
+		printf("wifi: s1:   pipe mux just before the experiment: %#x (2/7 asked for 2)\n",
+		    rd(gcc + 0x6b070) & 3);
+		kiwi_s1_write("pipe mux: BI_TCXO, after the resets", 0x6b070,
+		    gcc + 0x6b070, (rd(gcc + 0x6b070) & ~3u) | 2u);
+	}
+	kiwi_s1_write("pin 94 perst io: high", 0, tlmm + 0x1000UL * CORVETTE_PIN_PERST + 4, 2);
+	printf("wifi: s1:   pin 94 is %s, the endpoint's reset released\n",
+	    (rd(tlmm + 0x1000UL * CORVETTE_PIN_PERST + 4) & 1) ? "high" : "still low");
+	/*
+	 * The clock request, taken from the endpoint itself now that its reset is released and the reference
+	 * clock is supposed to be running. A radio that has a clock and is out of reset may let CLKREQ# go; one
+	 * that is still asking has either no clock or is not out of reset. This is the only reading the link has
+	 * from the far side, so it is taken twice: here, and again after the training window below.
+	 */
+	{
+		uint32_t clkreq = 0x1000UL * CORVETTE_PIN_CLKREQ, level;
+
+		kiwi_s1_write("pin 95 clkreq: read as a gpio with a pull-up", clkreq,
+		    tlmm + clkreq, CORVETTE_PIN_CLKREQ_SLEEP);
+		level = rd(tlmm + clkreq + 4) & 1;
+		printf("wifi: s1:   clkreq once the endpoint's reset was released: %u %s\n", level,
+		    level ? "high, the radio let the request go" : "LOW, it is still asking for a clock");
+		kiwi_s1_write("pin 95 clkreq: pcie0_clk_req_n", clkreq,
+		    tlmm + clkreq, CORVETTE_PIN_CLKREQ_N);
+	}
+	/*
+	 * One millisecond, which is the vendor's own number and the only one that has evidence behind it.
+	 *
+	 * msm_pcie_enable_link() releases PERST and then sleeps usleep_range(PERST_PROPAGATION_DELAY_US_MIN,
+	 * PERST_PROPAGATION_DELAY_US_MAX) -- 1000 to 1005 microseconds, the defaults, because pcie0 has no
+	 * qcom,perst-delay-us-min -- before msm_pcie_link_train() sets PARF_LTSSM bit 8. The phone's own dmesg
+	 * shows what that buys: PERST released at 65.314318 and "PCIe RC0 link initialized" at 65.331193, so
+	 * the endpoint presents its receiver termination and finishes training in seventeen milliseconds.
+	 *
+	 * S1 waited a whole second here -- an invention of an earlier round, first at 100 ms and then at
+	 * 1000 ms, neither of which changed the outcome. A thousand times the vendor's delay is not a
+	 * conservative choice: it leaves the endpoint sitting with its reset released and no training activity
+	 * for a second, which is not a state the vendor ever puts it in.
+	 */
+	sleep_ms(1);
+
+	/*
+	 * The vendor's msm_pcie_link_train() enables training with a single read-modify-write of
+	 * PARF_LTSSM -- write_mask(parf + 0x1b0, 0, BIT(8)) -- which sets bit 8 and leaves everything
+	 * else alone. It never touches ELBI +0x00 or ELBI +0x04: the LT_ENABLE bit in ELBI_SYS_CTRL
+	 * belongs to the older 2.1.0 op set, and this generation trains through PARF_LTSSM bit 8 only.
+	 * S1 used to raise an edge (clear, 1 ms, set) AND write ELBI +0x00/+0x04 -- neither of which the
+	 * vendor does, and writing the old LT_ENABLE beside the new one is exactly the kind of thing
+	 * that keeps a DWC wrapper from ever leaving detect.quiet.
+	 */
+	/*
+	 * Air192: msm_pcie_config_controller_phy(), the one vendor function the mechanical extraction
+	 * found that this implementation never had.  In pci-msm.c it runs at the top of link_train() for
+	 * every supported speed from 8.0 GT/s upwards:
+	 *   PCIE_GEN3_RELATED (0x890)               bits 25:24 rate shadow select, bit 0 cleared
+	 *   PCIE_GEN3_EQ_CONTROL (0x8a8)            bits 23:8  qcom,eq-pset-req-vec (absent here, so 0)
+	 *   PCIE_GEN3_EQ_FB_MODE_DIR_CHANGE (0x8ac) bits 4:0   qcom,eq-fmdc-t-min-phase23 (dt: 1)
+	 * The link capability reads back max speed 3, so the vendor loop runs once, for Gen3, and the
+	 * shadow selector is 0.  These are equalisation settings for a link that is already training;
+	 * they are here for exactness, not because they can lift detect.
+	 */
+	value = rd(core + 0x890);
+	printf("wifi: s1:   related 0x890 %#x, eq control 0x8a8 %#x, eq fb 0x8ac %#x before the gen3 settings\n",
+	    value, rd(core + 0x8a8), rd(core + 0x8ac));
+	kiwi_s1_write("related: rate shadow select gen3", 0x890, core + 0x890, value & ~0x3000000u);
+	kiwi_s1_write("related: zrxdc noncompl clear", 0x890, core + 0x890, rd(core + 0x890) & ~1u);
+	value = rd(core + 0x8a8);
+	kiwi_s1_write("eq control: pset request vector 0", 0x8a8, core + 0x8a8, value & ~0xffff00u);
+	value = rd(core + 0x8ac);
+	kiwi_s1_write("eq fb: t min phase23 1", 0x8ac, core + 0x8ac, (value & ~0x1fu) | 1u);
+
+	value = rd(elbi);
+	kiwi_s1_write("parf ltssm: enable", CORVETTE_PARF_LTSSM_OFFSET, parf + CORVETTE_PARF_LTSSM_OFFSET,
+	    rd(parf + CORVETTE_PARF_LTSSM_OFFSET) | CORVETTE_PARF_LTSSM_EN);
+	/*
+	 * The first forty milliseconds, one millisecond at a time. Detect.Quiet is a state the state machine
+	 * leaves on its own once its pipe clock runs -- the vendor's own dmesg shows seventeen milliseconds
+	 * from the enable to a trained link. A state field that reads 0 for all forty says the pipe clock the
+	 * PCS hands the core is not running at all, and no LTSSM setting can repair that. The windows below
+	 * report only where the state ended up, so this is the one place the timeline exists.
+	 */
+	{
+		vm_offset_t gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+		uint32_t previous = 0xffff, changes = 0, mux_entry = rd(gcc + 0x6b070) & 3;
+
+		printf("wifi: s1:   ltssm at 1 ms, the first 80 ms:");
+		for (unsigned ms = 0; ms < 80; ms++) {
+			uint32_t now = rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f;
+
+			printf(" %u", now);
+			if (now != previous) {
+				changes++;
+				previous = now;
+			}
+			sleep_ms(1);
+		}
+		printf("\n");
+		printf("wifi: s1:   it %s\n", changes <= 1 ?
+		    "never moved: the state machine is not being clocked out of detect.quiet" :
+		    "moved; the pipe clock runs and the failure is later in training");
+		/* 0x6b070 mux (0 = PHY PIPE), 0x6b048 pipe branch, 0x6b074 aux RCG, 0x6b058 rchng RCG */
+		printf("wifi: s1:   pipe source %#x at entry, %#x after 80 ms; pipe branch %#x, aux rcg %#x, "
+		    "rchng rcg %#x, clkreq %#x\n", mux_entry, rd(gcc + 0x6b070) & 3, rd(gcc + 0x6b048),
+		    rd(gcc + 0x6b074), rd(gcc + 0x6b058), rd(parf + 0x2b0));
+		printf("wifi: s1:   phy 0x214 %#x, phy 0x240 %#x, phy 0x244 %#x\n",
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + CORVETTE_PHY_STATUS_OFFSET),
+		    rd(parf + CORVETTE_PCIE0_PHY_AT + 0x240), rd(parf + CORVETTE_PCIE0_PHY_AT + 0x244));
+	}
+	/*
+	 * Air185: the sweep is gone.
+	 *
+	 * Air181 to air184 wrote PARF 0x4c eight ways and forced the pipe mux onto the PHY's PIPE. Neither is
+	 * what the phone runs: stock reports gcc_pcie_0_pipe_clk_src on bi_tcxo (2), rate 19.2 MHz, with no
+	 * consumer, and its PARF 0x4c is the boot value 0x1019. No sweep ever separated the eight
+	 * combinations, so the link now trains with both registers exactly as the boot firmware left them and
+	 * the only thing recorded is what they hold.
+	 */
+	{
+		vm_offset_t gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+		uint32_t refclk = rd(parf + CORVETTE_PARF_PHY_REFCLK), pipe = rd(gcc + 0x6b070);
+
+		printf("wifi: s1: 6b/7: the reference clock and the pipe selector are left as the boot firmware set "
+		    "them: parf 0x4c %#x (bit 9 %u, 12 %u, 16 %u), gcc 0x6b070 %#x\n", refclk,
+		    (refclk >> 9) & 1, (refclk >> 12) & 1, (refclk >> 16) & 1, pipe & 3);
+	}
+	state = kiwi_s1_watch(elbi, 300);
+	printf("wifi: s1:   after them: state %#x, elbi +0x00 %#x, +0x08 %#x, debug0 %#x (bit 0 is the core's own "
+	    "\"train\")\n", state, value, rd(elbi + 8), rd(core + 0x728));
+	/*
+	 * The enable stays exactly where msm_pcie_link_train() put it. Air160 took PARF_LTSSM bit 8 down
+	 * for two milliseconds to watch the core's own "train" bit move, then put it back: that aborts the
+	 * attempt that has just started, and the vendor does not do it -- one write, then poll. From here
+	 * the LTSSM state is sampled continuously, with the enable never disturbed again.
+	 */
+	state = kiwi_s1_watch(elbi, 200);
+	/* Air193: the air190 second perst edge is gone; the vendor releases perst exactly once. */
+
+	/*
+	 * Two more things upstream does and S1 has never done. First the link control register itself, which
+	 * nothing has read: bit 5 is "link disable", and a port whose link is disabled keeps its LTSSM where it
+	 * is whatever else is written. Then the speed change request -- dw_pcie_setup_rc ends with
+	 * LINK_WIDTH_SPEED_CONTROL |= SPEED_CHANGE, which is what makes a DWC port bring its link up again after
+	 * its registers were programmed.
+	 */
+	if (capability != 0) {
+		uint32_t control = rd(core + capability + 0x10);
+
+		printf("wifi: s1:   link control %#x: link disable %u, retrain %u, target speed %u\n",
+		    control & 0xffff, (control >> 5) & 1, (control >> 15) & 1, control & 0xf);
+		/*
+		 * Nothing is written here any more. The link disable bit and SPEED_CHANGE are both mainline
+		 * dw_pcie_setup_rc() habits: the vendor's link_train() makes one write to this word (the field at
+		 * 5h/7) and then enables the LTSSM, and the bootloader's SPEED_CHANGE bit is left alone by the
+		 * vendor for the whole life of the link. S1 both set and cleared it, and cleared a bit Android
+		 * never clears.
+		 */
+		state = kiwi_s1_watch(elbi, 300);
+		printf("wifi: s1:   with the link control left alone: state %#x, link status %#x, debug0 %#x\n", state,
+		    rd(core + capability + 0x10) >> 16, rd(core + 0x728));
+	}
+
+	state = kiwi_s1_watch(elbi, 1000);
+	if (capability != 0) {
+		status = rd(core + capability + 0x10) >> 16;
+	}
+	/*
+	 * Air184: three more samples over 300 ms. Air183 reached detect.active in 9 ms and was still there
+	 * 700 ms later, but one reading at the end cannot tell "stuck" from "retrying"; sampling the state,
+	 * the ELBI's status word and the link status together says whether anything in the core moves at all.
+	 */
+	printf("wifi: s1:   three samples over 300 ms, the state now %#x:\n", state);
+	for (unsigned i = 0; i < 3; i++) {
+		printf("wifi: s1:   +%u00 ms: parf %#x (state %#x), elbi +0x08 %#x, link status %#x\n", i,
+		    rd(parf + CORVETTE_PARF_LTSSM_OFFSET), rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f,
+		    rd(elbi + CORVETTE_ELBI_SYS_STTS_OFFSET),
+		    capability != 0 ? rd(core + capability + 0x10) >> 16 : 0);
+		if (i != 2)
+			sleep_ms(100);
+	}
+	printf("wifi: s1:   the core's own port state: debug0 %#x (bit 0 is its own \"train\"), debug1 %#x, link "
+	    "width/speed %#x\n", rd(core + 0x728), rd(core + 0x72c), rd(core + 0x80c));
+	printf("wifi: s1:   ltssm says %#x %s after a further 700 ms; parf says %#x (state %#x); the link's own "
+	    "status %#x (up %u, speed %u, width %u)\n", state,
+	    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)",
+	    rd(parf + CORVETTE_PARF_LTSSM_OFFSET), rd(parf + CORVETTE_PARF_LTSSM_OFFSET) & 0x3f, status,
+	    (status >> 13) & 1, status & 0xf, (status >> 4) & 0x3f);
+	{
+		uint32_t clkreq = 0x1000UL * CORVETTE_PIN_CLKREQ, level, i;
+
+		kiwi_s1_write("pin 95 clkreq: read as a gpio with a pull-up", clkreq,
+		    tlmm + clkreq, CORVETTE_PIN_CLKREQ_SLEEP);
+		/*
+		 * One sample said only "low" in air159 and air160; a timeline says whether the request ever
+		 * drops. CLKREQ# is released once the endpoint has a stable reference clock, so a run of
+		 * zeros across two hundred milliseconds means the radio never saw one.
+		 */
+		printf("wifi: s1:   clkreq over 200 ms at the end of the window:");
+		for (i = 0; i < 6; i++) {
+			level = rd(tlmm + clkreq + 4) & 1;
+			printf(" %u", level);
+			if (i != 5)
+				sleep_ms(40);
+		}
+		printf(" (0 = the radio is still asking for a clock)\n");
+		kiwi_s1_write("pin 95 clkreq: pcie0_clk_req_n", clkreq,
+		    tlmm + clkreq, CORVETTE_PIN_CLKREQ_N);
+	}
+	kiwi_s1_vendor_dump(parf, core);
+	/* Either one is enough to go on to the bus: a link the capability calls up is up, whatever a status
+	 * register that has never answered says. */
+	if (state != 0x11 && !(status & (1u << 13))) {
+		printf("wifi: s1:   the link is not up: parf ltssm state %#x %s, link status dllla %u. The seven "
+		    "RPMh rail commands completed, but their response words do not verify physical voltage. The "
+		    "radio has not answered link detection; external power and reference-clock delivery remain "
+		    "unverified.\n", state,
+		    kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)", (status >> 13) & 1);
+	}
+	return state == 0x11 || (status & (1u << 13)) != 0;
+}
+
+/*
+ * 2c/7: the link's own state machine (dt: reg-name pcie_sm, 0x1d07000).
+ *
+ * Where its program goes is not what the device tree's property names suggest. The vendor's own driver,
+ * drivers/pci/controller/pci-msm.c in OnePlus' kernel for this phone (msm_pcie_cesta_load_sm_seq), writes:
+ *
+ *	qcom,pcie-sm-seq         at pcie_sm + 0, + 4, + 8 ...             (not at the "start" offset)
+ *	qcom,pcie-sm-branch-seq  at pcie_sm + branch_offset + 4, + 8 ...  (0x1000, 0x1004 ...)
+ *	then sets BIT(0) of the register at qcom,pcie-sm-start-offset     (0x1090) -- that word is the run bit
+ *
+ * S1 wrote the thirteen words at 0x1090, which is why 0x1090 then read back 0x1 (the run bit, set by the
+ * first word's lowest bit) and the other twelve read 0: the program had been written into the run register
+ * and its neighbours. With the program at +0, the branches at +0x1000 and the run bit last, the state
+ * machine has what the vendor's driver gives it -- and the vendor loads it at probe time, long before the
+ * link is started.
+ */
+#define CORVETTE_SM_SEQ_OFFSET          0x0000          /* (pcie_sm + 4*i, from zero) */
+#define CORVETTE_SM_BRANCH_OFFSET       0x1000          /* dt: qcom,pcie-sm-branch-offset */
+#define CORVETTE_SM_START_OFFSET        0x1090          /* dt: qcom,pcie-sm-start-offset, bit 0 runs it */
+#define CORVETTE_SM_WORDS               13
+#define CORVETTE_SM_BRANCH_WORDS        7
+
+static void
+kiwi_s1_state_machine(void)
+{
+	static const uint32_t sequence[CORVETTE_SM_WORDS] = {
+		0x1c018081, 0x70074002, 0x50028000, 0x28007003, 0x80804002, 0x70021c01, 0x18001802,
+		0x70005000, 0x10004000, 0x80814002, 0x18001c01, 0x1c018080, 0x100
+	};
+	static const uint32_t branches[CORVETTE_SM_BRANCH_WORDS] = { 0x04, 0x1c, 0x24, 0x2c, 0x00, 0x00, 0x00 };
+	vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+	uint32_t before[CORVETTE_SM_WORDS], after[CORVETTE_SM_WORDS], run, same = 0;
+
+	printf("wifi: s1: 2c/7: the state machine at %#x: its program goes at +0, its branches at +%#x, and "
+	    "+%#x is the run bit\n", CORVETTE_PCIE0_SM, CORVETTE_SM_BRANCH_OFFSET, CORVETTE_SM_START_OFFSET);
+	for (unsigned i = 0; i < CORVETTE_SM_WORDS; i++) {
+		before[i] = rd(sm + CORVETTE_SM_SEQ_OFFSET + 4 * i);
+	}
+	printf("wifi: s1:   +0 before: %#x %#x %#x %#x %#x %#x %#x\n", before[0], before[1], before[2], before[3],
+	    before[4], before[5], before[6]);
+	printf("wifi: s1:   +0 before: %#x %#x %#x %#x %#x %#x, run bit %#x\n", before[7], before[8], before[9],
+	    before[10], before[11], before[12], rd(sm + CORVETTE_SM_START_OFFSET));
+
+	for (unsigned i = 0; i < CORVETTE_SM_WORDS; i++) {
+		kiwi_s1_write("state machine", CORVETTE_SM_SEQ_OFFSET + 4 * i, sm + CORVETTE_SM_SEQ_OFFSET + 4 * i,
+		    sequence[i]);
+	}
+	for (unsigned i = 0; i < CORVETTE_SM_BRANCH_WORDS; i++) {
+		kiwi_s1_write("state machine branch", CORVETTE_SM_BRANCH_OFFSET + 4 * i,
+		    sm + CORVETTE_SM_BRANCH_OFFSET + 4 * i, branches[i]);
+	}
+	for (unsigned i = 0; i < CORVETTE_SM_WORDS; i++) {
+		after[i] = rd(sm + CORVETTE_SM_SEQ_OFFSET + 4 * i);
+		if (after[i] == sequence[i]) {
+			same++;
+		}
+	}
+
+	/* The run bit last, as the vendor does: the machine is told to run only once its program is in. It is
+	 * taken down and up again even when it was already set, so that the edge is there whatever happened in
+	 * an earlier boot. */
+	run = rd(sm + CORVETTE_SM_START_OFFSET);
+	kiwi_s1_write("state machine: stop", CORVETTE_SM_START_OFFSET, sm + CORVETTE_SM_START_OFFSET, run & ~1u);
+	kiwi_s1_write("state machine: run", CORVETTE_SM_START_OFFSET, sm + CORVETTE_SM_START_OFFSET, run | 1);
+
+	printf("wifi: s1:   +0 after: %#x %#x %#x %#x %#x %#x %#x\n", after[0], after[1], after[2], after[3],
+	    after[4], after[5], after[6]);
+	printf("wifi: s1:   +0 after: %#x %#x %#x %#x %#x %#x\n", after[7], after[8], after[9], after[10],
+	    after[11], after[12]);
+	printf("wifi: s1:   2c/7: %u of %u program words read back as written, run bit now %#x\n", same,
+	    CORVETTE_SM_WORDS, rd(sm + CORVETTE_SM_START_OFFSET));
+}
+
+
+/*
+ * 5f/7: what actually powers this block.
+ *
+ * The phone's own bootargs say where it lives:
+ *
+ *	pci-msm-drv.pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,0x2
+ *
+ * -- base 0x1d07000, power control at +0x1040, its mask at +0x1048, one instance every 0x3000, two of
+ * them. drivers/pci/controller/pci-msm.c writes 1 into both registers of every instance when it loads,
+ * and the comment above that loop says why: "If the override is not done then CX Power Collapse won't
+ * happen". S1 has never written them, so this block has been running on nothing but what the CESTA state
+ * machine voted, and CESTA is told what to vote by the CRM block at 0x1d01000, which nothing here has
+ * spoken to either.
+ *
+ * Two questions, in this order, because the first decides what the second means:
+ *
+ *   - link disable, port link control bit 5. An LTSSM that is running leaves detect.quiet for DISABLED
+ *     within a millisecond of being told to; one that still reads 0 has no clock to run on. That is the
+ *     whole difference between "the link will not train" and "the link is not allowed to try".
+ *   - the override. Control then mask, as the vendor writes them, and the state sampled for 300 ms.
+ *
+ * Last, whether the power-up took 5c/7 and 5d/7 with it: if the core stops answering, its base addresses
+ * and its port are set again before 6/7 runs, so this run still ends with a link attempt. The CRM is read
+ * after all of that and before nothing at all -- it is the one window here that nobody has touched, and
+ * if it is the read that does not come back, everything above it is already in the log.
+ */
+#define CORVETTE_SM_PWR_CTRL            0x1040          /* (the vendor's override: force the power state) */
+#define CORVETTE_SM_PWR_MASK            0x1048
+#define CORVETTE_SM_INSTANCE            0x3000          /* (bootargs: 0x1D07000,0x1040,0x1048,0x3000,0x2) */
+#define CORVETTE_PCIE_CRM               0x1d01000       /* (dt: crm@1d01000, label pcie_crm) */
+/* dt: crm@1d01000 has four ranges -- "base" 0x1d01000, "crm_b" 0x1d04800, "crm_c" 0x1d05000, "crm_v" 0x1d04000.
+ * The votes go to "base" (DRV_BASE 0x200, resource stride 4, PWR_ST0..4 at 0x0/0x40/0x80/0x600/0x640); the status
+ * crm_read_curr_perf_ol() returns comes out of "crm_c", 0x4000 further on. */
+#define CORVETTE_PCIE_CRM_SIZE          0x6000          /* (0x1d01000 .. 0x1d07000, pcie_sm starts at the end) */
+#define CORVETTE_CRMC_AGGR_PERF_OL      0x4004          /* (crm_c + 0x04) */
+#define CORVETTE_CRMC_CURR_PERF_OL      0x400c          /* (crm_c + 0x0c) */
+#define CORVETTE_CRMC_SEQ_STATUS        0x41a0          /* (crm_c + 0x1a0) */
+
+static void
+kiwi_s1_power(vm_offset_t parf, vm_offset_t core, vm_offset_t elbi)
+{
+	vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+	vm_offset_t crm = corvette_s1_io_map(CORVETTE_PCIE_CRM, CORVETTE_PCIE_CRM_SIZE);
+	uint32_t capability = kiwi_s1_capability(core), control, state;
+
+	printf("wifi: s1: 5f/7: what powers this block: pcie_sm %#x + %#x (control), + %#x (mask), one "
+	    "instance every %#x\n", CORVETTE_PCIE0_SM, CORVETTE_SM_PWR_CTRL, CORVETTE_SM_PWR_MASK,
+	    CORVETTE_SM_INSTANCE);
+	printf("wifi: s1:   override now: instance 0 control %#x mask %#x; instance 1 control %#x mask %#x\n",
+	    rd(sm + CORVETTE_SM_PWR_CTRL), rd(sm + CORVETTE_SM_PWR_MASK),
+	    rd(sm + CORVETTE_SM_INSTANCE + CORVETTE_SM_PWR_CTRL),
+	    rd(sm + CORVETTE_SM_INSTANCE + CORVETTE_SM_PWR_MASK));
+
+	/* The one bit that says whether there is a clock under the state machine at all. */
+	if (capability != 0) {
+		control = rd(core + capability + 0x10);
+		/* The Link Disable bit is left alone. The vendor never writes DBI 0x80 at all -- its only writes
+		 * to the capability are LNKCTL2 (skipped: pcie0 has no qcom,target-link-speed) and DEVCAP (the max
+		 * read request size in link_train). S1 toggled this bit just to watch the state machine, which is
+		 * one more bit written that Android never writes. */
+		printf("wifi: s1:   link disable %u (left alone; the vendor never writes this word)\n",
+		    (control >> 5) & 1);
+	}
+
+	/*
+	 * Nothing is written to these two any more.
+	 *
+	 * The vendor touches them exactly twice in its whole life. pcie_init() writes 0x1 to both, per instance,
+	 * but only when the pci-msm-drv.pcie_sm_regs module parameter is on the command line. Then
+	 * msm_pcie_cesta_load_sm_seq() -- the function that programs the sequence 2c/7 has just loaded --
+	 * clears both to 0 as its very first act, before it writes a single instruction word. So by the time
+	 * Android enables a link the override is 0, and the bootloader leaves it at 0 as well: the line above
+	 * reads 0/0 for both instances on this phone.
+	 *
+	 * S1 wrote 2, which is neither of the vendor's two values and is not a bit any vendor path sets. With a
+	 * state machine that owns this block's power sequencing, an override bit nobody publishes is a good way
+	 * to have the hardware hold the PHY, or the reference clock, in a state no driver asked for.
+	 */
+	state = kiwi_s1_watch(elbi, 300);
+	printf("wifi: s1:   5f/7: the override left as the bootloader had it: state %#x %s, control %#x, mask %#x\n",
+	    state, kiwi_s1_ltssm_name(state) ? kiwi_s1_ltssm_name(state) : "(unnamed)",
+	    rd(sm + CORVETTE_SM_PWR_CTRL), rd(sm + CORVETTE_SM_PWR_MASK));
+
+	/* If the power-up reset the core, 5c/7 and 5d/7 are gone; put them back rather than lose the run. */
+	if (rd(core) == 0) {
+		printf("wifi: s1:   the power-up took the core's base addresses with it: setting them again\n");
+		kiwi_s1_dbi(parf, core);
+		kiwi_s1_port(core);
+	} else {
+		printf("wifi: s1:   the core still answers %#x, so 5c/7 held\n", rd(core));
+	}
+
+	printf("wifi: s1:   about to read the crm at %#x, which nothing has spoken to yet\n", CORVETTE_PCIE_CRM);
+	printf("wifi: s1:   crm: version %#x, parameters %#x %#x, enable %#x\n", rd(crm), rd(crm + 4), rd(crm + 8),
+	    rd(crm + 0xc));
+	printf("wifi: s1:   crm channel 0: busy %#x, update %#x, behave %#x; channel 1: %#x, %#x, %#x\n",
+	    rd(crm + 0x1000), rd(crm + 0x1020), rd(crm + 0x1040), rd(crm + 0x1004), rd(crm + 0x1024),
+	    rd(crm + 0x1044));
+}
+
+/*
+ * 2c/7: the pipe clock, and the vote CESTA is waiting for.
+ *
+ * Everything the core does after "train!" runs on the pipe clock, and the pipe clock is not one of the
+ * seven branches S1 voted: those are the wrapper's own clocks, and the core's pipe input comes from the
+ * PHY through a two-input mux in GCC --
+ *
+ *	gcc_pcie_0_pipe_clk_src: gcc 0x6b070, one bit, the PHY's clock on one side and the crystal on the other
+ *	gcc_pcie_0_pipe_clk:     gcc 0x52008 bit 4 (voted), with halt_reg 0x6b048 and BRANCH_HALT_SKIP,
+ *	                         which is why 2b/7 could not say anything about it
+ *	gcc_pcie_0_phy_rchng_clk_src: gcc 0x6b058, 100 MHz from gpll0, the PHY's rate-change clock
+ *
+ * A state machine clocked by the crystal instead of by the PHY sits in detect.quiet for ever: it has a
+ * clock, so it counts, but the clock is not the one the PCS hands it. So both values of that one bit are
+ * tried, and the log says which one, if either, lets the state move.
+ *
+ * Then the vote. The bootargs name the CESTA registers, and the CRM at 0x1d01000 is where the votes go:
+ * its parameters read back as two channels, five power states per channel, two resources, two hardware
+ * drivers -- that is the layout drivers/soc/qcom/crm.c describes, so the vote can be placed exactly:
+ *
+ *	h / w 0, channel 0: 0x200 + pwr_state offset + 4 * resource     (pwr_state offsets 0, 0x40, 0x80,
+ *	h / w 0, channel 0: 0x600, 0x640 for the last two)
+ *	then 0x1020 = BIT(0) to switch the channel in, and 0x1000 bit 0 to say it took.
+ *
+ * The two states that are used are PERF_LVL_GEN1, the level msm_pcie_cesta_map_save() puts D0 at, and the
+ * channel is switched in only after every word is in -- a half-written channel is a channel CESTA may
+ * act on.
+ */
+#define CORVETTE_GCC_PIPE_SRC           0x6b070         /* (gcc-pineapple parent map 7: 0=PHY PIPE, 2=BI_TCXO) */
+static uint32_t corvette_s1_pipe_src_original;
+static bool corvette_s1_pipe_src_changed;
+#define CORVETTE_GCC_PIPE_HALT          0x6b048
+#define CORVETTE_GCC_AUX_RCG            0x6b074
+#define CORVETTE_GCC_RCHNG_RCG          0x6b058
+#define CORVETTE_CRM_DRV0               0x200           /* (dt bootargs: pcie_sm_regs places the sm; the crm is its own block) */
+#define CORVETTE_CRM_CHN_BUSY           0x1000
+#define CORVETTE_CRM_CHN_UPDATE         0x1020
+#define CORVETTE_CRM_RESOURCES          2
+#define CORVETTE_CRM_PWR_STATES         5
+#define CORVETTE_CRM_PERF_GEN3          4               /* (PERF_LVL_GEN3: the vendor adds PERF_LVL_L1SS to the
+                                                         *   highest speed the port can do, and qcom,bw-scale has
+                                                         *   three entries, so Gen3 -> 3 + 1 = 4) */
+
+static const uint32_t corvette_crm_pwr_state[] = { 0x000, 0x040, 0x080, 0x600, 0x640 };
+
+static void
+kiwi_s1_cesta_d0(vm_offset_t gcc)
+{
+	vm_offset_t crm = corvette_s1_io_map(CORVETTE_PCIE_CRM, CORVETTE_PCIE_CRM_SIZE);
+
+	/* Match msm_pcie_enable(): apply D0 immediately after loading CESTA, before core/PHY reset. */
+	printf("wifi: s1: 2c/7: CESTA D0 vote; PIPE selector %#x, branch vote %#x\n",
+	    rd(gcc + CORVETTE_GCC_PIPE_SRC) & 3, rd(gcc + 0x52008) & (1u << 4));
+
+	/*
+	 * Last, the vote CESTA reads. pcie_crm_desc.set_chn_behave is false, so the channel behaves by itself
+	 * and CHN_BEHAVE stays 0 -- that part of the earlier read was normal. Five power states, two
+	 * resources, channel 0, and the channel is switched in only once every word is in it.
+	 */
+	printf("wifi: s1:   about to vote D0 through the crm at %#x: five states, two resources, channel 0\n",
+	    CORVETTE_PCIE_CRM);
+	/*
+	 * The vendor's own vote: drivers/pci/controller/pci-msm.c's msm_pcie_cesta_map_apply() writes the
+	 * D0 map to MAX_POWER_STATE (two) power states of one resource -- the resource being the controller
+	 * index -- and the value in the map is the performance level the port is to be scaled to. Everything
+	 * else in the cache stays at zero, and the flush writes those zeros out too.
+	 */
+	for (unsigned i = 0; i < CORVETTE_CRM_PWR_STATES; i++) {
+		for (unsigned j = 0; j < CORVETTE_CRM_RESOURCES; j++) {
+			vm_offset_t at = crm + CORVETTE_CRM_DRV0 + corvette_crm_pwr_state[i] + 4 * j;
+			uint32_t value = (j == 0 && i < 2) ? CORVETTE_CRM_PERF_GEN3 : 0;
+
+			kiwi_s1_write("crm vote", CORVETTE_CRM_DRV0 + corvette_crm_pwr_state[i] + 4 * j, at, value);
+		}
+	}
+	/*
+	 * The CRM's own view of the level, before the vote. crm.c: CRMC's CURR_PERF_OL is at 0x0c and
+	 * AGGR_PERF_OL at 0x04, one resource every 0x200 -- and msm_pcie_cesta_curr_perf_ol() in pci-msm.c
+	 * prints exactly this value by name ("Current perf ol is Gen3 speed") on the working phone. The word
+	 * S1 used to read at 0x1c0 is PERF_OL_STATUS, which crm.c defines as IRQ_STATUS: it reads 0 because
+	 * nothing faulted, and it says nothing about whether the vote landed.
+	 */
+	printf("wifi: s1:   crm before the vote: aggr perf ol %#x, curr perf ol %#x, seq status %#x "
+	    "(0 D3COLD, 1 L1SS, 2 Gen1, 3 Gen2, 4 Gen3; read from crm_c at %#x)\n",
+	    rd(crm + CORVETTE_CRMC_AGGR_PERF_OL), rd(crm + CORVETTE_CRMC_CURR_PERF_OL),
+	    rd(crm + CORVETTE_CRMC_SEQ_STATUS), CORVETTE_PCIE_CRM + 0x4000);
+	kiwi_s1_write("crm: channel 0 switched in", CORVETTE_CRM_CHN_UPDATE, crm + CORVETTE_CRM_CHN_UPDATE, 1);
+	for (unsigned i = 0; i < 100 && !(rd(crm + CORVETTE_CRM_CHN_BUSY) & 1); i++) {
+		sleep_ms(1);
+	}
+	printf("wifi: s1:   2c/7: after the vote: busy %#x, update %#x, aggr perf ol %#x, curr perf ol %#x, "
+	    "seq status %#x\n", rd(crm + CORVETTE_CRM_CHN_BUSY), rd(crm + CORVETTE_CRM_CHN_UPDATE),
+	    rd(crm + CORVETTE_CRMC_AGGR_PERF_OL), rd(crm + CORVETTE_CRMC_CURR_PERF_OL),
+	    rd(crm + CORVETTE_CRMC_SEQ_STATUS));
+	if ((rd(crm + CORVETTE_CRMC_CURR_PERF_OL) & 0xff) != CORVETTE_CRM_PERF_GEN3) {
+		printf("wifi: s1:   the crm's current level is %u, the vote asked for %u\n",
+		    rd(crm + CORVETTE_CRMC_CURR_PERF_OL) & 0xff, CORVETTE_CRM_PERF_GEN3);
+	} else {
+		printf("wifi: s1:   the crm is at the level the vote asked for: Gen3\n");
+	}
+}
+
+static const uint32_t corvette_iatu_regs[7] = {
+	CORVETTE_IATU_CTRL1, CORVETTE_IATU_CTRL2, CORVETTE_IATU_LBAR,
+	CORVETTE_IATU_UBAR, CORVETTE_IATU_LAR, CORVETTE_IATU_LTAR,
+	CORVETTE_IATU_UTAR,
+};
+
+static void
+corvette_s2_iatu_restore(vm_offset_t iatu)
+{
+	if (!corvette_s2_iatu_saved_valid) {
+		return;
+	}
+	for (int region = 1; region >= 0; region--) {
+		vm_offset_t at = iatu + (uint32_t)region * CORVETTE_PCIE_IATU_REGION_STRIDE;
+		wr(at + CORVETTE_IATU_CTRL2, 0);
+		for (int reg = 6; reg >= 2; reg--) {
+			wr(at + corvette_iatu_regs[reg], corvette_s2_iatu_saved[region][reg]);
+		}
+		wr(at + CORVETTE_IATU_CTRL1, corvette_s2_iatu_saved[region][0]);
+		wr(at + CORVETTE_IATU_CTRL2, corvette_s2_iatu_saved[region][1]);
+	}
+	__asm__ volatile ("dsb sy");
+	corvette_s2_iatu_saved_valid = false;
+	printf("wifi: s2: both outbound iATU regions restored to their entry values\n");
+}
+
+static bool
+corvette_s2_iatu_program(vm_offset_t iatu, unsigned region, uint32_t type,
+    uint32_t host, uint32_t limit, uint32_t target)
+{
+	vm_offset_t at = iatu + region * CORVETTE_PCIE_IATU_REGION_STRIDE;
+	uint32_t values[7] = { type, CORVETTE_IATU_ENABLE, host, 0, limit, target, 0 };
+
+	wr(at + CORVETTE_IATU_CTRL2, 0);
+	for (unsigned reg = 0; reg < 7; reg++) {
+		if (reg == 1) {
+			continue;
+		}
+		wr(at + corvette_iatu_regs[reg], values[reg]);
+	}
+	__asm__ volatile ("dsb sy");
+	wr(at + CORVETTE_IATU_CTRL2, CORVETTE_IATU_ENABLE);
+	__asm__ volatile ("dsb sy");
+	for (unsigned reg = 0; reg < 7; reg++) {
+		uint32_t actual = rd(at + corvette_iatu_regs[reg]);
+		printf("wifi: s2:   iATU region %u reg +%#x = %#x (wanted %#x)\n", region,
+		    corvette_iatu_regs[reg], actual, values[reg]);
+		if (actual != values[reg]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * S2 uses the vendor's outbound CFG0 translation for bus 1, followed by the DT-declared
+ * identity MEM32 aperture. BAR reads are allowed only when the endpoint already reports a
+ * 32-bit BAR inside that aperture. The firmware's original iATU state is restored by S1 cleanup.
+ */
+static bool
+kiwi_s2_iatu(vm_offset_t core)
+{
+	vm_offset_t iatu = core + 0x1000;
+	vm_offset_t conf = corvette_s1_io_map(CORVETTE_PCIE0_ECAM, 0x1000);
+	uint32_t endpoint, class, bar0, mem_value;
+	const uint32_t addresses[2][7] = {
+		{ CORVETTE_IATU_CTRL1, CORVETTE_IATU_CTRL2, CORVETTE_IATU_LBAR,
+		  CORVETTE_IATU_UBAR, CORVETTE_IATU_LAR, CORVETTE_IATU_LTAR, CORVETTE_IATU_UTAR },
+		{ CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_CTRL1,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_CTRL2,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_LBAR,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_UBAR,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_LAR,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_LTAR,
+		  CORVETTE_PCIE_IATU_REGION_STRIDE + CORVETTE_IATU_UTAR },
+	};
+
+	printf("wifi: s2: save the two outbound iATU regions before programming vendor CFG0 and DT MEM32 windows\n");
+	for (unsigned region = 0; region < 2; region++) {
+		for (unsigned reg = 0; reg < 7; reg++) {
+			corvette_s2_iatu_saved[region][reg] = rd(iatu + addresses[region][reg]);
+			printf("wifi: s2:   saved region %u reg +%#x = %#x\n", region, addresses[region][reg],
+			    corvette_s2_iatu_saved[region][reg]);
+		}
+	}
+	corvette_s2_iatu_saved_valid = true;
+
+	if (!corvette_s2_iatu_program(iatu, 0, CORVETTE_IATU_CFG0,
+	    CORVETTE_PCIE0_ECAM, CORVETTE_PCIE0_ECAM + 0xfff, CORVETTE_CFG0_BUS1_DEV0)) {
+		printf("wifi: s2: CFG0 iATU region did not read back; endpoint config is not accessed\n");
+		return false;
+	}
+	if (!corvette_s2_iatu_program(iatu, 1, CORVETTE_IATU_MEM,
+	    CORVETTE_PCIE0_MEM32, CORVETTE_PCIE0_MEM32 + CORVETTE_PCIE0_MEM32_SIZE - 1,
+	    CORVETTE_PCIE0_MEM32)) {
+		printf("wifi: s2: MEM32 iATU region did not read back; endpoint config is not accessed\n");
+		return false;
+	}
+
+	printf("wifi: s2: CFG0 window at %#x now targets bus 1/device 0; about to read endpoint identity\n",
+	    CORVETTE_PCIE0_ECAM);
+	endpoint = rd(conf);
+	class = rd(conf + 8);
+	bar0 = rd(conf + 0x10);
+	printf("wifi: s2: endpoint id %#x (vendor %#x device %#x), class/revision %#x, BAR0 %#x\n",
+	    endpoint, endpoint & 0xffff, endpoint >> 16, class, bar0);
+	if (endpoint == 0xffffffff || (endpoint & 0xffff) != 0x17cb || (endpoint >> 16) != 0x1107) {
+		printf("wifi: s2: endpoint identity mismatch; do not access MEM32 aperture\n");
+		return false;
+	}
+
+	if (bar0 == 0 || bar0 == 0xffffffff || (bar0 & 1) || (bar0 & 6) != 0) {
+		printf("wifi: s2: BAR0 is unset, IO, or 64-bit; skip endpoint MMIO read\n");
+		return true;
+	}
+	bar0 &= ~0xfu;
+	if (bar0 < CORVETTE_PCIE0_MEM32 || bar0 > CORVETTE_PCIE0_MEM32 + CORVETTE_PCIE0_MEM32_SIZE - 4) {
+		printf("wifi: s2: BAR0 %#x is outside the DT MEM32 aperture; skip endpoint MMIO read\n", bar0);
+		return true;
+	}
+	{
+		vm_offset_t bar = corvette_s1_io_map(bar0 & ~0xfffu, 0x1000);
+		mem_value = rd(bar + (bar0 & 0xfff));
+		printf("wifi: s2: BAR0 first dword at %#x = %#x\n", bar0, mem_value);
+	}
+	return true;
+}
+
+/* 7/7: the two devices behind the link, through ECAM. Reached only with the link at L0: before that these
+ * addresses do not answer, and the kernel that waits for an answer is not the one that comes back. */
+static void
+kiwi_s1_bus(void)
+{
+	/* air206: bus 0 rides the same 1 MiB window 5/7 mapped (cache hit); bus 1 device 0 gets its
+	 * own 4 KiB window instead of the 2 MiB one that blew the 8 MiB I/O submap after the link
+	 * came up (air205's panic: kmem_alloc 0x200000, KERN_NO_SPACE). */
+	vm_offset_t ecam = corvette_s1_io_map(CORVETTE_PCIE0_ECAM, 0x100000);      /* (bus 0 only) */
+	vm_offset_t radio_cfg = corvette_s1_io_map(CORVETTE_PCIE0_ECAM + 0x100000, 0x1000);
+	uint32_t root, root_class, root_header;
+
+	/* Said before the first read: if ECAM is not answering yet, this is the line the log ends on. */
+	printf("wifi: s1: 7/7: ECAM %#x: about to read bus 0's config space\n", CORVETTE_PCIE0_ECAM);
+	root = rd(ecam);
+	root_class = rd(ecam + 8);
+	root_header = rd(ecam + 0x0c);
+	uint32_t capability = rd(ecam + 0x34) & 0xfc, link = 0;
+
+	if (capability >= 0x40 && capability <= 0xfc) {
+		link = rd(ecam + capability + 0x10) >> 16;      /* (the same sixteen-bit register: link control, then status) */
+	}
+	printf("wifi: s1: 7/7: ECAM %#x: bus 0 %04x:%04x (expected 17cb:0113), class/revision %#x, header %#x\n",
+	    CORVETTE_PCIE0_ECAM, root & 0xffff, root >> 16, root_class, root_header >> 16);
+	printf("wifi: s1:   bus 0's link status %#x: up %u, speed %u, width %u\n", link, (link >> 13) & 1, link & 0xf,
+	    (link >> 4) & 0x3f);
+	printf("wifi: s1:   %s\n", (root & 0xffff) == 0x17cb && (root >> 16) == 0x0113 ? "the root complex answers" :
+	    "the root complex does not answer as expected");
+
+	/* Bus 1 last, and only after bus 0 has said its piece: if this read is the one that does not come back,
+	 * everything above it is already in the log. */
+	printf("wifi: s1:   bus 1, %#x: about to read the radio's config space\n", CORVETTE_PCIE0_ECAM + 0x100000);
+	{
+		uint32_t radio = rd(radio_cfg), radio_class = rd(radio_cfg + 8), bar = rd(radio_cfg + 0x10);
+
+		printf("wifi: s1:   bus 1 %04x:%04x (expected 17cb:1107), class/revision %#x, bar0 %#x\n", radio & 0xffff,
+		    radio >> 16, radio_class, bar);
+		printf("wifi: s1:   %s\n", (radio & 0xffff) == 0x17cb && (radio >> 16) == 0x1107 ? "THE RADIO ANSWERS" :
+		    "the radio does not answer: bus 1 is not its config space yet");
+	}
+}
+
+/*
+ * The way back.
+ *
+ * "fastboot oem stop" does not reset this SoC: xnuloader flags the kernel, the kernel returns through its
+ * stub, and everything the kernel left behind is still there -- clocks, power domains, the sequencer, the
+ * PHY. That was harmless while S1 only read; now it writes, and a second run that starts from a
+ * half-configured PCIe block reads a window with no clock under it, which on this NoC aborts instead of
+ * returning zero. That is the 900E that stop-then-stage started to produce.
+ *
+ * So everything this step changes is put back, in the reverse order it was changed: the pipe clock to the
+ * crystal, the pcie_sm override withdrawn, the CRM channel given back, the sequencer's TCSs left as they
+ * were found, and the PHY back under reset and out of power. Nothing is collapsed and no rail is given
+ * back: the power domains were up when S1 arrived, and they stay up.
+ */
+static void
+kiwi_s1_clean(void)
+{
+	vm_offset_t gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+	vm_offset_t sm = corvette_s1_io_map(CORVETTE_PCIE0_SM, CORVETTE_PCIE0_SM_SIZE);
+	vm_offset_t crm = corvette_s1_io_map(CORVETTE_PCIE_CRM, CORVETTE_PCIE_CRM_SIZE);
+	vm_offset_t parf = corvette_s1_io_map(CORVETTE_PCIE0_PARF, CORVETTE_PCIE0_PARF_SIZE);
+	vm_offset_t phy = parf + CORVETTE_PCIE0_PHY_AT;
+	vm_offset_t seq = corvette_s1_io_map(CORVETTE_RSC_PHYS, 0x10000);
+
+	printf("wifi: s1: clean: putting back what this step changed, so that a stop and a new run start level\n");
+	if (corvette_s1_pipe_src_changed) {
+		kiwi_s1_write("pipe source: restore entry selector", CORVETTE_GCC_PIPE_SRC,
+		    gcc + CORVETTE_GCC_PIPE_SRC, corvette_s1_pipe_src_original);
+		corvette_s1_pipe_src_changed = false;
+	}
+	kiwi_s1_write("pcie_sm +0x1040: override withdrawn", CORVETTE_SM_PWR_CTRL, sm + CORVETTE_SM_PWR_CTRL, 0);
+	kiwi_s1_write("pcie_sm +0x1048: its mask withdrawn", CORVETTE_SM_PWR_MASK, sm + CORVETTE_SM_PWR_MASK, 0);
+	kiwi_s1_write("crm: channel 0 given back", CORVETTE_CRM_CHN_UPDATE, crm + CORVETTE_CRM_CHN_UPDATE, 0);
+	{
+		const struct kiwi_tcs *t = kiwi_s1_tcs_layout(seq);
+
+		for (uint32_t tcs = 0; tcs < 2; tcs++) {
+			vm_offset_t at = seq + 0xd00 + 672 * tcs;
+
+			wr(seq + 0xd00 + 0x08, 1u << tcs);
+			wr(at + t->control, 0);
+			wr(at + t->enable, 0);
+		}
+		printf("wifi: s1:   tcs 0: control %#x, enabled %#x; tcs 1: control %#x, enabled %#x\n",
+		    rd(seq + 0xd00 + t->control), rd(seq + 0xd00 + t->enable),
+		    rd(seq + 0xd00 + 672 + t->control), rd(seq + 0xd00 + 672 + t->enable));
+	}
+	kiwi_s1_write("phy 0x240: powered, as it was found", 0x240, phy + 0x240, 3);
+	kiwi_s1_write("phy 0x200: reset off, as it was found", 0x200, phy + 0x200, rd(phy + 0x200) & ~1u);
+
+	/*
+	 * And the core's own configuration, which is what a second run trips over. Once 5c/7 writes the DBI's
+	 * base (0x60000000) and 5b/7 makes it a root complex, the core decodes that window for real; on the
+	 * next boot, with the PHY never having come up, that window answers with an abort instead of the zero
+	 * it answers on a clean machine -- which is a 900E at whichever point the run first touches it, well
+	 * before any of the PCIe work. Taking the addresses back leaves the core as the boot loader left it:
+	 * not decoding anything, so a read of 0x60000000 returns zero again.
+	 */
+	if (corvette_s2_iatu_saved_valid) {
+		corvette_s2_iatu_restore(corvette_s1_io_map(CORVETTE_PCIE0_CORE, 0x10000) + 0x1000);
+	}
+	kiwi_s1_write("parf dbi base v2: given back", 0x350, parf + 0x350, 0);
+	kiwi_s1_write("parf dbi base v2 hi", 0x354, parf + 0x354, 0);
+	kiwi_s1_write("parf atu base: as it was", 0x634, parf + 0x634, 0x1000);
+	kiwi_s1_write("parf atu base hi", 0x638, parf + 0x638, 0);
+	kiwi_s1_write("parf slv size v2: as it was", 0x358, parf + 0x358, 0x1000000);
+	kiwi_s1_write("parf slv size v2 hi", 0x35c, parf + 0x35c, 0);
+	kiwi_s1_write("parf device type: nothing", CORVETTE_PARF_DEVICE_TYPE_OFF, parf + CORVETTE_PARF_DEVICE_TYPE_OFF,
+	    0);
+	kiwi_s1_write("parf mhi clock/reset: as it was", CORVETTE_PARF_MHI_CLOCK_RESET,
+	    parf + CORVETTE_PARF_MHI_CLOCK_RESET, 3);
+	kiwi_s1_write("parf ltssm: off", CORVETTE_PARF_LTSSM_OFFSET, parf + CORVETTE_PARF_LTSSM_OFFSET, 0);
+	kiwi_s1_write("parf clkreq: its input back", 0x2b0, parf + 0x2b0, 0);
+	printf("wifi: s1:   the core's windows are given back: dbi base %#x, atu base %#x, device type %#x\n",
+	    rd(parf + 0x350), rd(parf + 0x634), rd(parf + CORVETTE_PARF_DEVICE_TYPE_OFF));
+	printf("wifi: s1:   clean: the machine is as S1 found it\n");
+}
+
+static void
+kiwi_s1(bool probe_iatu)
+{
+	const char *stopped = NULL;
+	vm_offset_t gcc, tlmm, parf, core;
+
+	printf("wifi: s1: corvette: PCIe0 on, one write at a time; each write prints what it overwrote and reads back\n");
+	gcc = corvette_s1_io_map(CORVETTE_GCC_PHYS, CORVETTE_GCC_SIZE);
+	tlmm = corvette_s1_io_map(CORVETTE_TLMM_PHYS, CORVETTE_TLMM_SIZE);
+	parf = corvette_s1_io_map(CORVETTE_PCIE0_PARF, CORVETTE_PCIE0_PARF_SIZE);
+	core = corvette_s1_io_map(CORVETTE_PCIE0_CORE, 0x10000);         /* (of it, only the ELBI at 0xf20 is read before L0) */
+
+	/* CNSS powers the radio before msm_pcie_enable() starts the host controller. */
+	printf("wifi: s1: CNSS order: hold PERST, enable radio rails and WLAN_EN, then initialize PCIe host\n");
+	kiwi_s1_pins(tlmm);
+	kiwi_s1_radio(parf, tlmm);
+
+	kiwi_s1_clocks(gcc);                                    /* (its halt bits prove nothing yet: 2b/7 repeats them) */
+	if (!kiwi_s1_gdsc("pcie_0_gdsc", gcc, CORVETTE_PCIE0_GDSCR, 0)) {
+		stopped = "2/7 pcie_0_gdsc will not come up out of collapse";
+	} else if (!kiwi_s1_gdsc("pcie_0_phy_gdsc", gcc, CORVETTE_PCIE0_PHY_GDSCR, 3)) {
+		stopped = "2/7 pcie_0_phy_gdsc will not come up out of collapse";
+	}
+	if (stopped == NULL) {
+		uint32_t source = rd(gcc + CORVETTE_GCC_PIPE_SRC);
+		/*
+		 * Air184: the selector is left where the boot firmware put it (PHY PIPE, 0).
+		 *
+		 * Air179 forced BI_TCXO here to answer one question -- is the core clocked at all -- and air180
+		 * to air183 trained with the crystal, where a pipe interface does not exist at all. Air183
+		 * settled it the other way: with the mux on PHY PIPE and the PHY's rails voted, all eight
+		 * reference-clock combinations move the state to detect.active in 9 ms. So the crystal is no
+		 * longer needed, and the link is trained the way the phone trains it.
+		 */
+		corvette_s1_pipe_src_original = source;
+		corvette_s1_pipe_src_changed = false;
+		printf("wifi: s1: 2/7 post-GDSC PIPE selector %#x (SM8650: 0=PHY PIPE, 2=BI_TCXO), left alone\n",
+		    source & 3);
+		kiwi_s1_clocks_again(gcc);
+		/*
+		 * Air187: the SerDes' lock bits, read before anything writes to the PHY.
+		 *
+		 * The stock phone reads 0xa00 = 0x13 and 0x1200 = 0x13 both while the link is carrying
+		 * traffic and after it was suspended, so bits 0 and 1 there are not a product of L0: they
+		 * are the reference clock / PLL lock. Every run of ours reads 0x10 with bit 0 and bit 1
+		 * clear, which means the PHY's analogue side never started. This print decides which of the
+		 * two it is: 0x13 here means the boot loader left a locked SerDes and the reset below is
+		 * what loses it; 0x10 means the PHY never had a clock to lock to.
+		 */
+		{
+			vm_offset_t early_phy = parf + CORVETTE_PCIE0_PHY_AT;
+			static const uint32_t early[] = { 0xa00, 0x1200, 0x1d0, 0x1d4, 0x214, 0x1420 };
+
+			printf("wifi: s1: 2b/7: the SerDes as the boot loader left it, before any PHY write:\n");
+			for (unsigned i = 0; i < sizeof(early) / sizeof(early[0]); i++) {
+				printf("wifi: s1:   +%#05x = %#x\n", early[i], rd(early_phy + early[i]));
+			}
+		}
+		/* Match pci-msm.c: load CESTA and vote D0 before resetting core/PHY. The mainline path
+		 * never loads or starts the sequencer (shennong runs the same silicon without it). */
+		if (!hakios_wifi_option("pcie_mainline")) {
+			kiwi_s1_state_machine();
+			kiwi_s1_cesta_d0(gcc);
+		}
+		kiwi_s1_resets(gcc);
+		if (!kiwi_s1_phy(parf)) {
+			stopped = "5/7 the PHY's ready bit did not come up after its own sequence";
+		} else if ((kiwi_s1_phy_deep(gcc, parf), kiwi_s1_rpmh(), kiwi_s1_rails(gcc, parf), kiwi_s1_pmic(),
+		    !kiwi_s1_core(parf))) {
+			stopped = "5b/7 the core does not take its own configuration (PARF writes do not stick)";
+		} else {
+			kiwi_s1_dbi(parf, core);        /* (5c/7: says whether the core answers, and sets its base addresses) */
+			kiwi_s1_port(core);             /* (5d/7: the port's own configuration: lanes, bus, class) */
+			kiwi_s1_power(parf, core, core + (CORVETTE_PCIE0_ELBI - CORVETTE_PCIE0_CORE));  /* (5f/7: what powers it) */
+			if (hakios_wifi_option("pcie_mainline")) {
+				if (!kiwi_s1_mainline_port(parf, core, tlmm, gcc)) {
+					stopped = "6m/7 the mainline bring-up's link training did not reach L0";
+				}
+			} else if (hakios_wifi_option("pcie_vendor_port")) {
+				if (!kiwi_s1_vendor_port(parf, core, tlmm, gcc)) {
+					stopped = "6/7 the vendor port's link training did not reach L0";
+				}
+			} else if (!kiwi_s1_link(parf, core, tlmm)) {
+				stopped = "6/7 link training did not reach L0";
+			}
+		}
+	}
+	if (stopped != NULL) {
+		printf("wifi: s1: STOPPED at %s. The steps after it are not attempted, and nothing below the "
+		    "controller was read\n", stopped);
+		kiwi_s1_clean();
+		return;
+	}
+	if (probe_iatu) {
+		(void)kiwi_s2_iatu(core);
+	} else if (hakios_wifi_option("pcie_mainline")) {
+		/* the mainline port read the radio itself, through its CFG0 iATU region */
+	} else {
+		kiwi_s1_bus();
+	}
+	printf("wifi: s1: done: PCIe0 link reached L0\n");
+	kiwi_s1_clean();
+}
+
 /*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see hakios_adreno_init()); with wifi=1 it does not.
  */
+extern void shennong_wlan_init(void);   /* (shennong_wlan.c, selected by pcie_mainline=1) */
+
 void
 hakios_wifi_init(void)
 {
-	uint32_t on = 0, back = 0, done = 0;
+	uint32_t on = 0, back = 0, done = 0, s0 = 0, s1 = 0, s2 = 0;
+
+	/* air207b: with pcie_mainline=1 the whole bring-up and the radio driver are shennong's
+	 * (shennong_wlan.c, the working Xiaomi 14 Pro port for this SoC and radio); our diagnostic
+	 * flow stays behind for wifi_s1 without the flag. */
+	if (hakios_wifi_option("pcie_mainline")) {
+		/*
+		 * (air222) the interface before the system starts: wifid opens the Wi-Fi interface once,
+		 * at its own start, and a radio that turns up twelve seconds later is one it has
+		 * already failed to open.  wifi_mac gives the address to make en0 with; the driver
+		 * takes it over when the radio is up.
+		 */
+		hakios_lx_net_early();
+		{ extern bool lx_os_radio_piece(unsigned long size);
+		  /* air229: the firmware's own QMI ask is a 6.94 MB and an 8.06 MB piece, or, when
+		   * those cannot be had, some 15.2 MB of half-megabyte chunks; the 48 MB pool (20 of
+		   * rings, 28 of buffers) and the big pieces all come out of this reserve (air228:
+		   * at 32 MB the second big piece failed and the chunks died at the 12 MB ceiling). */
+		  if (!lx_os_radio_piece(96UL << 20)) {
+			  if (!lx_os_radio_piece(48UL << 20)) {
+				  lx_os_radio_piece(32UL << 20);
+			  }
+		  } }
+		shennong_wlan_init();
+		return;
+	}
 	uint64_t size = 0;
 	thread_t thread;
 
+	/* corvette: the first look at its radio, which shares nothing with the steps below */
+	if (PE_parse_boot_argn("wifi_s0", &s0, sizeof(s0)) && s0) {
+		kiwi_s0();
+		return;
+	}
+	/* ... and the step after it: PCIe0 itself, powered and read back, with nothing of the radio's touched */
+	if (PE_parse_boot_argn("wifi_s2", &s2, sizeof(s2)) && s2) {
+		kiwi_s1(true);
+		return;
+	}
+	if (PE_parse_boot_argn("wifi_s1", &s1, sizeof(s1)) && s1) {
+		kiwi_s1(false);
+		return;
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

@@ -1,6 +1,6 @@
 /*
  * The whole of what the Wi-Fi driver's object asks of the kernel it is linked into. That object
- * (tools/mk-ath11k.sh in the repository: Linux's ath11k on FreeBSD's LinuxKPI headers and our
+ * (tools/mk-ath11k.sh or tools/mk-ath12k.sh in the repository: Linux's ath11k on FreeBSD's LinuxKPI headers and our
  * wifi/lx) is compiled as FreeBSD kernel code, bsd/dev/hakios.lx.c on this side as XNU's;
  * neither sees the other's headers, so nothing but C's own types crosses (and the station
  * boundary's, hakios.sta.h, which is written for both). Everything the
@@ -24,8 +24,17 @@ void	 lx_os_free(void *memory, unsigned long size);
  * side writes the other sees at once: the processor's cache is not in between, which makes
  * reading it slow. NULL when there is none; never given back.
  */
+bool	 lx_os_radio_piece(unsigned long size);	/* keep a piece for the radio, early */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
+/*
+ * Memory of the kernel's heap (the driver's kmalloc()) shown to the radio where it is, as Linux's
+ * dma_map_single() does: written out of the processor's cache, behind addresses of the radio's
+ * own, which this returns (0: it is not in one physical piece, or no addresses are left). For
+ * what the driver hands over once and leaves to the radio (ath12k's REO queue descriptors);
+ * never taken back.
+ */
+unsigned long long lx_os_radio_reach(const void *memory, unsigned long size);
 
 /* ---- saying things ---- */
 void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */
@@ -66,6 +75,7 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 
 /* ---- frames: the radio as what carries the machine's network interface ---- */
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
+void	 lx_os_net_say(void);					/* how sending went since the last word: to the log */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
 void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
 

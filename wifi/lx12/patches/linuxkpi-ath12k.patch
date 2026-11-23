@@ -1,0 +1,284 @@
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/ieee80211.h b/sys/compat/linuxkpi/common/include/linux/ieee80211.h
+--- a/sys/compat/linuxkpi/common/include/linux/ieee80211.h	2026-11-01 09:49:01.070303483 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/ieee80211.h	2026-11-01 09:52:01.069238719 +0000
+@@ -289,6 +289,7 @@
+ #define	WLAN_EXT_CAPA10_OBSS_NARROW_BW_RU_TOLERANCE_SUPPORT	BIT(79 % 8)
+ 
+ #define	WLAN_EXT_CAPA11_EMA_SUPPORT				0x00	/* XXX TODO FIXME */
++#define	WLAN_EXT_CAPA11_BCN_PROTECT				BIT(84 % 8)	/* 802.11-2024, Table 9-153, bit 84 */
+ 
+ 
+ /* iwlwifi/mvm/utils:: for (ac = IEEE80211_AC_VO; ac <= IEEE80211_AC_VI; ac++) */
+@@ -518,6 +519,8 @@
+ /* 802.11-2020, Table 9-359-Block Ack Action field values */
+ enum ieee80211_back {
+ 	WLAN_ACTION_ADDBA_REQ		= 0,
++	WLAN_ACTION_ADDBA_RESP		= 1,
++	WLAN_ACTION_DELBA		= 2,
+ };
+ 
+ enum ieee80211_sa_query {
+@@ -607,6 +610,16 @@
+ 					/* Optional follows... */
+ 					uint8_t variable[0];
+ 				} __packed addba_req;
++				/* 802.11-2024, 9.6.4.3 ADDBA Response frame format */
++				struct {
++					uint8_t action_code;
++					uint8_t dialog_token;
++					uint16_t status;
++					uint16_t capab;
++					uint16_t timeout;
++					/* Optional follows... */
++					uint8_t variable[0];
++				} __packed addba_resp;
+ 				/* 802.11-2024, 9.6.13.3 Event Report frame format */
+ 				struct {
+ 					uint8_t wnm_action;
+@@ -636,6 +649,7 @@
+ } __packed;
+ 
+ #define	MHZ_TO_KHZ(_f)		((_f) * 1000)
++#define	KHZ_TO_MHZ(_f)		((_f) / 1000)
+ #define	DBI_TO_MBI(_g)		((_g) * 100)
+ #define	MBI_TO_DBI(_x)		((_x) / 100)
+ #define	DBM_TO_MBM(_g)		((_g) * 100)
+@@ -671,6 +685,7 @@
+ 	WLAN_EID_EXT_NON_INHERITANCE		= 56,
+ 	WLAN_EID_EXT_CHANSWITCH_ANN		= 60,
+ 	WLAN_EID_MULTIPLE_BSSID			= 71,	/* IEEE80211_ELEMID_MULTIBSSID */
++	WLAN_EID_NON_TX_BSSID_CAP		= 83,	/* 802.11-2024, 9.4.2.71 Nontransmitted BSSID Capability */
+ 	WLAN_EID_MULTI_BSSID_IDX		= 85,
+ 	WLAN_EID_EXT_CAPABILITY			= 127,
+ 	WLAN_EID_VHT_CAPABILITY			= 191,	/* IEEE80211_ELEMID_VHT_CAP */
+@@ -1380,4 +1395,35 @@
+                 return (u8 *)hdr + 24;
+ }
+ 
++/*
++ * 802.11be-2024 (wifi/lx12, for ath12k): what the EML Capabilities subfield of a multi-link
++ * element encodes, in microseconds (Tables 9-417i, 9-417j, 9-417m); 0 for what is reserved.
++ * The fields are taken by their bits here: the IEEE80211_EML_CAP_* masks above are placeholders.
++ */
++static inline uint32_t
++ieee80211_emlsr_pad_delay_in_us(uint16_t eml_cap)
++{
++	uint32_t code = (eml_cap >> 1) & 0x7;		/* B1-B3: EMLSR Padding Delay */
++
++	return (code == 0 || code > 4 ? 0 : 32u << (code - 1));
++}
++
++static inline uint32_t
++ieee80211_emlsr_trans_delay_in_us(uint16_t eml_cap)
++{
++	uint32_t code = (eml_cap >> 4) & 0x7;		/* B4-B6: EMLSR Transition Delay */
++
++	return (code == 0 || code > 5 ? 0 : 16u << (code - 1));
++}
++
++static inline uint32_t
++ieee80211_eml_trans_timeout_in_us(uint16_t eml_cap)
++{
++	uint32_t code = (eml_cap >> 11) & 0xf;		/* B11-B14: Transition Timeout */
++
++	return (code == 0 || code > 11 ? 0 : 128u << (code - 1));
++}
++
++#define	IEEE80211_EHT_OPER_MCS15_DISABLE		0x40	/* 802.11be-2024, 9.4.2.322, EHT Operation Parameters B6 */
++
+ #endif	/* _LINUXKPI_LINUX_IEEE80211_H */
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/list.h b/sys/compat/linuxkpi/common/include/linux/list.h
+--- a/sys/compat/linuxkpi/common/include/linux/list.h	2026-11-01 09:49:01.066219117 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/list.h	2026-11-01 09:52:01.073040181 +0000
+@@ -461,6 +461,22 @@
+ 		__list_cut_position(list, head, entry);
+ }
+ 
++/* (wifi/lx12) everything of head before entry onto list (which is made anew), entry staying in head */
++static inline void list_cut_before(struct list_head *list,
++		struct list_head *head, struct list_head *entry)
++{
++	if (head->next == entry) {
++		INIT_LIST_HEAD(list);
++		return;
++	}
++	list->next = head->next;
++	list->next->prev = list;
++	list->prev = entry->prev;
++	list->prev->next = list;
++	head->next = entry;
++	entry->prev = head;
++}
++
+ static inline int list_is_first(const struct list_head *list,
+ 				const struct list_head *head)
+ {
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/rcupdate.h b/sys/compat/linuxkpi/common/include/linux/rcupdate.h
+--- a/sys/compat/linuxkpi/common/include/linux/rcupdate.h	2026-11-01 09:49:01.069507042 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/rcupdate.h	2026-11-01 09:52:01.073453655 +0000
+@@ -77,6 +77,7 @@
+ 
+ #define	rcu_read_lock_held(void)					\
+ 	linux_rcu_read_lock_held(RCU_TYPE_REGULAR)
++#define	rcu_read_lock_any_held()	rcu_read_lock_held()	/* (wifi/lx12) */
+ 
+ #define	synchronize_rcu(void) do {	\
+ 	linux_synchronize_rcu(RCU_TYPE_REGULAR);	\
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/skbuff.h b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+--- a/sys/compat/linuxkpi/common/include/linux/skbuff.h	2026-11-01 09:49:01.069867746 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/skbuff.h	2026-11-01 09:52:01.073293529 +0000
+@@ -1172,4 +1172,24 @@
+ #define	SKB_WITH_OVERHEAD(_s)						\
+ 	(_s) - ALIGN(sizeof(struct skb_shared_info), CACHE_LINE_SIZE)
+ 
++/*
++ * (wifi/lx12, for ath12k's dp_tx.c) room for tailbits more at the end of the data: the buffers
++ * here are linear, so it is there or it is not; the buffer that has the end is the buffer itself.
++ */
++static inline int
++skb_cow_data(struct sk_buff *skb, int tailbits, struct sk_buff **trailer)
++{
++	if (skb_tailroom(skb) < tailbits)
++		return (-ENOMEM);
++	*trailer = skb;
++	return (1);
++}
++
++static inline void *
++pskb_put(struct sk_buff *skb, struct sk_buff *tail, int len)
++{
++	(void)skb;
++	return (skb_put(tail, len));
++}
++
+ #endif	/* _LINUXKPI_LINUX_SKBUFF_H */
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/slab.h b/sys/compat/linuxkpi/common/include/linux/slab.h
+--- a/sys/compat/linuxkpi/common/include/linux/slab.h	2026-11-01 09:49:01.064341808 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/slab.h	2026-11-01 09:52:01.065522111 +0000
+@@ -170,7 +170,7 @@
+     kmalloc(sizeof(typeof(_p)), default_gfp(__VA_ARGS__))
+ 
+ #define	kmalloc_objs(_p, _n, ...)					\
+-    kmalloc(size_mul((_n) * sizeof(typeof(_p))), default_gfp(__VA_ARGS__))
++    kmalloc(size_mul((_n), sizeof(typeof(_p))), default_gfp(__VA_ARGS__))
+ 
+ static inline void *
+ krealloc(const void *ptr, size_t size, gfp_t flags)
+diff -ruN a/sys/compat/linuxkpi/common/include/linux/spinlock.h b/sys/compat/linuxkpi/common/include/linux/spinlock.h
+--- a/sys/compat/linuxkpi/common/include/linux/spinlock.h	2026-11-01 09:49:01.064914766 +0000
++++ b/sys/compat/linuxkpi/common/include/linux/spinlock.h	2026-11-01 09:52:01.073631714 +0000
+@@ -209,4 +209,9 @@
+     spin_unlock_irqrestore(_T->lock, _T->flags),
+     unsigned long flags)
+ 
++DEFINE_LOCK_GUARD_1(spinlock_bh,	/* (wifi/lx12, for ath12k) */
++    spinlock_t,
++    spin_lock_bh(_T->lock),
++    spin_unlock_bh(_T->lock))
++
+ #endif					/* _LINUXKPI_LINUX_SPINLOCK_H_ */
+diff -ruN a/sys/compat/linuxkpi/common/include/net/cfg80211.h b/sys/compat/linuxkpi/common/include/net/cfg80211.h
+--- a/sys/compat/linuxkpi/common/include/net/cfg80211.h	2026-11-01 09:49:01.071877718 +0000
++++ b/sys/compat/linuxkpi/common/include/net/cfg80211.h	2026-11-01 09:52:01.070709881 +0000
+@@ -194,6 +194,7 @@
+ 	uint8_t					he_gi;
+ 	uint8_t					he_ru_alloc;
+ 	uint8_t					eht_gi;
++	uint8_t					eht_ru_alloc;
+ };
+ 
+ struct ieee80211_rate {
+@@ -685,6 +686,19 @@
+ 	struct nl80211_sta_flag_update		sta_flags;
+ };
+ 
++/* (wifi/lx12, for ath12k) what is known of one link of a station: as much of station_info as a link has */
++struct link_station_info {
++	uint64_t				filled;		/* enum nl80211_sta_info */
++	uint64_t				rx_duration;
++	uint64_t				tx_duration;
++	uint32_t				tx_retries;
++	uint32_t				tx_failed;
++	int8_t					signal;
++	int8_t					signal_avg;
++	struct rate_info			txrate;
++	struct rate_info			rxrate;
++};
++
+ struct station_parameters {
+ 	/* XXX TODO */
+ 	int     sta_flags_mask, sta_flags_set;
+@@ -780,6 +794,7 @@
+ #define	IEEE80211_EHT_PHY_CAP4_EHT_MU_PPDU_4_EHT_LTF_08_GI	0x01
+ #define	IEEE80211_EHT_PHY_CAP4_PART_BW_DL_MU_MIMO		0x02
+ #define	IEEE80211_EHT_PHY_CAP4_POWER_BOOST_FACT_SUPP		0x03
++#define	IEEE80211_EHT_PHY_CAP4_PSR_SR_SUPP			0x02	/* (wifi/lx12) 802.11be-2024 Fig. 9-1074ao, B33 */
+ #define	IEEE80211_EHT_PHY_CAP4_MAX_NC_MASK			0x04
+ 
+ #define	IEEE80211_EHT_PHY_CAP5_COMMON_NOMINAL_PKT_PAD_0US	0x01
+@@ -1642,6 +1657,20 @@
+ 	return (lkpi_cfg80211_find_elem_pattern(eid, data, len, NULL, 0));
+ }
+ 
++/* (wifi/lx12) the first Element ID Extension element (255) with that extension id */
++static inline const struct element *
++cfg80211_find_ext_elem(uint8_t ext, const uint8_t *data, size_t len)
++{
++	size_t at = 0;
++
++	while (at + 2 <= len && at + 2 + data[at + 1] <= len) {
++		if (data[at] == 255 && data[at + 1] >= 1 && data[at + 2] == ext)
++			return ((const struct element *)(data + at));
++		at += 2 + data[at + 1];
++	}
++	return (NULL);
++}
++
+ static inline const struct element *
+ ieee80211_bss_get_elem(struct cfg80211_bss *bss, uint32_t eid)
+ {
+diff -ruN a/sys/compat/linuxkpi/common/include/net/mac80211.h b/sys/compat/linuxkpi/common/include/net/mac80211.h
+--- a/sys/compat/linuxkpi/common/include/net/mac80211.h	2026-11-01 09:49:01.071747748 +0000
++++ b/sys/compat/linuxkpi/common/include/net/mac80211.h	2026-11-01 09:52:01.072605794 +0000
+@@ -261,6 +261,8 @@
+  * 802.11ac-2013, 8.4.2.164 VHT Transmit Power Envelope element
+  * 802.11-???? ?
+  */
++#define	IEEE80211_TPE_EIRP_ENTRIES_320MHZ	5
++#define	IEEE80211_TPE_PSD_ENTRIES_320MHZ	16
+ struct ieee80211_parsed_tpe_eirp {
+ 	int8_t					power[5];
+ 	uint8_t					count;
+@@ -335,6 +337,8 @@
+ 	bool					use_short_slot;
+ 	bool					he_support;
+ 	bool					eht_support;
++	bool					eht_80mhz_full_bw_ul_mumimo;	/* (wifi/lx12, for ath12k) */
++	bool					eht_disable_mcs15;
+ 	bool					csa_active;
+ 	bool					mu_mimo_owner;
+ 	bool					color_change_active;
+@@ -473,6 +477,7 @@
+ 	IEEE80211_HW_TX_STATUS_NO_AMPDU_LEN,
+ 	IEEE80211_HW_HANDLES_QUIET_CSA,
+ 	IEEE80211_HW_NO_VIRTUAL_MONITOR,
++	IEEE80211_HW_MLO_MCAST_MULTI_LINK_TX,		/* (wifi/lx12, for ath12k) */
+ 
+ 	/* Keep last. */
+ 	NUM_IEEE80211_HW_FLAGS
+@@ -757,6 +762,7 @@
+ 	uint8_t					max_sp;
+ 	uint8_t					uapsd_queues;
+ 	uint16_t				valid_links;
++	uint16_t				eml_cap;	/* (wifi/lx12, for ath12k) */
+ 
+ 	struct ieee80211_link_sta		deflink;
+ 	struct ieee80211_link_sta		*link[IEEE80211_MLD_MAX_NUM_LINKS];	/* rcu? */
+@@ -1006,6 +1012,7 @@
+ 	int  (*sta_remove)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	int  (*sta_set_txpwr)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	void (*sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, struct station_info *);
++	void (*link_sta_statistics)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_link_sta *, struct link_station_info *);	/* (wifi/lx12) */
+ 	void (*sta_pre_rcu_remove)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *);
+ 	int  (*sta_state)(struct ieee80211_hw *, struct ieee80211_vif *, struct ieee80211_sta *, enum ieee80211_sta_state, enum ieee80211_sta_state);
+ 	void (*sta_notify)(struct ieee80211_hw *, struct ieee80211_vif *, enum sta_notify_cmd, struct ieee80211_sta *);

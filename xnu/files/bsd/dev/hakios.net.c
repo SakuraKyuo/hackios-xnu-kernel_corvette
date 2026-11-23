@@ -363,6 +363,8 @@ hakios_net_attach(const struct hakios_net_link *link)
 	};
 	const uint8_t *address = link->address;
 	ifnet_t ifp = NULL;
+
+	printf("net: attach asked for %s (unit %u, wireless %d)\n", link->name, unit, link->wireless ? 1 : 0);
 	thread_t thread;
 	errno_t error;
 
@@ -425,4 +427,16 @@ hakios_net_init(void)
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
 	hakios_virtio_net_init();
+	/*
+	 * (air224) a radio's interface is made in the kernel's start, before IOKit's; the registry
+	 * services iOS looks for are made now, once IOKit can take them.
+	 */
+	for (unsigned u = 0; u < HAKIOS_NET_UNITS; u++) {
+		if (net_ifs[u].link != NULL && net_ifs[u].link->wireless) {
+			char name[8];
+			snprintf(name, sizeof name, "en%u", u);
+			printf("net: making the Wi-Fi registry services for %s after IOKit's start\n", name);
+			HakiosWLANStart(name, net_ifs[u].link->address);
+		}
+	}
 }

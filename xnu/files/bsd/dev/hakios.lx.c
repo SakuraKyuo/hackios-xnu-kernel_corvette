@@ -10,6 +10,9 @@
  * files, its view of memory, the processor its firmware runs on -- is hakios.wifi.c's to
  * answer, which knows the phone.
  *
+ * On the Xiaomi 14 Pro the object is ath12k's (tools/mk-ath12k.sh, wifi/lx12), and the phone's side is
+ * shennong_wlan.c's (shennong_wlan_here()).
+ *
  * A kernel built without the object has the lx_start() at the end of this file, which says so.
  */
 #include <kern/clock.h>
@@ -38,21 +41,101 @@ extern void thread_set_thread_name(thread_t thread, const char *name);
 
 #define say hakios_wifi_say
 
+/* shennong_wlan.c: the phone's side (the Xiaomi 14 Pro's radio) */
+extern bool		 shennong_wlan_here(void);
+extern bool		 shennong_wlan_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);
+extern const uint8_t	*shennong_wlan_driver_file(const char *name, uint64_t *size);
+extern bool		 shennong_wlan_link_up(void);
+extern int		 shennong_wlan_radio_address(uint8_t *address);
+
 static LCK_GRP_DECLARE(lx_lock_group, "hakios-lx");
 static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
 
 /* ---- memory ------------------------------------------------------------------------------------------ */
 
+static void *lx_piece;
+static unsigned long lx_piece_size;
+
+/*
+ * (air226) a piece for the radio, asked for at the kernel's start: the same request made once the
+ * system has started (lx_os_radio_memory) finds no continuous run left.
+ */
+bool
+lx_os_radio_piece(unsigned long size)
+{
+	vm_offset_t address = 0;
+
+	if (lx_piece != NULL) {
+		return true;
+	}
+	size = round_page(size);
+	if (kmem_alloc_contig(kernel_map, &address, size, PAGE_SIZE, 0, 0, 0, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		say("lx: no %lu bytes of memory in one piece at the start\n", size);
+		return false;
+	}
+	bzero((void *)address, size);
+	lx_piece = (void *)address;
+	lx_piece_size = size;
+	say("lx: %lu bytes of memory kept in one piece for the radio\n", size);
+	return true;
+}
+
 void *
 lx_os_alloc(unsigned long size)
 {
+	vm_offset_t address = 0;
+
+	/*
+	 * (air225) the radio must reach the driver's big blocks: their pages have to be physically
+	 * in one piece.  kalloc_data gives no such promise and fails once the system has started.
+	 */
+	if (size >= (1UL << 20) &&
+	    kmem_alloc_contig(kernel_map, &address, size, PAGE_SIZE, 0, 0, 0, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+		bzero((void *)address, size);
+		return (void *)address;
+	}
+	if (size >= (1UL << 20)) {
+		say("lx: the VM has no %lu bytes of memory in one piece\n", size);
+		return NULL;
+	}
 	return kalloc_data(size, Z_WAITOK | Z_ZERO);
 }
 
 void
 lx_os_free(void *memory, unsigned long size)
 {
-	kfree_data(memory, size);
+	if (size >= (1UL << 20)) {
+		kmem_free(kernel_map, (vm_offset_t)memory, size);
+	} else {
+		kfree_data(memory, size);
+	}
+}
+
+unsigned long long
+lx_os_radio_reach(const void *memory, unsigned long size)
+{
+	vm_offset_t start = (vm_offset_t)memory, first = start & ~(vm_offset_t)4095, end = start + size;
+	uint64_t physical = kvtophys(first);
+	unsigned long long address = 0;
+
+	if (size == 0 || physical == 0) {
+		return 0;
+	}
+	for (vm_offset_t page = first + 4096; page < end; page += 4096) {
+		if (kvtophys(page) != physical + (page - first)) {
+			say("lx: %lu bytes of the heap the radio is to reach are not in one physical piece\n", size);
+			return 0;
+		}
+	}
+	for (vm_offset_t line = start & ~(vm_offset_t)63; line < end; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	if (!(shennong_wlan_here() ? shennong_wlan_radio_map(physical, end - first, &address) :
+	    hakios_wifi_radio_map(physical, end - first, &address))) {
+		return 0;
+	}
+	return address + (start - first);
 }
 
 /*
@@ -65,12 +148,22 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 {
 	vm_offset_t cached = 0, uncached;
 	uint64_t physical;
+	kern_return_t kr;
 
 	size = round_page(size);
-	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-	    KERN_SUCCESS) {
-		say("lx: no %lu bytes of memory in one piece\n", size);
-		return NULL;
+	if (lx_piece != NULL && size <= lx_piece_size) {
+		/* air228: carve the front and keep the remainder -- the ath12k driver asks for a
+		 * 7.27 MB piece and its pool for 4 MB pieces one after another; a single reserve of
+		 * 32 MB serves them all only if it is carved, not consumed whole. */
+		cached = (vm_offset_t)lx_piece;
+		lx_piece = (void *)((uint8_t *)lx_piece + size);
+		lx_piece_size -= size;
+	} else {
+		kr = kmem_alloc_contig(kernel_map, &cached, size, PAGE_SIZE, 0, 0, 0, VM_KERN_MEMORY_IOKIT);
+		if (kr != KERN_SUCCESS) {
+			say("lx: no %lu bytes of memory in one piece (%d)\n", size, kr);
+			return NULL;
+		}
 	}
 	physical = kvtophys(cached);
 	bzero((void *)cached, size);
@@ -79,7 +172,8 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	}
 	__asm__ volatile ("dsb sy");
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
-	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, address)) {
+	if (uncached == 0 || !(shennong_wlan_here() ? shennong_wlan_radio_map(physical, size, address) :
+	    hakios_wifi_radio_map(physical, size, address))) {
 		return NULL;
 	}
 	return (void *)uncached;
@@ -96,15 +190,68 @@ lx_os_map_registers(unsigned long long physical, unsigned long size)
 
 /* ---- saying things ----------------------------------------------------------------------------------- */
 
+/*
+ * What the driver said (and what the phone's side adds, hakios_lx_keep()), kept as well, the last
+ * 96 KB: the kernel's message buffer is overrun by others long before a run ends. On the way back
+ * to the loader hakios_lx_replay() puts it into the loader's log, which is what reaches the host.
+ */
+extern void loader_log_putc(char c);
+static LCK_MTX_DECLARE(lx_kept_lock, &lx_lock_group);
+static char lx_kept[96 * 1024];
+static size_t lx_kept_at;
+static bool lx_kept_wrapped, lx_kept_any;
+
+void
+hakios_lx_keep(const char *text)
+{
+	lck_mtx_lock(&lx_kept_lock);
+	lx_kept_any = true;
+	for (const char *c = text; *c != 0; c++) {
+		lx_kept[lx_kept_at] = *c;
+		if (++lx_kept_at == sizeof(lx_kept)) {
+			lx_kept_at = 0;
+			lx_kept_wrapped = true;
+		}
+	}
+	lck_mtx_unlock(&lx_kept_lock);
+}
+#define lx_keep hakios_lx_keep
+
+/* (on the way out: nothing else runs, no lock is taken) */
+void
+hakios_lx_replay(void)
+{
+	size_t n = lx_kept_wrapped ? sizeof(lx_kept) : lx_kept_at, at = lx_kept_wrapped ? lx_kept_at : 0;
+
+	if (!lx_kept_any) {
+		return;
+	}
+	for (const char *c = "\n--- the Wi-Fi driver's lines, again (the last 96 KB) ---\n"; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	for (size_t i = 0; i < n; i++) {
+		char c = lx_kept[(at + i) % sizeof(lx_kept)];
+
+		if (c != 0) {
+			loader_log_putc(c);
+		}
+	}
+	for (const char *c = "\n--- that was all ---\n"; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+}
+
 void
 lx_os_print(const char *text)
 {
+	lx_keep(text);
 	say("%s", text);
 }
 
 void
 lx_os_tell(const char *text)
 {
+	lx_keep(text);
 	hakios_wifi_tell("%s", text);
 }
 
@@ -215,7 +362,7 @@ int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
 	uint64_t length = 0;
-	const uint8_t *file = hakios_wifi_driver_file(name, &length);
+	const uint8_t *file = shennong_wlan_here() ? shennong_wlan_driver_file(name, &length) : hakios_wifi_driver_file(name, &length);
 
 	if (file == NULL) {
 		return ENOENT;
@@ -228,13 +375,13 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
-	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
+	return (shennong_wlan_here() ? shennong_wlan_link_up() : hakios_wifi_dsp_is_up()) ? 0 : ENXIO;
 }
 
 int
 lx_os_radio_address(unsigned char *address)
 {
-	return hakios_wifi_radio_address(address);
+	return shennong_wlan_here() ? shennong_wlan_radio_address(address) : hakios_wifi_radio_address(address);
 }
 
 int
@@ -262,6 +409,9 @@ static LCK_MTX_DECLARE(lx_queue_lock, &lx_lock_group);
 static struct lx_frame *lx_queue;
 static uint32_t lx_queue_in, lx_queue_out;      /* frames put in and taken out, counted from the start */
 static uint64_t lx_queue_dropped;
+/* how sending goes, for lx_os_net_say(): time in the driver, the deepest the queue got, frames since the last word */
+static uint64_t lx_send_ns, lx_send_most_ns;
+static uint32_t lx_send_frames, lx_queue_deepest;
 
 static void
 lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
@@ -275,8 +425,13 @@ lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
 		}
 		frame = &lx_queue[lx_queue_out % LX_QUEUE];     /* (stays ours until lx_queue_out moves) */
 		lck_mtx_unlock(&lx_queue_lock);
+		uint64_t began = lx_os_nanoseconds(), took;
 		lx_transmit(frame->bytes, frame->length);
+		took = lx_os_nanoseconds() - began;
 		lck_mtx_lock(&lx_queue_lock);
+		lx_send_ns += took;
+		lx_send_most_ns = took > lx_send_most_ns ? took : lx_send_most_ns;
+		lx_send_frames++;
 		lx_queue_out++;
 		lck_mtx_unlock(&lx_queue_lock);
 	}
@@ -300,6 +455,7 @@ lx_link_transmit(mbuf_t packet, size_t length)
 	}
 	frame->length = (uint16_t)length;
 	lx_queue_in++;
+	lx_queue_deepest = lx_queue_in - lx_queue_out > lx_queue_deepest ? lx_queue_in - lx_queue_out : lx_queue_deepest;
 	lck_mtx_unlock(&lx_queue_lock);
 	thread_wakeup((event_t)&lx_queue_in);
 	return true;
@@ -330,6 +486,7 @@ lx_os_net_attach(const unsigned char *address)
 	lx_link_attached = hakios_net_attach(&lx_link);
 	say("lx: %s\n", lx_link_attached ? "the radio is the link behind en0" : "EN0 HAS A LINK ALREADY: the radio's frames go "
 	    "nowhere");
+	lx_keep(lx_link_attached ? "lx: the radio is the link behind en0\n" : "lx: EN0 HAS A LINK ALREADY: the radio's frames go nowhere\n");
 }
 
 /*
@@ -350,8 +507,48 @@ hakios_lx_net_early(void)
 void
 lx_os_net_link(int up)
 {
+	char line[200];
+
+	snprintf(line, sizeof(line), "lx: the network is %s: en0 %s; frames from the kernel so far %u, %llu dropped\n",
+	    up ? "joined" : "left", lx_link_attached ? "is the radio's" : "IS NOT THE RADIO'S (its frames go nowhere)",
+	    lx_queue_in, lx_queue_dropped);
+	say("%s", line);
+	lx_keep(line);
 	if (lx_link_attached) {
 		hakios_net_link_state(up != 0);
+	}
+}
+
+/*
+ * How sending went since the last word (called with the driver's word every ten seconds): the
+ * frames, the time each took in the driver on average and at most, the deepest the queue got
+ * (LX_QUEUE: a full queue drops) -- whether the kernel's frames wait for the driver, or the
+ * driver for the kernel's frames.
+ */
+void
+lx_os_net_say(void)
+{
+	uint64_t ns, most;
+	uint32_t frames, deepest;
+	uint64_t dropped;
+
+	lck_mtx_lock(&lx_queue_lock);
+	ns = lx_send_ns;
+	most = lx_send_most_ns;
+	frames = lx_send_frames;
+	deepest = lx_queue_deepest;
+	dropped = lx_queue_dropped;
+	lx_send_ns = lx_send_most_ns = 0;
+	lx_send_frames = lx_queue_deepest = 0;
+	lck_mtx_unlock(&lx_queue_lock);
+	if (frames != 0) {
+		char line[200];
+
+		snprintf(line, sizeof(line), "lx: sending: %u frames from the kernel, %llu us each in the driver (at most %llu); the "
+		    "queue at most %u of %u deep; %llu dropped in all\n", frames, ns / frames / 1000, most / 1000, deepest, LX_QUEUE,
+		    dropped);
+		say("%s", line);
+		lx_keep(line);
 	}
 }
 
@@ -432,7 +629,7 @@ lx_os_irq_msi(unsigned long long *address, unsigned *data)
 {
 	uint32_t first = 0;
 
-	if (!hakios_wifi_radio_msi(address, data, &first)) {
+	if (shennong_wlan_here() || !hakios_wifi_radio_msi(address, data, &first)) {     /* (the Xiaomi 14 Pro: none yet) */
 		return 0;
 	}
 	lx_irq_first = first;
@@ -541,7 +738,7 @@ lx_os_station_lost(int error)
 __attribute__((weak)) int
 lx_start(void)
 {
-	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath11k.sh, then "
+	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath11k.sh or tools/mk-ath12k.sh, then "
 	    "build the kernel again)\n");
 	return ENXIO;
 }
