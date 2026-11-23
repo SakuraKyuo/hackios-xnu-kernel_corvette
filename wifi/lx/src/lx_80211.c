@@ -574,7 +574,7 @@ frame_describe(struct lx_radio *radio, const uint8_t *e, unsigned length, bool o
 			what = "ICMP";
 		}
 	}
-	printf("lx: a frame %s: %s%s%s%s, %u bytes, %s %02x:%02x:%02x:%02x:%02x:%02x\n", out ? "SENT" : "RECEIVED", what,
+	printf("lx: a frame %s: %s%s%s, %u bytes, %s %02x:%02x:%02x:%02x:%02x:%02x\n", out ? "SENT" : "RECEIVED", what,
 	    kind == 0 ? "" : kind == 1 ? " DISCOVER" : kind == 2 ? " OFFER" : kind == 3 ? " REQUEST" : kind == 5 ? " ACK" :
 	    kind == 6 ? " NAK" : " (another kind)", detail, length, out ? "to" : "from", e[out ? 0 : 6], e[out ? 1 : 7],
 	    e[out ? 2 : 8], e[out ? 3 : 9], e[out ? 4 : 10], e[out ? 5 : 11]);
@@ -815,7 +815,14 @@ management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 	return (frame + 24);
 }
 
-#define LX_KEEP_FREE	512
+/* air236: 512 was above what the pool has free (7168 slots, about 6700 in the receive rings:
+ * about 468), so every frame waited the guard's whole 50 ms before sending anyway.  128 is
+ * a floor that still holds the sender back before the pool is exhausted, and the wait is
+ * capped at 10 ms.  What the guard did is counted below and printed by lx_station_say(). */
+#define LX_KEEP_FREE	128
+#define LX_KEEP_WAIT_MS	10
+static unsigned long long lx_tx_waits, lx_tx_waited_ms;	/* times a frame waited, and ms in all */
+static unsigned lx_tx_waited_most;			/* the longest one, ms */
 
 /* An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key. */
 static bool
@@ -834,9 +841,15 @@ ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 	 * starved, so that what came in was slow as well. Here the sender waits for the radio instead
 	 * (this is the queue's own thread; what was sent comes back on the bus's).
 	 */
-	for (unsigned waited = 0; waited < 50 && lx_buffers_free() < LX_KEEP_FREE; waited++) {
+	unsigned waited = 0;
+
+	while (waited < LX_KEEP_WAIT_MS && lx_buffers_free() < LX_KEEP_FREE) {
 		lx_pause_ms(1);
+		waited++;
 	}
+	lx_tx_waited_ms += waited;
+	lx_tx_waits += waited != 0;
+	lx_tx_waited_most = waited > lx_tx_waited_most ? waited : lx_tx_waited_most;
 	/*
 	 * To an access point that does WMM the frame goes as QoS data, with a traffic class (from the
 	 * IPv4 header's precedence, else 0: best effort): the firmware aggregates only those, by class
@@ -2057,6 +2070,8 @@ lx_station_say(void)
 		    radio->ba_sessions, radio->ba_refused, radio->acked, radio->not_acked, radio->dropped);
 		lx_tell("lx: the shim saw %llu frames and set aside %u of them; the rest went up to the network stack\n",
 		    (unsigned long long)radio->frames, radio->others);
+		lx_tell("lx: the sender waited for a free buffer %llu times (%llu ms in all, %u at most); %u of the radio's buffers are free now\n",
+		    lx_tx_waits, lx_tx_waited_ms, lx_tx_waited_most, lx_buffers_free());
 		lx_memory_say();
 		lx_os_net_say();
 	}
