@@ -6,7 +6,7 @@
 // The region is marked reserved in the device memory map.
 //
 #define XNU_PAYLOAD_BASE      0xA8000000ULL
-#define XNU_PAYLOAD_MAX_SIZE  0x04000000ULL
+#define XNU_PAYLOAD_MAX_SIZE  0x05000000ULL
 #define XNU_PAYLOAD_MAGIC     0x50554E58 // "XNUP"
 
 typedef struct {

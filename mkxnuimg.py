@@ -12,7 +12,7 @@ or, when there is none, from devices/poco-x5-pro/prebuilt/.
 
 usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 """
-import argparse, gzip, os, subprocess, sys
+import argparse, gzip, os, struct, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
@@ -40,7 +40,7 @@ OS_PATCH = os.environ.get('BOOT_OS_PATCH', '')
 FD_BASE = int(os.environ.get('FD_BASE', '0x9FD00000'), 16)
 FD_SIZE = int(os.environ.get('FD_SIZE', '0x200000'), 16)
 PAYLOAD_BASE = int(os.environ.get('PAYLOAD_BASE', '0xF0000000'), 16)
-PAYLOAD_MAX = 0x04000000
+PAYLOAD_MAX = 0x05000000
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
@@ -48,8 +48,11 @@ ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
 ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
-fd_path = os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path):
+fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
+if os.environ.get('UEFI_FD'):
+    parts = {'shim': part('BootShim.bin'), 'fd': fd_path, 'dtb': part('device-tree.dtb'),
+             'ramdisk': part('ramdisk'), 'mkbootimg': part('mkbootimg.py')}
+elif os.path.isfile(fd_path):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
@@ -65,6 +68,12 @@ else:
              'dtb': part('device-tree.dtb'), 'ramdisk': part('ramdisk'),
              'mkbootimg': part('mkbootimg.py')}
 shim = open(parts['shim'], 'rb').read()
+if args.payload:
+    # The shim copies the payload to PAYLOAD_BASE only if it looks for "XNUP" there;
+    # without that the firmware finds nothing, the loader never starts, and the phone
+    # resets right after the boot menu (see devices/corvette/README.md).
+    assert all(struct.pack('<I', w) in shim for w in (0x5289CB03, 0x72AA0AA3)), \
+        f"{parts['shim']} does not copy a payload: use a shim that looks for XNUP"
 fd = open(parts['fd'], 'rb').read()
 assert len(fd) == FD_SIZE, hex(len(fd))
 
@@ -72,7 +81,7 @@ blob = shim + fd
 if args.payload:
     data = open(args.payload, 'rb').read()
     # the payload file is a complete "XNUP" container (see xnuloader/mkpayload.py)
-    assert data[:4] == b'XNUP' and len(data) <= PAYLOAD_MAX - 0x1000, 'bad or oversized payload'
+    assert data[:4] == b'XNUP' and len(data) <= PAYLOAD_MAX - 0x100000, 'bad or oversized payload'
     blob += data
     blob += b'\0' * (-len(blob) % 16)
     print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')

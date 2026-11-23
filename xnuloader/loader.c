@@ -39,7 +39,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
 #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
-#define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+#define PAYLOAD_MAX_SIZE    0x05000000ULL         /* RAM reserved for the payload in the UEFI memory map */
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -322,6 +322,92 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_len = n;
 }
 
+/*
+ * The stored copy is what survives a reset. A boot that dies in a store (the
+ * phone resets, USB never answers again) leaves the lines up to that store in
+ * the logdump partition, and the next boot puts them back at the top of the
+ * log, so "the log dies with the reset" stops being a blind spot.
+ */
+#define LOG_DISK_MAGIC   "XNULOADER-DISK1\n"   /* these 16 bytes, exactly */
+#define LOG_DISK_HEAD    20u                    /* then a u32: what follows */
+#define LOG_PREV_KEEP    (16u * 1024)           /* newest bytes put back, at most */
+#define LOG_PREV_READ    (56u * 1024)           /* read at boot, at most */
+
+static int log_quiet;                           /* a flush made before a risky store */
+
+/* What goes to the partition: header, this session's log, the kernel log. */
+static void
+compose_disk(const char *klog, uint64_t klog_len)
+{
+	uint64_t n = LOG_DISK_HEAD;
+
+	if (log_len > sizeof(out_buf) - LOG_DISK_HEAD - 8192) {
+		klog_len = 0;
+	}
+	memset(out_buf, 0, LOG_DISK_HEAD);
+	memcpy(out_buf, LOG_DISK_MAGIC, 16);
+	memcpy(out_buf + n, log_buf, log_len);
+	n += log_len;
+	if (klog != NULL && klog_len != 0) {
+		if (klog_len > sizeof(out_buf) - n - 1) {
+			klog_len = sizeof(out_buf) - n - 1;
+		}
+		memcpy(out_buf + n, klog, klog_len);
+		n += klog_len;
+	}
+	*(uint32_t *)(out_buf + 16) = (uint32_t)(n - LOG_DISK_HEAD);
+	staged_len = n;
+}
+
+/*
+ * Before the banner, so the restored lines come first and this session follows
+ * them. Only the newest bytes are kept: what killed a boot is at the end.
+ */
+static void
+restore_prev(void)
+{
+	static const char head[] = "== log stored before this boot ==\n";
+	efi_block_io *bio = find_log_partition();
+	uint64_t bs, take, from, room, n = sizeof(head) - 1;
+	uint32_t stored;
+
+	if (bio == NULL || bio->media == NULL || log_len != 0) {
+		return;
+	}
+	bs = bio->media->block_size;
+	if (bs == 0 || LOG_PREV_READ > sizeof(block_buffer)) {
+		return;
+	}
+	take = LOG_PREV_READ / bs * bs;
+	if (take <= LOG_DISK_HEAD) {
+		return;
+	}
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, take, block_buffer))) {
+		return;
+	}
+	if (memcmp(block_buffer, LOG_DISK_MAGIC, 16) != 0) {
+		return;
+	}
+	stored = *(uint32_t *)(block_buffer + 16);
+	if (stored == 0 || stored > take - LOG_DISK_HEAD) {
+		return;
+	}
+	from = stored > LOG_PREV_KEEP ? stored - LOG_PREV_KEEP : 0;
+	stored -= (uint32_t)from;
+	room = sizeof(log_buf) - n - 4096;
+	if (stored > room) {
+		from += stored - room;
+		stored = (uint32_t)room;
+	}
+	if (stored == 0) {
+		return;
+	}
+	memcpy(log_buf, head, n);
+	memcpy(log_buf + n, block_buffer + LOG_DISK_HEAD + from, stored);
+	log_len = n + stored;
+	log_buf[log_len] = 0;
+}
+
 static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
 static void hc_print_state(const char *when);
@@ -332,7 +418,7 @@ write_logs(const char *klog, uint64_t klog_len)
 {
 	efi_block_io *bio = find_log_partition();
 
-	compose_logs(klog, klog_len);
+	compose_disk(klog, klog_len);
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
@@ -342,6 +428,7 @@ write_logs(const char *klog, uint64_t klog_len)
 			}
 			print("\n== END OF LOG ==\n");
 		}
+		compose_logs(klog, klog_len);
 		return;
 	}
 	uint64_t bs = bio->media->block_size;
@@ -372,8 +459,10 @@ write_logs(const char *klog, uint64_t klog_len)
 			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
 		}
 	}
-	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
-	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
+	if (!log_quiet) {
+		print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
+		    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
+	}
 	compose_logs(klog, klog_len);
 }
 
@@ -3601,6 +3690,2027 @@ fb_reply_data(uint64_t len)
 	usb_tx((const uint8_t *)msg, 12);
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* PCIe0 to the WCN7850 (corvette): the link, brought up here              */
+/*                                                                          */
+/* The kernel's own S1 writes every register the vendor's                    */
+/* msm_pcie_enable_link() writes, and the link still does not leave          */
+/* detect.quiet while PHYSTATUS stays set. The one port of this radio to    */
+/* the same SoC family that is known to work (ios-dodge,                    */
+/* op13_wifi_link_probe) does the bring-up in the firmware, before any      */
+/* operating system has taken the clocks and the power domains over. That   */
+/* is what this is: the same sequence, run from here.                       */
+/*                                                                          */
+/*   oem pcie-state   only reads: what the boot loader left, and whether    */
+/*                    this address space answers from UEFI at all.          */
+/*   oem pcie-link    writes, in the vendor's own order. Every store is     */
+/*                    printed on the line before it is made, and read back  */
+/*                    on the same line, so a fault names its register.      */
+/*                                                                          */
+/* The radio is on PCIe0 (dt: qcom,pcie@1c00000): parf 0x01c00000 (the PHY  */
+/* 0x2000 after its 0x3000), dm_core 0x60000000 (its config space, with the */
+/* ELBI at 0xf20 and the iATU at 0x1000), ECAM 0x60100000 (a megabyte to    */
+/* the bus) and the identity MEM32 aperture 0x60300000.                    */
+/* ------------------------------------------------------------------------ */
+
+#define PC_GCC_PHYS       0x00100000UL
+#define PC_GCC_VOTE       0x52008
+#define PC_GCC_VOTE_RCH   0x52000
+#define PC_GCC_COLLAPSE   0x5214c
+#define PC_GCC_GDSCR      0x6b004
+#define PC_GCC_PHY_GDSCR  0x6c000
+#define PC_GCC_BCR        0x6b000
+#define PC_GCC_PHY_BCR    0x6c01c
+#define PC_PARF_PHYS      0x01c00000UL
+#define PC_PHY_AT         0x6000
+#define PC_CORE_PHYS      0x60000000UL
+#define PC_ELBI_AT        0xf20
+#define PC_ECAM_PHYS      0x60100000UL
+#define PC_MEM32_PHYS     0x60300000UL
+#define PC_MEM32_SIZE     0x03d00000UL
+#define PC_TCSR_PHYS      0x1f40000UL
+#define PC_TLMM_PHYS      0x0f100000UL
+#define PC_RSC_PHYS       0x17a20000UL
+#define PC_SM_PHYS        0x1d07000UL
+
+#define PC_GDSC_ON        (1u << 31)
+#define PC_GDSC_UP        (1u << 16)      /* in CFG_GDSCR, four bytes after the domain's own register */
+#define PC_LTSSM_EN       (1u << 8)
+
+/* The always-on processor's mailbox (power-controller@c300000) and the IPCC
+ * send register that rings it; see pc_radio_pdc() far below. */
+#define PC_QMP_PHYS    0xc300000ULL
+#define PC_IPCC_PHYS   0x406000ULL
+#define PC_IPCC_SEND   (PC_IPCC_PHYS + 0xc)
+#define PC_QMP_MAGIC   0x4d41494cu
+#define PC_QMP_UP      0xffffu
+#define PC_QMP_MSG_LEN 64u
+
+static inline uint32_t
+pc_rd(uint64_t pa)
+{
+	uint32_t v;
+
+	__asm__ volatile ("dsb sy" ::: "memory");
+	v = *(volatile uint32_t *)(uintptr_t)pa;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	return v;
+}
+
+static inline void
+pc_wr(uint64_t pa, uint32_t v)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)pa = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+pc_ms(uint64_t ms)
+{
+	BS->stall(ms * 1000);
+}
+
+/* A store, what it overwrote, and what the register says the moment after. */
+static void pc_flush(void);
+
+static void
+pc_set(const char *what, uint32_t off, uint64_t pa, uint32_t value)
+{
+	uint32_t before = pc_rd(pa);
+
+	print("pcie:   %s +%x: %x -> %x", what, (uint64_t)off, (uint64_t)before, (uint64_t)value);
+	pc_flush();
+	pc_wr(pa, value);
+	print(", %x back\n", (uint64_t)pc_rd(pa));
+}
+
+static const char *
+pc_ltssm_name(uint32_t state)
+{
+	switch (state) {
+	case 0x00: return "detect.quiet";
+	case 0x01: return "detect.active";
+	case 0x02: return "polling.active";
+	case 0x04: return "polling.configuration";
+	case 0x06: return "detect.wait";
+	case 0x07: return "configuration.linkwidth.start";
+	case 0x0b: return "configuration.complete";
+	case 0x0c: return "configuration.idle";
+	case 0x0d: return "recovery.lock";
+	case 0x10: return "recovery.idle";
+	case 0x11: return "L0";
+	case 0x13: return "sending electrical idle";
+	case 0x14: return "L1.idle";
+	case 0x16: return "L2.idle";
+	case 0x1a: return "disabled";
+	default: return "unnamed";
+	}
+}
+
+/* The pins this link uses, from the phone's own device tree: wlan-en (16),
+ * perst (94) and clkreq# (95). Perst is held low until the link is about to
+ * be started; clkreq# carries pcie0_clk_req_n (function 1), not a GPIO. */
+#define PC_PIN_WLAN_EN   16
+#define PC_PIN_PERST     94
+#define PC_PIN_CLKREQ    95
+#define PC_PIN_WAKE      96
+/* pinctrl-pineapple's control word: pull is bits 1:0 (3 is pull-up), the mux
+ * is bits 5:2, drive is 8:6 and output enable is 9; each pin's function table
+ * is { gpio, f1, f2, ... } by index, so pin 95's pcie0_clk_req_n is mux 1. */
+#define PC_PIN_PULL_UP   3u
+#define PC_PIN_MUX(n)    ((uint32_t)(n) << 2)
+#define PC_PIN_IN_PULLUP PC_PIN_PULL_UP
+#define PC_PIN_OUT_8MA   0x2c0
+#define PC_PIN_CLKREQ_N  (PC_PIN_MUX(1) | PC_PIN_PULL_UP)
+
+static void
+pc_dump(const char *when)
+{
+	uint64_t gcc = PC_GCC_PHYS, tlmm = PC_TLMM_PHYS;
+	uint32_t core, phy;
+	static const struct {
+		const char *name;
+		uint32_t at;
+	} halt[] = { { "slv_q2a", 0x6b01c }, { "slv_axi", 0x6b020 }, { "mstr_axi", 0x6b02c },
+		     { "cfg_ahb", 0x6b038 }, { "aux", 0x6b03c }, { "pipe", 0x6b048 },
+		     { "phy_rchng", 0x6b054 }, { "cnoc", 0x10058 } };
+
+	print("pcie: %s: gcc %x: votes %x, %x; collapse %x\n", when, gcc,
+	    (uint64_t)pc_rd(gcc + PC_GCC_VOTE), (uint64_t)pc_rd(gcc + PC_GCC_VOTE_RCH),
+	    (uint64_t)pc_rd(gcc + PC_GCC_COLLAPSE));
+	print("pcie:   halted (1 = not running):");
+	for (unsigned i = 0; i < sizeof(halt) / sizeof(halt[0]); i++) {
+		print(" %s %d", halt[i].name, (uint64_t)(pc_rd(gcc + halt[i].at) & 1));
+	}
+	print("\n");
+	core = pc_rd(gcc + PC_GCC_GDSCR);
+	phy = pc_rd(gcc + PC_GCC_PHY_GDSCR);
+	print("pcie:   gdsc core %x (on %d, up %d), phy %x (on %d, up %d)\n", (uint64_t)core,
+	    (uint64_t)((core >> 31) & 1), (uint64_t)((pc_rd(gcc + PC_GCC_GDSCR + 4) >> 16) & 1), (uint64_t)phy,
+	    (uint64_t)((phy >> 31) & 1), (uint64_t)((pc_rd(gcc + PC_GCC_PHY_GDSCR + 4) >> 16) & 1));
+	print("pcie:   resets core %x, phy %x, com %x %x %x, block %x %x; clkref %x %x\n",
+	    (uint64_t)pc_rd(gcc + PC_GCC_BCR), (uint64_t)pc_rd(gcc + PC_GCC_PHY_BCR),
+	    (uint64_t)pc_rd(gcc + 0x6c014), (uint64_t)pc_rd(gcc + 0x6c020), (uint64_t)pc_rd(gcc + 0x6c028),
+	    (uint64_t)pc_rd(gcc + 0x6f000), (uint64_t)pc_rd(gcc + 0x6f00c),
+	    (uint64_t)pc_rd(PC_TCSR_PHYS + 0xb1100), (uint64_t)pc_rd(PC_TCSR_PHYS + 0xb1114));
+	print("pcie:   pins: 16 %x/%x, 17 %x/%x, 18 %x/%x, 94 %x/%x, 95 %x/%x\n",
+	    (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_WLAN_EN), (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_WLAN_EN + 4),
+	    (uint64_t)pc_rd(tlmm + 0x11000), (uint64_t)pc_rd(tlmm + 0x11004),
+	    (uint64_t)pc_rd(tlmm + 0x12000), (uint64_t)pc_rd(tlmm + 0x12004),
+	    (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_PERST), (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_PERST + 4),
+	    (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_CLKREQ), (uint64_t)pc_rd(tlmm + 0x1000 * PC_PIN_CLKREQ + 4));
+	/* Below the wrapper nothing answers until its power domain is up, so
+	 * these are read only when the domain itself says it is on. */
+	if (!(core & PC_GDSC_ON)) {
+		print("pcie:   the core's power domain is off: parf, the core and the phy are not read\n");
+		return;
+	}
+	print("pcie:   parf %x: ltssm %x (state %d %s), refclk %x, device type %x\n", PC_PARF_PHYS,
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x1b0), (uint64_t)(pc_rd(PC_PARF_PHYS + 0x1b0) & 0x3f),
+	    pc_ltssm_name(pc_rd(PC_PARF_PHYS + 0x1b0) & 0x3f), (uint64_t)pc_rd(PC_PARF_PHYS + 0x4c),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x1000));
+	print("pcie:   elbi %x: %x %x %x %x; core id %x, class %x\n", PC_CORE_PHYS + PC_ELBI_AT,
+	    (uint64_t)pc_rd(PC_CORE_PHYS + PC_ELBI_AT), (uint64_t)pc_rd(PC_CORE_PHYS + PC_ELBI_AT + 4),
+	    (uint64_t)pc_rd(PC_CORE_PHYS + PC_ELBI_AT + 8), (uint64_t)pc_rd(PC_CORE_PHYS + PC_ELBI_AT + 0xc),
+	    (uint64_t)pc_rd(PC_CORE_PHYS), (uint64_t)pc_rd(PC_CORE_PHYS + 8));
+	if (phy & PC_GDSC_ON) {
+		print("pcie:   phy %x: status %x (bit 6 %d, 1 = not ready), power down %x, start %x\n",
+		    PC_PARF_PHYS + PC_PHY_AT, (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x214),
+		    (uint64_t)((pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x214) >> 6) & 1),
+		    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x240),
+		    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x244));
+	} else {
+		print("pcie:   the phy's power domain is off: its registers are not read\n");
+	}
+}
+
+/* 1: the seven branch clocks of PCIe0, in two votes (Linux's gcc-sm8650.c). */
+static void
+pc_clocks(void)
+{
+	uint64_t gcc = PC_GCC_PHYS;
+	uint32_t vote = pc_rd(gcc + PC_GCC_VOTE), rchng = pc_rd(gcc + PC_GCC_VOTE_RCH);
+
+	print("pcie: 1: the branch clocks of PCIe0, at gcc %x\n", gcc);
+	pc_set("vote (7 branches)", PC_GCC_VOTE, gcc + PC_GCC_VOTE, vote | 0x7f);
+	pc_set("vote (phy_rchng)", PC_GCC_VOTE_RCH, gcc + PC_GCC_VOTE_RCH, rchng | (1u << 22));
+	pc_ms(2);
+}
+
+/* 2: one power domain, out of collapse, with its power-up handshake waited for.
+ * The handshake is bit 16 of CFG_GDSCR, four bytes after the domain's own
+ * register; the domain's bit 31 is the state and bit 0 the software collapse. */
+static int
+pc_gdsc(const char *name, uint32_t gdscr, uint32_t collapse_bit)
+{
+	uint64_t at = PC_GCC_PHYS + gdscr;
+	uint32_t value = pc_rd(at), cfg = pc_rd(at + 4), polls, collapse;
+
+	print("pcie: 2: %s +%x: %x (on %d, collapse %d), cfg %x (up %d)\n", name, (uint64_t)gdscr,
+	    (uint64_t)value, (uint64_t)((value >> 31) & 1), (uint64_t)(value & 1), (uint64_t)cfg,
+	    (uint64_t)((cfg >> 16) & 1));
+	if ((cfg & PC_GDSC_UP) && (value & PC_GDSC_ON)) {
+		print("pcie:   %s is already up\n", name);
+		return 1;
+	}
+	collapse = pc_rd(PC_GCC_PHYS + PC_GCC_COLLAPSE);
+	if (collapse & (1u << collapse_bit)) {
+		pc_set("collapse: cleared", PC_GCC_COLLAPSE, PC_GCC_PHYS + PC_GCC_COLLAPSE,
+		    collapse & ~(1u << collapse_bit));
+	}
+	/* From the vendor tree (gdsc-regulator.c), a domain that has a
+	 * collapse vote is enabled by that vote alone: SW_COLLAPSE is never
+	 * written for it, so it is not written here either. */
+	for (polls = 0; polls < 100; polls++) {
+		value = pc_rd(at);
+		cfg = pc_rd(at + 4);
+		if ((cfg & PC_GDSC_UP) && (value & PC_GDSC_ON)) {
+			break;
+		}
+		pc_ms(1);
+	}
+	print("pcie:   %s after %d ms: %x (on %d), cfg %x (up %d)\n", name, (uint64_t)polls, (uint64_t)value,
+	    (uint64_t)((value >> 31) & 1), (uint64_t)cfg, (uint64_t)((cfg >> 16) & 1));
+	return (cfg & PC_GDSC_UP) && (value & PC_GDSC_ON);
+}
+
+
+static void pc_radio(void);
+
+/* Put the log on the partition before a store that may reset the phone. */
+static void
+pc_flush(void)
+{
+	log_quiet++;
+	flush_log();
+	log_quiet--;
+}
+
+/* ------------------------------------------------------------------------ */
+/* The firmware's page tables, for the windows below the PCIe wrapper       */
+/*
+ * The loader runs at EL1 (the banner's CurrentEL=1), in the translation
+ * regime the firmware left on (TTBR0_EL1, 4 KB granules), and that map holds
+ * the pages the firmware itself used, not the device tree's. Reading 0x1c00000
+ * answered and reading
+ * 0x1c01000 raised a level-3 translation fault (esr 96000007, far 1c01000),
+ * so each window below the wrapper has to be filled in before it is read.
+ *
+ * The walk is the hardware's: L0 to L2 must already be tables, and only a
+ * missing L3 entry is added. The attribute bits are copied from a mapping
+ * that answers today (0x100000, the GCC), because the MAIR_EL2 index of a
+ * device region is the firmware's choice, not ours.
+ */
+
+#define PC_TT_POOL 8
+
+static uint64_t pc_tt_pool[PC_TT_POOL][512] __attribute__((aligned(0x1000)));
+static unsigned pc_tt_used;
+
+static uint64_t
+pc_tt_base(void)
+{
+	return READ_SYSREG(TTBR0_EL1) & 0x0000fffffffff000ULL;
+}
+
+/* TCR_EL1.T0SZ gives 64 - T0SZ bits of virtual address, and with 4 KB
+ * granules a region of more than 39 bits starts the walk at level 0, more
+ * than 30 at level 1, and anything smaller at level 2. */
+static int
+pc_tt_start(void)
+{
+	int bits = 64 - (int)(READ_SYSREG(TCR_EL1) & 0x3f);
+
+	return bits > 39 ? 0 : bits > 30 ? 1 : 2;
+}
+
+/* Walk to the level-3 entry that maps va, adding a table at any level whose
+ * entry is still invalid. With *block: 1 = a block already maps va, 2 = the
+ * pool is out of tables. */
+static uint64_t *
+pc_tt_l3(uint64_t va, int *block)
+{
+	uint64_t table = pc_tt_base();
+	int start = pc_tt_start();
+
+	*block = 0;
+	for (int level = start; level <= 2; level++) {
+		uint64_t *entry = (uint64_t *)(uintptr_t)
+		    (table + (((va >> (12 + 9 * (3 - level))) & 0x1ff) * 8));
+		uint64_t d = *entry;
+
+		if (!(d & 1)) {
+			if (pc_tt_used >= PC_TT_POOL) {
+				*block = 2;
+				return NULL;
+			}
+			table = (uint64_t)(uintptr_t)pc_tt_pool[pc_tt_used++];
+			*entry = table | 3;
+			clean_dcache((uint64_t)(uintptr_t)entry, (uint64_t)(uintptr_t)entry + 8);
+			continue;
+		}
+		if (!(d & 2)) {
+			*block = 1;
+			return NULL;
+		}
+		table = d & 0x0000fffffffff000ULL;
+	}
+	return (uint64_t *)(uintptr_t)(table + (((va >> 12) & 0x1ff) * 8));
+}
+
+/* The descriptor that maps va today, or 0: the attribute template. */
+static uint64_t
+pc_tt_desc(uint64_t va)
+{
+	uint64_t table = pc_tt_base();
+	int start = pc_tt_start();
+
+	for (int level = start; level <= 2; level++) {
+		uint64_t d = *(volatile uint64_t *)(uintptr_t)
+		    (table + (((va >> (12 + 9 * (3 - level))) & 0x1ff) * 8));
+
+		if (!(d & 1)) {
+			return 0;
+		}
+		if (!(d & 2)) {
+			return d;
+		}
+		table = d & 0x0000fffffffff000ULL;
+	}
+	return *(volatile uint64_t *)(uintptr_t)(table + (((va >> 12) & 0x1ff) * 8));
+}
+
+/* 1 = the page answers now, either because it already did or because the
+ * entry was added; an existing entry is never rewritten. */
+static int
+pc_map_page(uint64_t pa, uint32_t attrs, uint32_t *added, uint32_t *present)
+{
+	int block = 0;
+	uint64_t *entry = pc_tt_l3(pa, &block);
+
+	if (entry == NULL) {
+		return block == 1;
+	}
+	if (*entry & 1) {
+		(*present)++;
+		return 1;
+	}
+	*entry = (pa & 0x0000fffffffff000ULL) | (uint64_t)(attrs & 0xffc) | 3;
+	clean_dcache((uint64_t)(uintptr_t)entry, (uint64_t)(uintptr_t)entry + 8);
+	(*added)++;
+	return 1;
+}
+
+static void
+pc_map_windows(void)
+{
+	static const struct {
+		const char *name;
+		uint64_t base, len;
+	} win[] = {
+		{ "parf+phy", PC_PARF_PHYS, 0x8000 },
+		{ "core elbi+atu", PC_CORE_PHYS, 0x2000 },
+		{ "ecam", PC_ECAM_PHYS, 0x100000 },
+		{ "mem32", PC_MEM32_PHYS, 0x10000 },
+		{ "pcie sm", PC_SM_PHYS, 0x2000 },
+		{ "cmd db", 0x81c60000ULL, 0x20000 },
+		{ "spmi arbiter", 0x0c400000ULL, 0x90000 },
+		{ "aop qmp", PC_QMP_PHYS, 0x1000 },
+		{ "ipcc", PC_IPCC_PHYS, 0x1000 },
+	};
+	uint64_t tpl = pc_tt_desc(PC_GCC_PHYS);
+	uint32_t attrs = (uint32_t)(tpl & 0xfff);
+
+	print("pcie: map: ttbr0_el1 %x tcr_el1 %x, start level %d, template %x from %x\n",
+	    pc_tt_base(), READ_SYSREG(TCR_EL1), (uint64_t)pc_tt_start(), (uint64_t)attrs, PC_GCC_PHYS);
+	if ((tpl & 1) == 0) {
+		print("pcie: map: %x is not mapped either: nothing is added\n", PC_GCC_PHYS);
+		return;
+	}
+	for (unsigned w = 0; w < sizeof(win) / sizeof(win[0]); w++) {
+		uint32_t added = 0, present = 0, failed = 0;
+
+		for (uint64_t pa = win[w].base; pa < win[w].base + win[w].len; pa += 0x1000) {
+			if (!pc_map_page(pa, attrs, &added, &present)) {
+				failed++;
+			}
+		}
+		print("pcie: map %s %x +%x: %d added, %d already, %d failed\n", win[w].name,
+		    win[w].base, win[w].len, (uint64_t)added, (uint64_t)present, (uint64_t)failed);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	__asm__ volatile ("tlbi vmalle1" ::: "memory");
+	__asm__ volatile ("dsb sy; isb" ::: "memory");
+	/* the page that faulted last time is the proof; the log is on the
+	 * partition before the read, so a fault here still names it */
+	print("pcie: map: parf +1000 reads %x, +1b0 reads %x\n",
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x1000), (uint64_t)pc_rd(PC_PARF_PHYS + 0x1b0));
+	pc_flush();
+}
+
+/* The vote bit is the enable for these domains. From the vendor tree:
+ * pineapple-gdsc.dtsi puts gcc_pcie_0_gdsc on vote bit 0 and gcc_pcie_0_phy_gdsc
+ * on bit 3 of gcc_apcs_gdsc_vote_ctrl (0x15214c), and gdsc-regulator.c clears
+ * the bit to enable and never writes SW_COLLAPSE for a domain that has a
+ * collapse vote. The store is put on the partition first, so a reset here
+ * still says whether the register read back. */
+static int
+pc_gdsc_vote(const char *name, uint32_t gdscr, uint32_t bit, int enable)
+{
+	uint64_t gcc = PC_GCC_PHYS, at = gcc + gdscr;
+	uint32_t vote = pc_rd(gcc + PC_GCC_COLLAPSE), want, value, cfg, polls;
+
+	want = enable ? (vote & ~(1u << bit)) : (vote | (1u << bit));
+	print("pcie: vote %s (bit %d): %x -> %x\n", name, (uint64_t)bit, (uint64_t)vote,
+	    (uint64_t)want);
+	pc_flush();
+	pc_wr(gcc + PC_GCC_COLLAPSE, want);
+	print("pcie:   stored, %x back\n", (uint64_t)pc_rd(gcc + PC_GCC_COLLAPSE));
+	for (polls = 0; polls < 100; polls++) {
+		value = pc_rd(at);
+		cfg = pc_rd(at + 4);
+		if ((cfg & PC_GDSC_UP) && (value & PC_GDSC_ON)) {
+			break;
+		}
+		pc_ms(1);
+	}
+	print("pcie:   %s after %d ms: %x (on %d), cfg %x (up %d)\n", name, (uint64_t)polls,
+	    (uint64_t)value, (uint64_t)((value >> 31) & 1), (uint64_t)cfg,
+	    (uint64_t)((cfg >> 16) & 1));
+	return (cfg & PC_GDSC_UP) && (value & PC_GDSC_ON);
+}
+
+/* The core's power domain one write at a time: stage 3 reset the phone, and this
+ * says which of its two writes does it. 1 clears only the collapse bit, 2 only
+ * SW_COLLAPSE, 3 both (the stage-3 order), 4 all five collapse bits and then
+ * SW_COLLAPSE, 8 writes the same value back (is any store fatal), 5 clocks and
+ * the phy's vote, 6 clocks and the core's vote, 7 rails, clocks, phy, core. */
+static void
+pc_gdsc_try(uint32_t what)
+{
+	uint64_t gcc = PC_GCC_PHYS, at = PC_GCC_PHYS + PC_GCC_GDSCR;
+	uint32_t value = pc_rd(at), collapse = pc_rd(gcc + PC_GCC_COLLAPSE);
+
+	print("\npcie: gdsc try %d: gdscr %x (on %d, collapse %d), collapse reg %x\n",
+	    (uint64_t)what, (uint64_t)value, (uint64_t)((value >> 31) & 1), (uint64_t)(value & 1),
+	    (uint64_t)collapse);
+	if (what == 8) {
+		print("pcie:   control: the same value, written back\n");
+		pc_flush();
+		pc_wr(gcc + PC_GCC_COLLAPSE, collapse);
+		print("pcie:   stored, %x back\n", (uint64_t)pc_rd(gcc + PC_GCC_COLLAPSE));
+		pc_dump("vote written");
+		return;
+	}
+	if (what == 5) {
+		pc_clocks();
+		pc_gdsc_vote("pcie_0_phy_gdsc", PC_GCC_PHY_GDSCR, 3, 1);
+		pc_dump("gdsc try");
+		return;
+	}
+	if (what == 6) {
+		pc_clocks();
+		pc_gdsc_vote("pcie_0_gdsc", PC_GCC_GDSCR, 0, 1);
+		pc_dump("gdsc try");
+		return;
+	}
+	if (what == 7) {
+		pc_radio();
+		pc_clocks();
+		pc_gdsc_vote("pcie_0_phy_gdsc", PC_GCC_PHY_GDSCR, 3, 1);
+		pc_gdsc_vote("pcie_0_gdsc", PC_GCC_GDSCR, 0, 1);
+		pc_dump("gdsc try");
+		return;
+	}
+	if (what == 1 || what == 3) {
+		pc_set("collapse bit 0: cleared", PC_GCC_COLLAPSE, gcc + PC_GCC_COLLAPSE, collapse & ~1u);
+	} else if (what == 4) {
+		pc_set("collapse bits 0-4: cleared", PC_GCC_COLLAPSE, gcc + PC_GCC_COLLAPSE,
+		    collapse & ~0x1fu);
+	}
+	if (what >= 2) {
+		value = pc_rd(at);
+		if (value & 1) {
+			pc_set("pcie_0_gdsc: sw collapse cleared", PC_GCC_GDSCR, at, value & ~1u);
+		}
+	}
+	for (unsigned i = 0; i < 20; i++) {
+		pc_ms(1);
+	}
+	pc_dump("gdsc try");
+}
+
+/* 3: the resets. A core that has never been reset is not a core that is out
+ * of reset: both are held for two milliseconds and released. The device tree
+ * names only the first two; gcc-pineapple.c has five, and the COM PHY is the
+ * one that holds the SerDes' PLL. */
+static void
+pc_resets(void)
+{
+	uint64_t gcc = PC_GCC_PHYS;
+	static const uint32_t com[] = { 0x6c014, 0x6c020, 0x6c028 };
+	static const uint32_t blocks[] = { 0x6f000, 0x6f00c };
+
+	/* Clocks on, gdsc on, no parf or phy write of ours yet: this is the
+	 * boot loader's state, if it left one. */
+	print("pcie: 3: handed over parf +0 %x, +20 %x, +40 %x, +4c %x, +b8 %x, +1b0 %x, +1000 %x\n",
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x0), (uint64_t)pc_rd(PC_PARF_PHYS + 0x20),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x40), (uint64_t)pc_rd(PC_PARF_PHYS + 0x4c),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0xb8), (uint64_t)pc_rd(PC_PARF_PHYS + 0x1b0),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x1000));
+	print("pcie: 3: handed over phy +200 %x, +214 %x, +218 %x, +240 %x, +244 %x, +11e0 %x, +1200 %x\n",
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x200),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x214),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x218),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x240),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x244),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x11e0),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x1200));
+	print("pcie: 3: resets: core %x, phy %x, com %x %x %x, block %x %x\n",
+	    (uint64_t)pc_rd(gcc + PC_GCC_BCR), (uint64_t)pc_rd(gcc + PC_GCC_PHY_BCR),
+	    (uint64_t)pc_rd(gcc + com[0]), (uint64_t)pc_rd(gcc + com[1]), (uint64_t)pc_rd(gcc + com[2]),
+	    (uint64_t)pc_rd(gcc + blocks[0]), (uint64_t)pc_rd(gcc + blocks[1]));
+	pc_set("core reset: held", PC_GCC_BCR, gcc + PC_GCC_BCR, 1);
+	pc_set("phy reset: held", PC_GCC_PHY_BCR, gcc + PC_GCC_PHY_BCR, 1);
+	pc_ms(2);
+	pc_set("core reset: released", PC_GCC_BCR, gcc + PC_GCC_BCR, 0);
+	pc_set("phy reset: released", PC_GCC_PHY_BCR, gcc + PC_GCC_PHY_BCR, 0);
+	pc_ms(2);
+	for (unsigned i = 0; i < sizeof(com) / sizeof(com[0]); i++) {
+		pc_set("com phy: held", com[i], gcc + com[i], 1);
+		pc_ms(1);
+		pc_set("com phy: released", com[i], gcc + com[i], 0);
+		pc_ms(1);
+	}
+	for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+		if (pc_rd(gcc + blocks[i]) & 1) {
+			pc_set("phy block: released", blocks[i], gcc + blocks[i], 0);
+		}
+	}
+	print("pcie: 3: after: core %x, phy %x, com %x %x %x\n", (uint64_t)pc_rd(gcc + PC_GCC_BCR),
+	    (uint64_t)pc_rd(gcc + PC_GCC_PHY_BCR), (uint64_t)pc_rd(gcc + com[0]),
+	    (uint64_t)pc_rd(gcc + com[1]), (uint64_t)pc_rd(gcc + com[2]));
+}
+
+/* 4: the pins. wlan-en is driven low here and raised after the rails are up,
+ * so that the radio sees a power-on edge; perst stays low until 6. */
+static void
+pc_pins(void)
+{
+	uint64_t tlmm = PC_TLMM_PHYS + 0x1000 * PC_PIN_WLAN_EN;
+
+	print("pcie: 4: pins: 16 %x/%x, 94 %x/%x, 95 %x/%x\n",
+	    (uint64_t)pc_rd(tlmm), (uint64_t)pc_rd(tlmm + 4),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ + 4));
+	pc_set("pin 16 wlan-en io: low", 0, tlmm + 4, 0);
+	/* 0x3c3 = gpio, output enable, drive 16 mA, pull up: the values the
+	 * phone's cnss_wlan_en_active pinctrl and the working dodge uefi use. */
+	pc_set("pin 16 wlan-en config: 16 mA, pull up", 0, tlmm, 0x3c3u);
+	pc_set("pin 94 perst io: low", 0, PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4, 0);
+	/* 0x201 = gpio, output enable, 2 mA, pull down, as pcie0_perst_default
+	 * and the working dodge uefi program it. */
+	pc_set("pin 94 perst config: 2 mA, pull down", 0,
+	    PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST, 0x201u);
+	pc_set("pin 95 clkreq: mux pcie0_clk_req_n, pull up", 0,
+	    PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ, PC_PIN_CLKREQ_N);
+	pc_set("pin 96 wake: gpio input, pull up", 0, PC_TLMM_PHYS + 0x1000 * PC_PIN_WAKE,
+	    PC_PIN_IN_PULLUP);
+	print("pcie: 4: clkreq %x/%x, wake %x/%x, perst %x/%x\n",
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ + 4),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_WAKE),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_WAKE + 4),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4));
+}
+
+/* 6: the radio's seven supplies. The address column is the one the command
+ * database carries for each resource (air164: 0x40a00 .. 0x44100). The name is
+ * the cmd-db resource name, so the firmware client below can look it up again;
+ * the label is only what the log says it powers. */
+static const struct {
+	const char *name;
+	const char *label;
+	uint32_t address;
+	uint32_t millivolts;
+} pc_rails[] = {
+	{ "ldob15", "vdd-wlan-io",   0x40a00, 1800 },
+	{ "ldoc3",  "vdd-wlan-io12", 0x42000, 1200 },
+	{ "smpi4",  "vdd-wlan",      0x44100, 940 },
+	{ "smpc2",  "vdd-wlan-aon",  0x40300, 976 },
+	{ "smpc3",  "vdd-wlan-dig",  0x40400, 915 },
+	{ "smpc6",  "vdd-wlan-rfa1", 0x40600, 1864 },
+	{ "smpc1",  "vdd-wlan-rfa2", 0x40200, 1316 },
+	/* pcie0's analog supply. Its node has no vreg-* names, so the values
+	 * come from pcie1's node, which asks for the same three PMIC rails.
+	 * The firmware client takes all ten votes but can only place seven of
+	 * them in its own TCS set, and the direct RSC path below skipped these
+	 * three because the address column was zero. The addresses are the ones
+	 * air164's cmd-db lookup printed, so write them like the other seven. */
+	{ "ldoi3",  "pcie 1p2",      0x44600, 1200 },
+	{ "ldoe3",  "pcie 0p9",      0x43200, 880 },
+	{ "ldoi1",  "pcie qref",     0x44500, 880 },
+};
+
+#define PC_MSGID_WRITE_4  0x10008u
+#define PC_MSGID_WRITE_RESP_4  0x10108u   /* LEN 8 | RESP_REQ | WRITE */
+#define PC_MSGID_READ_4   0x10108u
+#define PC_RAIL_PROBE     0x40a00u      /* ldob15 vdd-wlan-io: read only */
+
+/*
+ * One RPMh "door" (TCS) per group. 0x2a0 is qcom,tcs-offset's stride for a v3
+ * RSC; which index carries active-only traffic is what "oem pcie-rsc" finds.
+ */
+static int pc_rsc_tcs;
+static int pc_rsc_drv = 2;      /* apps RSC drv block: 0x17a00000 + 0x10000 * n */
+static uint32_t pc_rsc_status;  /* CMD_STATUS of the last command, kept before it is cleared */
+static uint32_t pc_rsc_idle;    /* polls spent waiting for the TCS to be free */
+
+static uint64_t
+pc_rsc_base(int tcs)
+{
+	return PC_RSC_PHYS - 0x20000ULL + 0x10000ULL * (uint64_t)pc_rsc_drv +
+	    0xd00 + 0x2a0ULL * (uint64_t)tcs;
+}
+
+/* One command in slot set 0. The layout is the 3.x one (a command stride of
+ * 24 bytes, CONTROL at 0x24); the major version is in the DRV's first word. */
+static int
+pc_rsc(uint32_t address, uint32_t msgid, uint32_t data, int wants_answer, uint32_t *answer)
+{
+	uint64_t base = pc_rsc_base(pc_rsc_tcs);
+	uint32_t irq_enable, polls, done;
+
+	if (((pc_rd(PC_RSC_PHYS) >> 16) & 0xff) != 3) {
+		print("pcie: rsc: not version 3 (%x): not written\n", (uint64_t)pc_rd(PC_RSC_PHYS));
+		return 0;
+	}
+	irq_enable = pc_rd(base);
+	pc_wr(base + 0x08, 1);
+	pc_wr(base + 0x24, 0);
+	pc_wr(base + 0x2c, 0);
+	for (polls = 0; polls < 500; polls++) {
+		if (pc_rd(base + 0x28) != 0) {
+			break;
+		}
+		BS->stall(100);
+	}
+	pc_rsc_idle = polls;
+	pc_wr(base + 0x34, msgid);
+	pc_wr(base + 0x38, address);
+	pc_wr(base + 0x3c, data);
+	pc_wr(base + 0x20, wants_answer ? 1 : 0);
+	pc_wr(base, irq_enable | 1);
+	pc_wr(base + 0x2c, 1);
+	BS->stall(10);
+	pc_wr(base + 0x24, (1u << 16) | (1u << 24));
+	for (polls = 0; polls < 2000; polls++) {
+		if (pc_rd(base + 0x04) & 1) {
+			break;
+		}
+		BS->stall(50);
+	}
+	pc_rsc_status = pc_rd(base + 0x40);
+	if (answer != NULL) {
+		*answer = pc_rd(base + 0x44);
+	}
+	done = (pc_rsc_status & (1u << 16)) != 0;   /* CMD_STATUS.COMPL */
+	pc_wr(base + 0x08, 1);
+	pc_wr(base + 0x24, 0);
+	pc_wr(base + 0x2c, 0);
+	pc_wr(base, irq_enable);
+	return done;
+}
+
+/*
+ * "oem pcie-rsc": vote the seven supplies through the firmware's own RPMh
+ * client and raise wlan-en. This is the route ios-dodge takes on the SM8750:
+ * CmdDbDxe turns a resource name into its address, RpmhDxe keeps the vote and
+ * aggregates it with every other client, and a cold reset releases it. Nothing
+ * here touches the PCIe controller, so it is safe on a cold phone.
+ *
+ * The ABI is the one recovered from RpmhDxe (create at 0x30, issue at 0x98,
+ * revision 0x10001); the offsets are asserted at compile time.
+ */
+struct pc_cmddb_protocol {
+	uint64_t revision;
+	void *query;
+	efi_status (EFIAPI *address)(void *self, const char *name, uint32_t *address);
+};
+
+struct pc_rpmh_protocol {
+	uint64_t revision;
+	void *init;
+	efi_status (EFIAPI *valid)(uint32_t drv, uint8_t *valid);
+	efi_status (EFIAPI *count)(uint32_t drv, uint32_t *count);
+	void *create_internal, *create_explicit;
+	efi_status (EFIAPI *create)(uint32_t drv, const char *name, void **client);
+	void *invalidate, *callback, *destroy, *find, *churn_all, *churn_single;
+	void *finish, *finish_sw, *issue_set, *invalidate_sleep, *invalidate_wake, *read;
+	efi_status (EFIAPI *issue)(void *client, uint32_t sleep_set, uint8_t wait,
+	    uint32_t address, uint32_t data, uint32_t *request);
+};
+
+_Static_assert(__builtin_offsetof(struct pc_rpmh_protocol, create) == 0x30,
+    "RpmhDxe create ABI");
+_Static_assert(__builtin_offsetof(struct pc_rpmh_protocol, issue) == 0x98,
+    "RpmhDxe issue ABI");
+
+static int pc_rails_client_state;   /* 0 untried, 1 voted, -1 not available */
+
+/* 1 when the firmware took the votes, 0 when it has no such client. The vote
+ * itself is retained by the driver, so the handle is not kept here. */
+static int
+pc_rails_protocol(void)
+{
+	static const efi_guid cmddb_guid = { 0x1c34f691, 0xd33d, 0x4e14,
+	    { 0xb8, 0xf8, 0x32, 0xc6, 0xc0, 0x29, 0xe9, 0x5b } };
+	static const efi_guid rpmh_guid = { 0xe1d0b573, 0xf29f, 0x495d,
+	    { 0x93, 0x52, 0xca, 0x0d, 0xd4, 0x2a, 0x0a, 0x74 } };
+	struct pc_cmddb_protocol *db = NULL;
+	struct pc_rpmh_protocol *rpmh = NULL;
+	void *client = NULL;
+	efi_status s, t;
+	uint8_t valid = 0;
+	uint32_t count = 0, voted = 0;
+
+	if (pc_rails_client_state != 0) {
+		return pc_rails_client_state > 0;
+	}
+	pc_rails_client_state = -1;
+	s = BS->locate_protocol(&cmddb_guid, NULL, (void **)&db);
+	t = BS->locate_protocol(&rpmh_guid, NULL, (void **)&rpmh);
+	print("pcie: rails: cmd-db %x (rev %x), rpmh %x (rev %x)\n", (uint64_t)s,
+	    db != NULL ? (uint64_t)db->revision : 0, (uint64_t)t,
+	    rpmh != NULL ? (uint64_t)rpmh->revision : 0);
+	if (EFI_ERROR(s) || EFI_ERROR(t) || db == NULL || rpmh == NULL ||
+	    db->address == NULL || rpmh->create == NULL || rpmh->issue == NULL) {
+		print("pcie: rails: no firmware client, the tcs path has to do it\n");
+		return 0;
+	}
+	/* drv 2 is the block the device tree gives the applications RSC. */
+	s = rpmh->valid(2, &valid);
+	t = rpmh->count(2, &count);
+	print("pcie: rails: drv 2 valid %d (%x), tcs count %d (%x)\n", (uint64_t)valid,
+	    (uint64_t)s, (uint64_t)count, (uint64_t)t);
+	if (EFI_ERROR(s) || EFI_ERROR(t) || !valid || count < 3) {
+		return 0;
+	}
+	s = rpmh->create(2, "hackios-corvette-wifi", &client);
+	print("pcie: rails: client %x handle %x\n", (uint64_t)s,
+	    (uint64_t)(uintptr_t)client);
+	if (EFI_ERROR(s) || client == NULL) {
+		return 0;
+	}
+	for (unsigned r = 0; r < sizeof(pc_rails) / sizeof(pc_rails[0]); r++) {
+		uint32_t address = 0, request = 0;
+		efi_status dbs, vs, ms, es;
+
+		dbs = db->address(db, pc_rails[r].name, &address);
+		if (EFI_ERROR(dbs) || address == 0) {
+			print("pcie: rails: %s: no address (%x)\n", pc_rails[r].name,
+			    (uint64_t)dbs);
+			continue;
+		}
+		/* Voltage, then mode 7 (high power), then enable: the order the
+		 * working dodge uefi uses. Without the mode vote an ldo can stay in
+		 * low power mode and limit the radio's inrush. */
+		vs = rpmh->issue(client, 0, 0, address, pc_rails[r].millivolts, &request);
+		ms = rpmh->issue(client, 0, 0, address + 8, 7, &request);
+		es = rpmh->issue(client, 0, 0, address + 4, 1, &request);
+		print("pcie: rails: %s %s at %x: %d mV %x, mode %x, enable %x (request %d)\n",
+		    pc_rails[r].name, pc_rails[r].label, (uint64_t)address,
+		    (uint64_t)pc_rails[r].millivolts, (uint64_t)vs, (uint64_t)ms,
+		    (uint64_t)es, (uint64_t)request);
+		if (!EFI_ERROR(vs) && !EFI_ERROR(es)) {
+			voted++;
+		}
+	}
+	/* The radio's crystal is an RPMh clock resource, not a supply: both
+	 * working bring-ups vote it before the chip is powered. Without it
+	 * the pcie block has no reference and never leaves reset. */
+	{
+		static const char *const clocks[] = { "rfclka1", "rfclka0", "rfclkb1" };
+
+		for (unsigned c = 0; c < sizeof clocks / sizeof clocks[0]; c++) {
+			uint32_t address = 0, request = 0;
+			efi_status cs = db->address(db, clocks[c], &address);
+
+			if (EFI_ERROR(cs) || address == 0) {
+				print("pcie: rails: clock %s: no address (%x)\n",
+				    clocks[c], (uint64_t)cs);
+				continue;
+			}
+			cs = rpmh->issue(client, 0, 0, address, 1, &request);
+			print("pcie: rails: clock %s at %x: on %x (request %d)\n",
+			    clocks[c], (uint64_t)address, (uint64_t)cs, (uint64_t)request);
+		}
+	}
+	BS->stall(10000);
+	print("pcie: rails: %d of %d votes taken\n", (uint64_t)voted,
+	    (uint64_t)(sizeof(pc_rails) / sizeof(pc_rails[0])));
+	pc_rails_client_state = (int)voted == (int)(sizeof(pc_rails) / sizeof(pc_rails[0])) ? 1 : -1;
+	return pc_rails_client_state > 0;
+}
+
+static void
+pc_rsc_probe(void)
+{
+	uint64_t wlan = PC_TLMM_PHYS + 0x1000 * PC_PIN_WLAN_EN;
+
+	print("\npcie: rsc: the firmware rail vote\n");
+	if (!pc_rails_protocol()) {
+		print("pcie: rsc: nothing was voted\n");
+		return;
+	}
+	pc_set("pin 16 wlan-en io: high", 0, wlan + 4, 2);
+	pc_ms(100);
+	print("pcie: rsc: done\n");
+}
+
+/* The always-on processor's mailbox. qcom_aoss.c opens it with five words of
+ * its message memory; the waits here are polls, not interrupts, and the
+ * doorbell is the one redwood_adsp.c rings: IPCC's send register at +0xc,
+ * client 0 (the AOP) in the upper half, signal 0 in the lower. */
+
+/* qcom,pdc_init_table of this phone's cnss-kiwi node, verbatim and in order:
+ * the up and down level of every rail the PDC's rf and bb domains own.
+ * cnss_aop_pdc_reconfig() sends exactly these before the radio is powered. */
+static const char *const pc_pdc_msg[] = {
+	"{class: wlan_pdc, ss: rf, res: s3c.v, upval: 916}",
+	"{class: wlan_pdc, ss: rf, res: s3c.v, upval: 916}",
+	"{class: wlan_pdc, ss: rf, res: s1c.v, upval: 1316}",
+	"{class: wlan_pdc, ss: rf, res: s1c.v, upval: 1316}",
+	"{class: wlan_pdc, ss: rf, res: s6c.v, upval: 1864}",
+	"{class: wlan_pdc, ss: rf, res: s6c.v, upval: 1864}",
+	"{class: wlan_pdc, ss: bb, res: s2c.v, upval: 976}",
+	"{class: wlan_pdc, ss: bb, res: s2c.v, upval: 976}",
+	"{class: wlan_pdc, ss: bb, res: s4i.v, upval: 940}",
+	"{class: wlan_pdc, ss: bb, res: s4i.v, upval: 940}",
+};
+
+static void
+pc_qmp_kick(void)
+{
+	pc_wr(PC_IPCC_SEND, 0);      /* client 0, signal 0 */
+}
+
+static int
+pc_qmp_wait(uint32_t off, uint32_t want)
+{
+	/* qmp_open() and qmp_send() both give the far side a second. */
+	for (unsigned i = 0; i < 1000; i++) {
+		if (pc_rd(PC_QMP_PHYS + off) == want) {
+			return 1;
+		}
+		pc_ms(1);
+	}
+	return 0;
+}
+
+/* How many of the ten the AOP took; 0 also means the mailbox was not ours to
+ * use. A message is never written over one that is still in the buffer. */
+static int
+pc_radio_pdc(void)
+{
+	uint32_t off, size;
+	int taken = 0;
+
+	print("\npcie: 6a: the PDC table the radio's rails need first\n");
+	if (pc_rd(PC_QMP_PHYS) != PC_QMP_MAGIC || pc_rd(PC_QMP_PHYS + 4) != 1) {
+		print("pcie:   qmp +0 %x +4 %x: no mailbox, the table is left alone\n",
+		    (uint64_t)pc_rd(PC_QMP_PHYS), (uint64_t)pc_rd(PC_QMP_PHYS + 4));
+		return 0;
+	}
+	off = pc_rd(PC_QMP_PHYS + 0x38);
+	size = pc_rd(PC_QMP_PHYS + 0x34);
+	print("pcie:   qmp mailbox +%x size %x; ucore link %x ack %x, channel %x ack %x\n",
+	    (uint64_t)off, (uint64_t)size, (uint64_t)pc_rd(PC_QMP_PHYS + 0xc),
+	    (uint64_t)pc_rd(PC_QMP_PHYS + 0x10), (uint64_t)pc_rd(PC_QMP_PHYS + 0x14),
+	    (uint64_t)pc_rd(PC_QMP_PHYS + 0x18));
+	if (size < PC_QMP_MSG_LEN + 4 || off + size > 0x400) {
+		print("pcie:   the mailbox does not hold a %d byte message\n",
+		    (uint64_t)PC_QMP_MSG_LEN);
+		return 0;
+	}
+	/* qmp_open(): ack the far side's link, raise ours, then the channel. */
+	pc_wr(PC_QMP_PHYS + 0x10, pc_rd(PC_QMP_PHYS + 0xc));
+	pc_wr(PC_QMP_PHYS + 0x24, PC_QMP_UP);
+	pc_qmp_kick();
+	if (!pc_qmp_wait(0x28, PC_QMP_UP)) {
+		print("pcie:   the always-on processor did not ack the link\n");
+		return 0;
+	}
+	pc_wr(PC_QMP_PHYS + 0x2c, PC_QMP_UP);
+	pc_qmp_kick();
+	if (!pc_qmp_wait(0x14, PC_QMP_UP)) {
+		print("pcie:   the always-on processor did not open its channel\n");
+		return 0;
+	}
+	pc_wr(PC_QMP_PHYS + 0x18, PC_QMP_UP);
+	pc_qmp_kick();
+	if (!pc_qmp_wait(0x30, PC_QMP_UP)) {
+		print("pcie:   the always-on processor did not ack the channel\n");
+		return 0;
+	}
+	print("pcie:   qmp open: link %x ack %x, channel %x ack %x\n",
+	    (uint64_t)pc_rd(PC_QMP_PHYS + 0x24), (uint64_t)pc_rd(PC_QMP_PHYS + 0x28),
+	    (uint64_t)pc_rd(PC_QMP_PHYS + 0x2c), (uint64_t)pc_rd(PC_QMP_PHYS + 0x30));
+	/* qmp_send(): the payload at +4, its length at +0, 64 bytes, NUL padded,
+	 * written 32 bits at a time; the length word going back to 0 is the ack. */
+	for (unsigned m = 0; m < sizeof(pc_pdc_msg) / sizeof(pc_pdc_msg[0]); m++) {
+		const char *msg = pc_pdc_msg[m];
+		unsigned n = 0;
+
+		if (pc_rd(PC_QMP_PHYS + off) != 0) {
+			print("pcie:   message %d not sent: one is still in the buffer\n",
+			    (uint64_t)m);
+			break;
+		}
+		while (n < PC_QMP_MSG_LEN - 1 && msg[n] != 0) {
+			n++;
+		}
+		for (unsigned k = 0; k < PC_QMP_MSG_LEN; k += 4) {
+			uint32_t w = 0;
+
+			for (unsigned b = 0; b < 4; b++) {
+				if (k + b < n) {
+					w |= (uint32_t)(uint8_t)msg[k + b] << (8 * b);
+				}
+			}
+			pc_wr(PC_QMP_PHYS + off + 4 + k, w);
+		}
+		pc_wr(PC_QMP_PHYS + off, PC_QMP_MSG_LEN);
+		pc_rd(PC_QMP_PHYS + off);       /* the read back qmp_send() does */
+		pc_qmp_kick();
+		if (!pc_qmp_wait(off, 0)) {
+			print("pcie:   message %d \"%s\" was not consumed\n",
+			    (uint64_t)m, msg);
+			pc_wr(PC_QMP_PHYS + off, 0);
+			break;
+		}
+		taken++;
+		print("pcie:   pdc %d/%d taken: %s\n", (uint64_t)(m + 1),
+		    (uint64_t)(sizeof(pc_pdc_msg) / sizeof(pc_pdc_msg[0])), msg);
+	}
+	print("pcie: 6a: %d of %d PDC messages taken\n", (uint64_t)taken,
+	    (uint64_t)(sizeof(pc_pdc_msg) / sizeof(pc_pdc_msg[0])));
+	return taken;
+}
+
+static void
+pc_radio(void)
+{
+	uint64_t wlan = PC_TLMM_PHYS + 0x1000 * PC_PIN_WLAN_EN;
+	unsigned on = 0;
+
+	print("\npcie: 6: the radio's 7 supplies\n");
+	/* The status pins as the chip leaves them, before anything is voted:
+	 * 17 is bt-en, 18 sw-ctrl and 19 wlan-sw-ctrl. */
+	print("pcie:   pins before the rails: 16 %x, 17 %x, 18 %x, 19 %x\n",
+	    (uint64_t)pc_rd(wlan + 4), (uint64_t)pc_rd(PC_TLMM_PHYS + 0x11004),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x12004), (uint64_t)pc_rd(PC_TLMM_PHYS + 0x13004));
+	(void)pc_radio_pdc();
+	/* Firmware client first; the TCS below is the fallback when it is absent. */
+	(void)pc_rails_protocol();
+	/* Every step is a write with RESP_REQ and is waited for. Nothing is read
+	 * back: a read command here is a write of its data word, so the readbacks
+	 * of the earlier rounds were writing zero and switching the rail off. */
+	for (unsigned r = 0; r < sizeof(pc_rails) / sizeof(pc_rails[0]); r++) {
+		uint32_t address = pc_rails[r].address;
+		int volt, mode, enable;
+
+		if (address == 0) {
+			print("pcie:   %s %s: no tcs address, left to the client\n",
+			    pc_rails[r].name, pc_rails[r].label);
+			continue;
+		}
+		volt = pc_rsc(address, PC_MSGID_WRITE_RESP_4, pc_rails[r].millivolts, 1, NULL);
+		mode = pc_rsc(address + 8, PC_MSGID_WRITE_RESP_4, 7, 1, NULL);
+		enable = pc_rsc(address + 4, PC_MSGID_WRITE_RESP_4, 1, 1, NULL);
+		print("pcie:   %s %s at %x: %d mV %s, mode %s, enable %s\n",
+		    pc_rails[r].name, pc_rails[r].label, (uint64_t)address,
+		    (uint64_t)pc_rails[r].millivolts, volt ? "completed" : "silent",
+		    mode ? "completed" : "silent", enable ? "completed" : "silent");
+		if (enable) {
+			on++;
+		}
+		pc_ms(2);
+	}
+	print("pcie: 6: %d of %d enables completed\n", (uint64_t)on,
+	    (uint64_t)(sizeof(pc_rails) / sizeof(pc_rails[0])));
+	pc_set("pin 16 wlan-en io: high", 0, wlan + 4, 2);
+	pc_ms(100);
+	print("pcie:   pins after wlan-en: 16 %x, 17 %x, 18 %x, 19 %x\n",
+	    (uint64_t)pc_rd(wlan + 4), (uint64_t)pc_rd(PC_TLMM_PHYS + 0x11004),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x12004), (uint64_t)pc_rd(PC_TLMM_PHYS + 0x13004));
+	/* The table programs the radio's own pmu, which is what generates
+	 * VDD13_PMU_PCIE_I and VDD19_PMU_PCIE_I, so send it once more now that
+	 * the chip is powered and has pulled sw-ctrl up. The values are the
+	 * same, so the second pass cannot make anything worse. */
+	(void)pc_radio_pdc();
+}
+
+/* 6: the reference clock out to the far end. Without it the radio's receiver
+ * cannot answer a receiver detection, whatever else is configured. */
+static void
+pc_clkref(void)
+{
+	print("pcie: 6: the reference clock, tcsr %x\n", PC_TCSR_PHYS);
+	/* air166aj left these alone and the run never came back; the images
+	 * that did complete always drove them, so drive them. */
+	pc_set("tcsr pcie 0 clkref", 0xb1100, PC_TCSR_PHYS + 0xb1100,
+	    pc_rd(PC_TCSR_PHYS + 0xb1100) | 1u);
+	pc_set("tcsr pcie 1 clkref", 0xb1114, PC_TCSR_PHYS + 0xb1114,
+	    pc_rd(PC_TCSR_PHYS + 0xb1114) | 1u);
+	/* The refgen is a pll of its own and stage 7 reaches the phy's start
+	 * bit within tens of microseconds: let it settle first. */
+	pc_ms(20);
+	print("pcie: 6: refgen settled 20 ms, clkref %x %x\n",
+	    (uint64_t)pc_rd(PC_TCSR_PHYS + 0xb1100), (uint64_t)pc_rd(PC_TCSR_PHYS + 0xb1114));
+}
+
+/* 7: the PHY's own sequence, 115 triples of offset, value and delay from the
+ * phone's device tree (qcom,phy-sequence). The device type has to be RC before
+ * the tables go in: the vendor's msm_pcie_enable_link() writes it first. */
+static const uint32_t pc_phy_sequence[] = {
+	0x240, 0x03, 0x00, 0x0c0, 0x01, 0x00, 0x0cc, 0x62, 0x00,
+	0x0d0, 0x02, 0x00, 0x060, 0xf8, 0x00, 0x064, 0x01, 0x00,
+	0x000, 0x93, 0x00, 0x004, 0x01, 0x00, 0x0e0, 0x90, 0x00,
+	0x0e4, 0x82, 0x00, 0x0f4, 0x07, 0x00, 0x070, 0x02, 0x00,
+	0x010, 0x02, 0x00, 0x074, 0x16, 0x00, 0x014, 0x16, 0x00,
+	0x078, 0x36, 0x00, 0x018, 0x36, 0x00, 0x110, 0x08, 0x00,
+	0x0bc, 0x0a, 0x00, 0x120, 0x42, 0x00, 0x080, 0x04, 0x00,
+	0x084, 0x0d, 0x00, 0x020, 0x0a, 0x00, 0x024, 0x1a, 0x00,
+	0x088, 0x41, 0x00, 0x028, 0x34, 0x00, 0x090, 0xab, 0x00,
+	0x094, 0xaa, 0x00, 0x098, 0x01, 0x00, 0x030, 0x55, 0x00,
+	0x034, 0x55, 0x00, 0x038, 0x01, 0x00, 0x140, 0x14, 0x00,
+	0x164, 0x34, 0x00, 0x03c, 0x01, 0x00, 0x01c, 0x04, 0x00,
+	0x174, 0x16, 0x00, 0x1bc, 0x0f, 0x00, 0x170, 0xa0, 0x00,
+	0x11a4, 0x38, 0x00, 0x10dc, 0x11, 0x00, 0x1160, 0xbf, 0x00,
+	0x1164, 0xbf, 0x00, 0x1168, 0xb7, 0x00, 0x116c, 0xea, 0x00,
+	0x115c, 0x3f, 0x00, 0x1174, 0x5c, 0x00, 0x1178, 0x9c, 0x00,
+	0x117c, 0x1a, 0x00, 0x1180, 0x89, 0x00, 0x1170, 0xdc, 0x00,
+	0x1188, 0x94, 0x00, 0x118c, 0x5b, 0x00, 0x1190, 0x1a, 0x00,
+	0x1194, 0x89, 0x00, 0x10cc, 0x00, 0x00, 0x1008, 0x09, 0x00,
+	0x1014, 0x05, 0x00, 0x104c, 0x08, 0x00, 0x1050, 0x08, 0x00,
+	0x10d8, 0x0f, 0x00, 0x1118, 0x1c, 0x00, 0x10f8, 0x07, 0x00,
+	0x11f8, 0x08, 0x00, 0x1600, 0x00, 0x00, 0xe84, 0x15, 0x00,
+	0xe90, 0x3f, 0x00, 0xee4, 0x02, 0x00, 0xe40, 0x09, 0x00,
+	0xe3c, 0x15, 0x00, 0x19a4, 0x38, 0x00, 0x18dc, 0x11, 0x00,
+	0x1960, 0xbf, 0x00, 0x1964, 0xbf, 0x00, 0x1968, 0xb7, 0x00,
+	0x196c, 0xea, 0x00, 0x195c, 0x3f, 0x00, 0x1974, 0x5c, 0x00,
+	0x1978, 0x9c, 0x00, 0x197c, 0x1a, 0x00, 0x1980, 0x89, 0x00,
+	0x1970, 0xdc, 0x00, 0x1988, 0x94, 0x00, 0x198c, 0x5b, 0x00,
+	0x1990, 0x1a, 0x00, 0x1994, 0x89, 0x00, 0x18cc, 0x00, 0x00,
+	0x1808, 0x09, 0x00, 0x1814, 0x05, 0x00, 0x184c, 0x08, 0x00,
+	0x1850, 0x08, 0x00, 0x18d8, 0x0f, 0x00, 0x1918, 0x1c, 0x00,
+	0x18f8, 0x07, 0x00, 0x19f8, 0x08, 0x00, 0x1684, 0x15, 0x00,
+	0x1690, 0x3f, 0x00, 0x16e4, 0x02, 0x00, 0x1640, 0x09, 0x00,
+	0x163c, 0x15, 0x00, 0x2dc, 0x05, 0x00, 0x388, 0x77, 0x00,
+	0x398, 0x0b, 0x00, 0x6a4, 0x1e, 0x00, 0x6f4, 0x27, 0x00,
+	0x3e0, 0x0f, 0x00, 0x60c, 0x1d, 0x00, 0x614, 0x07, 0x00,
+	0x620, 0xc1, 0x00, 0x694, 0x00, 0x00, 0x3d0, 0x8c, 0x00,
+	0x368, 0x17, 0x00, 0x370, 0x2e, 0x00, 0x200, 0x00, 0x00,
+	0x244, 0x03, 0x00
+};
+
+/* The LTSSM sits in detect.quiet until the phy drives a PIPE clock into the
+ * controller, so a short LTSSM enable answers "is the phy's PLL running right
+ * now?" with the hardware itself. The state is cleared again afterwards. */
+/*
+ * Count a clock through gcc's debug mux. The counter runs against the 4.8 MHz
+ * reference for 0x20000 ticks (about 27 ms) and the status word holds the
+ * number of edges seen in that window.
+ */
+static uint32_t
+pc_measure(const char *what, uint32_t sel)
+{
+	const uint64_t gcc = PC_GCC_PHYS;
+	uint32_t ctl, st, count;
+	int spins;
+
+	pc_wr(gcc + 0x62004, (uint32_t)pc_rd(gcc + 0x62004) | 1u);
+	pc_wr(gcc + 0x62000, ((uint32_t)pc_rd(gcc + 0x62000) & ~0xfu) | 2u);
+	pc_wr(gcc + 0x62024, sel & 0x3ffu);
+
+	ctl = (uint32_t)pc_rd(gcc + 0x62048);
+	pc_wr(gcc + 0x62048, ctl & ~(1u << 20));
+	pc_wr(gcc + 0x62048, (ctl & ~(1u << 20)) | (1u << 21));
+	pc_wr(gcc + 0x62048, ctl & ~((1u << 20) | (1u << 21)));
+
+	ctl = ((ctl & ~0xfffffu) | 0x20000u);
+	pc_wr(gcc + 0x62048, ctl);
+	pc_wr(gcc + 0x62048, ctl | (1u << 20));
+
+	st = (uint32_t)pc_rd(gcc + 0x6204c);
+	for (spins = 0; spins < 200 && (st & (1u << 25)) == 0; spins++) {
+		pc_ms(1);
+		st = (uint32_t)pc_rd(gcc + 0x6204c);
+	}
+
+	pc_wr(gcc + 0x62048, ctl);
+	st = (uint32_t)pc_rd(gcc + 0x6204c);
+	count = st & 0x1ffffffu;
+
+	print("pcie: measure %s (sel %x): %d counts, done %d, %d Hz\n",
+	    what, sel, count, (st >> 25) & 1,
+	    (uint64_t)count * 4800000u / 0x20000u);
+	return count;
+}
+
+static uint32_t
+pc_pipe_probe(const char *where)
+{
+	uint64_t parf = PC_PARF_PHYS;
+	uint32_t state;
+
+	pc_set("probe: ltssm on", 0x1b0, parf + 0x1b0, pc_rd(parf + 0x1b0) | PC_LTSSM_EN);
+	pc_ms(30);
+	state = (uint32_t)(pc_rd(parf + 0x1b0) & 0x3f);
+	pc_set("probe: ltssm off", 0x1b0, parf + 0x1b0, pc_rd(parf + 0x1b0) & ~PC_LTSSM_EN);
+	print("pcie: probe %s: ltssm %x %s, elbi %x, phy +214 %x, +21c %x\n", where,
+	    (uint64_t)state, pc_ltssm_name(state), (uint64_t)pc_rd(PC_CORE_PHYS + 0xf28),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x214),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x21c));
+	return state;
+}
+
+static void
+pc_phy(void)
+{
+	uint64_t parf = PC_PARF_PHYS, phy = PC_PARF_PHYS + PC_PHY_AT;
+	uint32_t writes = sizeof(pc_phy_sequence) / sizeof(pc_phy_sequence[0]) / 3, status = 0, polls;
+
+	/* gcc_pcie_0_phy_rchng_clk_src, gcc 6b058: the vendor node asks for the
+	 * rate change clock at 100 MHz (GPLL0_OUT_EVEN / 3) and the boot loader
+	 * left it on the TCXO. Gate the branch, move the source, gate it back. */
+	{
+		uint32_t cfg = pc_rd(PC_GCC_PHYS + 0x6b058);
+
+		print("pcie: 7: rate change clk: gpll0 %x, src %x, votes %x\n",
+		    (uint64_t)pc_rd(PC_GCC_PHYS), (uint64_t)cfg,
+		    (uint64_t)pc_rd(PC_GCC_PHYS + 0x52000));
+		cfg = pc_rd(PC_GCC_PHYS + 0x6b058);
+		print("pcie: 7: rate change clk: reread %x\n", (uint64_t)cfg);
+		pc_set("rate change clk: 100 MHz from gpll0", 0x6b058, PC_GCC_PHYS + 0x6b058,
+		    (cfg & ~0x7ffu) | (6u << 8) | 5u);
+		pc_ms(2);
+		print("pcie: 7: rate change clk now: src %x, votes %x, gpll0 %x\n",
+		    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b058),
+		    (uint64_t)pc_rd(PC_GCC_PHYS + 0x52000), (uint64_t)pc_rd(PC_GCC_PHYS));
+	}
+
+	/* msm_pcie_enable_link() writes four PARF registers before the phy
+	 * tables: PHY_CTRL bit 0 cleared is what lets the controller's PIPE
+	 * clocks and resets run, SYS_CTRL carries the clock requests, PM_CTRL
+	 * bit 5 lifts the "never enter L1" veto, and MHI clock/reset ctrl bit 4
+	 * releases the MHI path's reset. The S1 wrote only the device type. */
+	print("pcie: 7: parf sys %x, phy ctrl %x, pm ctrl %x, mhi ctrl %x\n",
+	    (uint64_t)pc_rd(parf), (uint64_t)pc_rd(parf + 0x40), (uint64_t)pc_rd(parf + 0x20),
+	    (uint64_t)pc_rd(parf + 0x174));
+
+	/* The board default is 1019, pad selected: leave it alone. Route the
+	 * pipe clock before the tables instead, the way qmp_pcie_power_on does. */
+	/* 1019 is the board's own value and the hardware puts it back after
+	 * every write, so this register is read only in practice. */
+	print("pcie: 7: refclk +4c left alone: %x\n", (uint64_t)pc_rd(parf + 0x4c));
+	pc_set("pipe mux: phy before the tables", 0x6b070, PC_GCC_PHYS + 0x6b070, 0);
+	pc_set("pipe clk: on before the tables", 0x52008, PC_GCC_PHYS + 0x52008,
+	    pc_rd(PC_GCC_PHYS + 0x52008) | (1u << 4));
+	pc_ms(3);
+
+	/* Stage 3 pulsed these before the refgen existed, so the phy's pll block
+	 * may never have left reset. Same five resets, same polarity, now that
+	 * the reference is settled and the boot loader's clocks are running. */
+	{
+		static const uint32_t com[] = { 0x6c014, 0x6c020, 0x6c028 };
+
+		pc_set("reset again: core held", PC_GCC_BCR, PC_GCC_PHYS + PC_GCC_BCR, 1);
+		pc_set("reset again: phy held", PC_GCC_PHY_BCR, PC_GCC_PHYS + PC_GCC_PHY_BCR, 1);
+		pc_ms(2);
+		pc_set("reset again: core released", PC_GCC_BCR, PC_GCC_PHYS + PC_GCC_BCR, 0);
+		pc_set("reset again: phy released", PC_GCC_PHY_BCR, PC_GCC_PHYS + PC_GCC_PHY_BCR, 0);
+		pc_ms(2);
+		for (unsigned i = 0; i < sizeof(com) / sizeof(com[0]); i++) {
+			pc_set("reset again: com held", com[i], PC_GCC_PHYS + com[i], 1);
+			pc_ms(1);
+			pc_set("reset again: com released", com[i], PC_GCC_PHYS + com[i], 0);
+			pc_ms(1);
+		}
+	}
+	/* The core reset above takes the PARF block back to its defaults, so
+	 * everything that has to survive goes in afterwards, in the order
+	 * msm_pcie_enable_link() uses: reset, then device type and the four
+	 * enables, then the tables. */
+	pc_set("device type: RC after the reset", 0x1000, parf + 0x1000, 4);
+	pc_set("phy ctrl: clocks and resets on", 0x40, parf + 0x40, pc_rd(parf + 0x40) & ~1u);
+	print("pcie: 7: after the reset: device type %x, sys %x, phy ctrl %x\n",
+	    (uint64_t)pc_rd(parf + 0x1000), (uint64_t)pc_rd(parf),
+	    (uint64_t)pc_rd(parf + 0x40));
+	print("pcie: 7: the phy's sequence, %d writes from %x\n", (uint64_t)writes, phy);
+	for (uint32_t i = 0; i < writes; i++) {
+		uint32_t offset = pc_phy_sequence[3 * i], value = pc_phy_sequence[3 * i + 1];
+		uint32_t delay = pc_phy_sequence[3 * i + 2], before = pc_rd(phy + offset);
+
+		pc_wr(phy + offset, value);
+		if (pc_rd(phy + offset) != value) {
+			print("pcie:   phy %d/%d +%x did not stick: %x -> %x\n",
+			    (uint64_t)(i + 1), (uint64_t)writes, (uint64_t)offset,
+			    (uint64_t)before, (uint64_t)pc_rd(phy + offset));
+		}
+		if (delay) {
+			pc_ms(delay);
+		}
+	}
+	/* PHYSTATUS is bit 6 of 0x214 and it means the opposite of "ready": Linux
+	 * polls it until it is CLEAR ("if (status & BIT(6)) return false"). */
+	for (polls = 0; polls < 200; polls++) {
+		status = pc_rd(phy + 0x214);
+		if (!(status & 0x40)) {
+			break;
+		}
+		pc_ms(1);
+	}
+	print("pcie: 7: phy +214 %x (bit 6 %d), %d ms; 240 %x, 244 %x, 218 %x, 21c %x, 600 %x\n",
+	    (uint64_t)status, (uint64_t)((status >> 6) & 1), (uint64_t)polls, (uint64_t)pc_rd(phy + 0x240),
+	    (uint64_t)pc_rd(phy + 0x244), (uint64_t)pc_rd(phy + 0x218), (uint64_t)pc_rd(phy + 0x21c),
+	    (uint64_t)pc_rd(phy + 0x600));
+	/* gcc_pcie_0_pipe_clk_src at gcc + 0x6b070: 0 is the phy, 2 is the
+	 * TCXO. The controller's PIPE clock is what carries the receiver
+	 * detect handshake, so it must come from the phy. */
+	print("pcie: 7: pipe mux %x (0 = phy), rchng mux %x, pipe halt %x, votes %x\n",
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b070), (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b058),
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b048), (uint64_t)pc_rd(PC_GCC_PHYS + 0x52008));
+	print("pcie: 7: aux halt %x, cfg halt %x, rchng halt %x, aux src %x, rchng src %x\n",
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b03c), (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b038),
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b054), (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b074),
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b058));
+	/* A hardware gated GCC branch can keep the source it was voted on
+	 * latched, so take the pipe clock down across the mux change. */
+	pc_set("pipe clk: vote off", 0x52008, PC_GCC_PHYS + 0x52008,
+	    pc_rd(PC_GCC_PHYS + 0x52008) & ~(1u << 4));
+	pc_set("pipe mux: phy", 0x6b070, PC_GCC_PHYS + 0x6b070,
+	    pc_rd(PC_GCC_PHYS + 0x6b070) & ~3u);
+	pc_ms(1);
+	pc_set("pipe clk: vote on", 0x52008, PC_GCC_PHYS + 0x52008,
+	    pc_rd(PC_GCC_PHYS + 0x52008) | (1u << 4));
+	pc_ms(1);
+	print("pcie: 7: refclk before the restart +4c %x\n", (uint64_t)pc_rd(parf + 0x4c));
+	/* Restart the phy's power sequencer now that the pipe clock is routed,
+	 * then let the pll settle before reading anything back. */
+	pc_set("phy power down: down", 0x240, phy + 0x240, 0);
+	pc_ms(1);
+	pc_set("phy power down: up", 0x240, phy + 0x240, 3);
+	pc_ms(10);
+	print("pcie: 7: phy after the restart +214 %x, +21c %x, +600 %x, +604 %x\n",
+	    (uint64_t)pc_rd(phy + 0x214), (uint64_t)pc_rd(phy + 0x21c),
+	    (uint64_t)pc_rd(phy + 0x600), (uint64_t)pc_rd(phy + 0x604));
+	print("pcie: 7: refclk after the restart +4c %x\n", (uint64_t)pc_rd(parf + 0x4c));
+	print("pcie: 7: phy com %x %x %x %x %x %x %x %x\n",
+	    (uint64_t)pc_rd(phy + 0x220), (uint64_t)pc_rd(phy + 0x224),
+	    (uint64_t)pc_rd(phy + 0x228), (uint64_t)pc_rd(phy + 0x22c),
+	    (uint64_t)pc_rd(phy + 0x230), (uint64_t)pc_rd(phy + 0x234),
+	    (uint64_t)pc_rd(phy + 0x238), (uint64_t)pc_rd(phy + 0x23c));
+	print("pcie: 7: phy pll %x %x %x %x %x %x %x %x\n",
+	    (uint64_t)pc_rd(phy + 0x11e0), (uint64_t)pc_rd(phy + 0x1200),
+	    (uint64_t)pc_rd(phy + 0x1204), (uint64_t)pc_rd(phy + 0x1208),
+	    (uint64_t)pc_rd(phy + 0x120c), (uint64_t)pc_rd(phy + 0x1210),
+	    (uint64_t)pc_rd(phy + 0x1214), (uint64_t)pc_rd(phy + 0x1218));
+	(void)pc_pipe_probe("after the phy tables");
+	pc_measure("gcc_pcie_0_aux_clk", 0x14cu);
+	pc_measure("pcie_0_pipe_clk from the phy", 0x14fu);
+	pc_measure("gcc_pcie_0_pipe_clk branch", 0x14du);
+	pc_measure("gcc_pcie_0_phy_rchng_clk", 0x14eu);
+}
+
+/* 8: the core's own config space. The vendor writes 0 to DBI_BASE_ADDR_V2 (the
+ * core keeps decoding at the offset the boot loader left); the ATU base stays
+ * 0x1000, and the DT's slv-addr-space-size goes in the low word. */
+static void
+pc_dbi(void)
+{
+	uint64_t parf = PC_PARF_PHYS, core = PC_CORE_PHYS;
+	uint32_t id, command, class, bus, link, misc;
+
+	print("pcie: 8: dbi base %x, atu base %x, slv size %x; core id %x\n",
+	    (uint64_t)pc_rd(parf + 0x350), (uint64_t)pc_rd(parf + 0x634), (uint64_t)pc_rd(parf + 0x358),
+	    (uint64_t)pc_rd(core));
+	if (pc_rd(parf + 0x350) != 0) {
+		pc_set("dbi base v2: 0", 0x350, parf + 0x350, 0);
+	}
+	if (pc_rd(parf + 0x354) != 0) {
+		pc_set("dbi base v2 hi: 0", 0x354, parf + 0x354, 0);
+	}
+	if (pc_rd(parf + 0x634) != 0x1000) {
+		pc_set("atu base: 0x1000", 0x634, parf + 0x634, 0x1000);
+	}
+	if (pc_rd(parf + 0x638) != 0) {
+		pc_set("atu base hi: 0", 0x638, parf + 0x638, 0);
+	}
+	if (pc_rd(parf + 0x358) != 0x4000000) {
+		pc_set("slv size v2: 64 MB", 0x358, parf + 0x358, 0x4000000);
+	}
+	if (pc_rd(parf + 0x35c) != 0) {
+		pc_set("slv size v2 hi: 0", 0x35c, parf + 0x35c, 0);
+	}
+	id = pc_rd(core);
+	if (id == 0 || id == 0xffffffff) {
+		print("pcie:   the core still reads %x: it is not decoding its own config space\n", (uint64_t)id);
+		return;
+	}
+	command = pc_rd(core + 0x04);
+	class = pc_rd(core + 0x08);
+	bus = pc_rd(core + 0x18);
+	link = pc_rd(core + 0x710);
+	misc = pc_rd(core + 0x8bc);
+	print("pcie:   command %x, class %x, bus %x, port link control %x (%d lanes), misc %x\n",
+	    (uint64_t)command, (uint64_t)class, (uint64_t)bus, (uint64_t)link, (uint64_t)((link >> 16) & 0x3f),
+	    (uint64_t)misc);
+	pc_set("misc control 1: ro on", 0x8bc, core + 0x8bc, misc | 1);
+	pc_set("bus numbers", 0x18, core + 0x18, (bus & 0xff000000) | 0x00ff0100);
+	pc_set("command", 0x04, core + 0x04, (command & 0xffff0000) | 0x107);
+	pc_set("class: pci bridge", 0x08, core + 0x08, (class & 0xffff) | 0x06040000);
+	pc_set("misc control 1: ro off", 0x8bc, core + 0x8bc, misc);
+}
+
+/* 9: the four writes the vendor makes that the kernel's S1 had to learn one at
+ * a time: the Qactive veto (0x2c4 bit 0, with bit 8), LANE_SKEW_OFF (0x714
+ * bit 5), the gen3/gen2 field at 0x80c bits 12:8, and INT_ALL_MASK (0x22c). */
+static void
+pc_extras(void)
+{
+	uint64_t parf = PC_PARF_PHYS, core = PC_CORE_PHYS;
+	uint32_t value, misc;
+
+	value = pc_rd(parf + 0x2c4);
+	print("pcie: 9: parf cfg bits 3 %x (qactive veto %d), lane skew %x, gen3/gen2 %x, int mask %x\n",
+	    (uint64_t)value, (uint64_t)(value & 1), (uint64_t)pc_rd(core + 0x714), (uint64_t)pc_rd(core + 0x80c),
+	    (uint64_t)pc_rd(parf + 0x22c));
+	pc_set("qactive veto off", 0x2c4, parf + 0x2c4, value & ~1u);
+	pc_set("cfg bits 3: bit 8", 0x2c4, parf + 0x2c4, pc_rd(parf + 0x2c4) | (1u << 8));
+	pc_set("lane skew off: on", 0x714, core + 0x714, pc_rd(core + 0x714) | (1u << 5));
+	value = pc_rd(core + 0x80c);
+	pc_set("gen3/gen2: field to 1", 0x80c, core + 0x80c, (value & ~0x1f00u) | 0x100);
+	misc = pc_rd(core + 0x8bc);
+	pc_wr(core + 0x8bc, misc | 1);
+	pc_set("max read request size 0", 0x78, core + 0x78, pc_rd(core + 0x78) & ~0x7000u);
+	pc_wr(core + 0x8bc, misc);
+	pc_set("aux clock frequency 20 MHz", 0xb40, core + 0xb40, 20);
+	pc_set("interrupt mask: nothing masked", 0x22c, parf + 0x22c, 0);
+	/* The DT gives qcom,pcie-clkreq-offset = 0x2c48 and a qcom,pcie-sm-seq,
+	 * so the vendor routes the clkreq pin and the l1ss timeout to the state
+	 * machine instead of the legacy path: PARF_CESTA_CLKREQ_SEL (bit 0) and
+	 * PARF_CESTA_L1SUB_TIMEOUT_EXT_INT_EN (bit 3). ios-dodge writes 9 here
+	 * after the phy tables and before the endpoint's reset is released. */
+	print("pcie: 9: cesta route %x at parf +2c48\n", (uint64_t)pc_rd(parf + 0x2c48));
+	pc_set("cesta route: clkreq + l1ss to", 0x2c48, parf + 0x2c48,
+	    pc_rd(parf + 0x2c48) | 9u);
+}
+
+/* The window the DT names in qcom,pcie-sm-debug, in that order: 0x1040 is
+ * PWR_CTRL, 0x1048 PWR_MASK, 0x1090 the run bit, and 0x1094 to 0x109c the
+ * machine's own program counter and status. */
+static void
+pc_sm_dump(const char *when)
+{
+	static const uint32_t at[14] = { 0x1040, 0x1048, 0x1050, 0x1058, 0x1060, 0x1068,
+		0x1070, 0x1078, 0x1080, 0x1088, 0x1090, 0x1094, 0x1098, 0x109c };
+	uint32_t v[14];
+
+	for (unsigned i = 0; i < 14; i++) {
+		v[i] = pc_rd(PC_SM_PHYS + at[i]);
+	}
+	print("pcie: 10: sm %s: %x %x %x %x %x %x %x / %x %x %x %x %x %x %x\n", when,
+	    (uint64_t)v[0], (uint64_t)v[1], (uint64_t)v[2], (uint64_t)v[3], (uint64_t)v[4],
+	    (uint64_t)v[5], (uint64_t)v[6], (uint64_t)v[7], (uint64_t)v[8], (uint64_t)v[9],
+	    (uint64_t)v[10], (uint64_t)v[11], (uint64_t)v[12], (uint64_t)v[13]);
+}
+
+/* 10: the link's own state machine. The program goes at +0, the branches at
+ * +0x1000, and the run bit is bit 0 of +0x1090 -- the vendor's
+ * msm_pcie_cesta_load_sm_seq() order, which the kernel's S1 also follows. */
+static void
+pc_sm(void)
+{
+	static const uint32_t sequence[13] = {
+		0x1c018081, 0x70074002, 0x50028000, 0x28007003, 0x80804002, 0x70021c01, 0x18001802,
+		0x70005000, 0x10004000, 0x80814002, 0x18001c01, 0x1c018080, 0x100
+	};
+	static const uint32_t branches[7] = { 0x04, 0x1c, 0x24, 0x2c, 0x00, 0x00, 0x00 };
+	uint64_t sm = PC_SM_PHYS;
+	uint32_t same = 0, run;
+
+	print("pcie: 10: the state machine at %x: program, branches, then the run bit\n", sm);
+	for (unsigned i = 0; i < 13; i++) {
+		pc_wr(sm + 4 * i, sequence[i]);
+		same += pc_rd(sm + 4 * i) == sequence[i];
+	}
+	for (unsigned i = 0; i < 7; i++) {
+		pc_wr(sm + 0x1000 + 4 * i, branches[i]);
+	}
+	run = pc_rd(sm + 0x1090);
+	/* The kernel's command line names this block:
+	 * pci-msm-drv.pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,0x2 -- base,
+	 * PWR_CTRL, PWR_MASK, instance stride, two instances. The vendor sets bit
+	 * 0 of both for every instance at module_init and clears both for the
+	 * instance it is about to program, right before loading the sequence:
+	 * that bit is the software override of the machine's power handshake.
+	 * This firmware never cleared it, so print what the boot loader left,
+	 * hand the handshake back, and watch the machine's own counter. */
+	pc_sm_dump("left");
+	pc_set("sm pwr ctrl: cleared", 0x1040, sm + 0x1040, pc_rd(sm + 0x1040) & ~1u);
+	pc_set("sm pwr mask: cleared", 0x1048, sm + 0x1048, pc_rd(sm + 0x1048) & ~1u);
+	pc_wr(sm + 0x1090, run & ~1u);
+	pc_wr(sm + 0x1090, run | 1);
+	pc_sm_dump("started");
+	{
+		uint32_t pc0 = pc_rd(sm + 0x1094), pc1 = pc0;
+		unsigned i;
+
+		for (i = 0; i < 50; i++) {
+			pc_ms(1);
+			pc1 = pc_rd(sm + 0x1094);
+			if (pc1 != pc0) {
+				print("pcie: 10: sm moved %x -> %x after %d ms\n", (uint64_t)pc0,
+				    (uint64_t)pc1, (uint64_t)(i + 1));
+				break;
+			}
+		}
+		if (pc1 == pc0) {
+			print("pcie: 10: sm did not move in 50 ms, counter %x\n", (uint64_t)pc0);
+		}
+	}
+	pc_sm_dump("50 ms");
+	print("pcie: 10: %d of 13 program words read back, run bit %x\n", (uint64_t)same,
+	    (uint64_t)pc_rd(sm + 0x1090));
+	(void)pc_pipe_probe("after the state machine");
+	pc_measure("pcie_0_pipe_clk, ltssm running", 0x14fu);
+	pc_measure("gcc_pcie_0_pipe_clk, ltssm running", 0x14du);
+}
+
+/* 11: the endpoint's reset, then training.
+ *
+ * The vendor releases PERST and waits one millisecond (PERST_PROPAGATION_DELAY
+ * 1000-1005 us) before setting PARF_LTSSM bit 8, with one read-modify-write and
+ * no edge. Everything after that is polling: the state is in PARF_LTSSM bits
+ * 5:0, not in the ELBI, whose status register is not wired to the LTSSM on this
+ * generation. */
+/* One fixed budget of LTSSM reads: detect.active pulses every 12 ms, and the
+ * highest state seen. Anything above 1 means a receiver answered. */
+static uint32_t
+pc_window(const char *tag)
+{
+	uint64_t parf = PC_PARF_PHYS;
+	uint32_t i, pulses = 0, last = 0xffffffff, top = 0;
+
+	for (i = 0; i < 250000; i++) {
+		uint32_t now = pc_rd(parf + 0x1b0) & 0x3f;
+
+		if (now == 1 && last != 1)
+			pulses++;
+		if (now > top)
+			top = now;
+		last = now;
+	}
+	print("pcie: 11: window %s: %d reads, top %x, pulses %d, clkreq %x, override %x, route %x, pm %x\n",
+	    tag, (uint64_t)i, (uint64_t)top, (uint64_t)pulses,
+	    (uint64_t)(pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_CLKREQ + 4) & 1),
+	    (uint64_t)pc_rd(parf + 0x2b0), (uint64_t)pc_rd(parf + 0x2c48),
+	    (uint64_t)pc_rd(parf + 0x24));
+	return top;
+}
+
+/* The pad's level as the gpio block sees it: while the pad is muxed to the
+ * controller its gpio input is disconnected, so mux it to gpio with a pull
+ * up, read, and put the board's mux back. */
+static uint32_t
+pc_pin_probe(uint32_t pin, const char *what)
+{
+	uint64_t base = PC_TLMM_PHYS + 0x1000 * pin;
+	uint32_t cfg = pc_rd(base), level;
+
+	pc_wr(base, 0x3);		/* gpio, input, pull up */
+	pc_ms(2);
+	level = pc_rd(base + 4) & 1;
+	pc_wr(base, cfg);
+	print("pcie: 11: %s: pin %d level %d, config %x\n", what, (uint64_t)pin,
+	    (uint64_t)level, (uint64_t)cfg);
+	return level;
+}
+
+
+/* ---- the PMIC itself, over the SPMI arbiter ----------------------------- */
+/* The rails above are votes on the always-on processor's sequencer: its
+ * "completed" answer only says the command was taken, not that a regulator is
+ * on. The PMIC's own registers do say that, and the radio's sleep clock is one
+ * of them: PMK8550 gpio3, which Android's PMIC pinctrl driver turns into a
+ * 32.768 kHz output and which nothing configures when the phone boots through
+ * this loader. Layouts: spmi-pmic-arb v7 (core 0xc400000, cnfg 0xc42d000,
+ * observer 0xc440000, system 0), pinctrl-spmi-gpio (mode 0x40, pull 0x41,
+ * function source 0x44, master enable 0x46), regulator (type 0x04, status 0x08
+ * bit 7 in regulation, voltage 0x40/0x41 in mV, enable 0x46 bit 7). */
+#define PC_ARB_CORE   0x0c400000UL
+#define PC_ARB_CNFG   0x0c42d000UL
+#define PC_ARB_OBS    0x0c440000UL
+#define PC_ARB_MAP(n) (0x2000 + 4 * (n))
+#define PC_ARB_CH(n)  (0x20 * (n))
+#define PC_OBS_CMD    0x00
+#define PC_OBS_STATUS 0x08
+#define PC_OBS_DATA0  0x18
+#define PC_OBS_DATA1  0x1c
+
+/* One transfer. bytes != 0 reads count (1 to 8) registers from reg on; bytes
+ * == 0 writes value to reg. Returns 0, -1 when the arbiter never answered,
+ * -2 when it refused or the transfer failed. */
+static int
+pc_spmi(uint32_t channel, uint8_t reg, uint32_t value, uint8_t *bytes, uint32_t count)
+{
+	uint64_t ch = PC_ARB_OBS + PC_ARB_CH(channel), spin;
+	uint32_t status = 0;
+
+	if (bytes != 0) {
+		pc_wr(ch + PC_OBS_CMD, (1u << 27) | (uint32_t)reg << 4 | (count - 1));
+	} else {
+		pc_wr(ch + PC_OBS_DATA0, value);
+		pc_wr(ch + PC_OBS_CMD, (uint32_t)reg << 4 | (count - 1));
+	}
+	for (spin = 0; spin < 5000; spin++) {
+		status = pc_rd(ch + PC_OBS_STATUS);
+		if (status & 1u) {
+			break;
+		}
+	}
+	if (!(status & 1u)) {
+		return -1;
+	}
+	if (status & 0xeu) {
+		return -2;
+	}
+	if (bytes != 0) {
+		uint32_t first = pc_rd(ch + PC_OBS_DATA0);
+		uint32_t second = count > 4 ? pc_rd(ch + PC_OBS_DATA1) : 0;
+		uint32_t i;
+
+		for (i = 0; i < count; i++) {
+			bytes[i] = (uint8_t)((i < 4 ? first : second) >> (8 * (i % 4)));
+		}
+	}
+	return 0;
+}
+
+/* The arbiter's channel of the peripheral with this PPID, or -1. */
+static int
+pc_spmi_channel(uint32_t ppid, uint32_t *owner)
+{
+	uint32_t apids = pc_rd(PC_ARB_CORE + 4) & 0x7ff, n;
+
+	if (apids == 0 || apids > 1024) {
+		return -1;
+	}
+	for (n = 0; n < apids; n++) {
+		uint32_t map = pc_rd(PC_ARB_CORE + PC_ARB_MAP(n));
+
+		if (!map || ((map >> 8) & 0xfff) != ppid) {
+			continue;
+		}
+		*owner = pc_rd(PC_ARB_CNFG + 4 * n) & 7;
+		return (int)n;
+	}
+	return -1;
+}
+
+/* Every SMPS and LDO the arbiter knows, read the way the regulator driver
+ * would: what it is, whether it is in regulation, and at what voltage. */
+static int
+pc_rail_wanted(uint32_t mv)
+{
+	static const uint32_t want[] = {1800, 1200, 940, 976, 915, 1316, 1864};
+	unsigned i;
+
+	for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+		uint32_t d = mv > want[i] ? mv - want[i] : want[i] - mv;
+
+		if (d <= 4) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+pc_pmic_survey(const char *when)
+{
+	uint32_t apids = pc_rd(PC_ARB_CORE + 4) & 0x7ff, n, answered = 0, found = 0, wanted = 0;
+
+	print("pcie: 6b: the pmic's own view %s (%d apids)\n", when, (uint64_t)apids);
+	if (apids == 0 || apids > 1024) {
+		print("pcie: 6b: the arbiter reports no usable apids\n");
+		return;
+	}
+	/* Only the rails this loader votes are printed: the whole table is 46
+	 * lines and the staged copy of the log has no room for it. */
+	for (n = 0; n < apids; n++) {
+		uint32_t map = pc_rd(PC_ARB_CORE + PC_ARB_MAP(n));
+		uint32_t ppid, owner, mv;
+		uint8_t type = 0, st = 0, en = 0, lo = 0, hi = 0;
+
+		if (!map) {
+			continue;
+		}
+		ppid = (map >> 8) & 0xfff;
+		owner = pc_rd(PC_ARB_CNFG + 4 * n) & 7;
+		if (pc_spmi(n, 0x04, 0, &type, 1) != 0) {
+			continue;
+		}
+		answered++;
+		if (type != 0x03 && type != 0x04) {
+			continue;
+		}
+		found++;
+		(void)pc_spmi(n, 0x08, 0, &st, 1);
+		(void)pc_spmi(n, 0x46, 0, &en, 1);
+		(void)pc_spmi(n, 0x40, 0, &lo, 1);
+		(void)pc_spmi(n, 0x41, 0, &hi, 1);
+		mv = ((uint32_t)hi << 8) | lo;
+		if (!(en & 0x80) || !pc_rail_wanted(mv)) {
+			continue;
+		}
+		print("pcie: 6b:   %x %s %d mV enabled, %s (owner %d)\n", (uint64_t)ppid,
+		    type == 0x03 ? "smps" : "ldo", (uint64_t)mv,
+		    (st & 0x80) ? "in regulation" : "not in regulation", (uint64_t)owner);
+		wanted++;
+	}
+	print("pcie: 6b: %d answered of %d, %d regulators, %d enabled at a voted voltage\n",
+	    (uint64_t)answered, (uint64_t)apids, (uint64_t)found, (uint64_t)wanted);
+	flush_log();
+}
+
+/* PMK8550 gpio3 (dt: alt_sleep_clk, function func1, output, no bias) is the
+ * radio's 32.768 kHz sleep clock. After a boot through this loader it is an
+ * enabled input with no source, so the WCN7850's PMU has no sleep clock at
+ * all; K90 records the same state and sets this pin from its own power code. */
+static void
+pc_pmic_sleep_clock(void)
+{
+	static const uint8_t regs[10] = {0x04, 0x05, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x4a};
+	uint8_t r[10] = {0};
+	uint32_t page, channel = 0xffffffff, owner = 0, i;
+	int s1, s2, s3;
+
+	for (page = 0xb8; page <= 0xbf; page++) {
+		uint32_t ppid = page, ch;
+		uint8_t type = 0;
+		int rc;
+
+		for (ch = 0; ch < 1024; ch++) {
+			uint32_t map = pc_rd(PC_ARB_CORE + PC_ARB_MAP(ch));
+
+			if (map && ((map >> 8) & 0xfff) == ppid) {
+				break;
+			}
+		}
+		if (ch == 1024) {
+			continue;
+		}
+		rc = pc_spmi(ch, 0x04, 0, &type, 1);
+		print("pcie: 6b: page %x channel %d type %x %s\n", (uint64_t)ppid,
+		    (uint64_t)ch, (uint64_t)type, rc == 0 ? "" : "(no answer)");
+		if (ppid == 0xbb) {
+			channel = ch;
+			owner = pc_rd(PC_ARB_CNFG + 4 * ch) & 7;
+		}
+	}
+	if (channel == 0xffffffff) {
+		print("pcie: 6b: no channel for pmk8550 gpio3 (page bb of sid 0)\n");
+		return;
+	}
+	for (i = 0; i < sizeof(regs); i++) {
+		(void)pc_spmi(channel, regs[i], 0, &r[i], 1);
+	}
+	print("pcie: 6b: gpio3 type %x subtype %x, mode %x, pull %x, source %x, enable %x, power %x (owner %d)\n",
+	    (uint64_t)r[0], (uint64_t)r[1], (uint64_t)r[2], (uint64_t)r[3], (uint64_t)r[6],
+	    (uint64_t)r[8], (uint64_t)r[9], (uint64_t)owner);
+	if ((r[0] & 0x1f) != 0x10) {
+		print("pcie: 6b: page bb is not a gpio (type %x), left alone\n", (uint64_t)r[0]);
+		return;
+	}
+	if ((r[8] & 0x80) && (r[2] & 3) == 1 && (r[6] & 0xf) == 2) {
+		print("pcie: 6b: the sleep clock already runs as an output, function 1\n");
+		return;
+	}
+	/* The first write repeats the enable register's current value, so a wrong
+	 * channel path cannot change the PMIC: if it does not read back, nothing
+	 * else is written. */
+	/* The write channel (chnls) aborts on access from here (esr 96000010
+	 * at 0xc56e010), so this stays read only and the pin keeps the state
+	 * it was found in. */
+	print("pcie: 6b: the sleep clock stays as found; chnls is not reachable\n");
+	for (i = 0; i < sizeof(regs); i++) {
+		(void)pc_spmi(channel, regs[i], 0, &r[i], 1);
+	}
+	print("pcie: 6b: gpio3 now mode %x, source %x, enable %x\n",
+	    (uint64_t)r[2], (uint64_t)r[6], (uint64_t)r[8]);
+	flush_log();
+}
+
+/* 11: the link, in the order the two working WCN7850 ports use (sheng's
+ * WifiProbe on SM8550, K90's mhi_pcie_power on SM8750): the root port is
+ * configured while PERST# is held low, PERST# stays low for 100 ms after the
+ * power-up, then one rising edge, a millisecond, and the LTSSM. The vendor
+ * state machine (0x1d07000) is not used: neither of those ports runs it. */
+static uint32_t
+pc_link(void)
+{
+	uint64_t parf = PC_PARF_PHYS, core = PC_CORE_PHYS;
+	uint32_t state = 0xffffffff, capability = 0, status = 0, at, ms;
+
+	for (at = pc_rd(core + 0x34) & 0xfc; capability == 0 && at >= 0x40 && at <= 0xfc; ) {
+		uint32_t word = pc_rd(core + at);
+
+		if ((word & 0xff) == 0x10) {
+			capability = at;
+			break;
+		}
+		at = (word >> 8) & 0xfc;
+	}
+	print("pcie: 11: ltssm %x (state %d), capability %x, link status %x\n",
+	    (uint64_t)pc_rd(parf + 0x1b0), (uint64_t)(pc_rd(parf + 0x1b0) & 0x3f),
+	    (uint64_t)capability,
+	    (uint64_t)(capability ? pc_rd(core + capability + 0x10) >> 16 : 0));
+	pc_set("device type: RC", 0x1000, parf + 0x1000, 4);
+	/* The vendor enables the master wakeup and disables core clock gating in
+	 * sys ctrl; the boot loader leaves both off. */
+	pc_set("parf sys: master wakeup, core cgc off", 0x0, parf,
+	    pc_rd(parf) | (1u << 1) | (1u << 6));
+	/* With no state manager running the clkreq signal has to go to the
+	 * controller, not to cesta, or the controller never sees it. */
+	pc_set("cesta route: clkreq to parf", 0x2c48, parf + 0x2c48,
+	    pc_rd(parf + 0x2c48) & ~1u);
+	/* cnss2 drives bt-en low whenever the link will not come up. */
+	pc_set("pin 17 bt-en config: output", 0, PC_TLMM_PHYS + 0x1000 * 17, 0x2c0);
+	pc_set("pin 17 bt-en io: low", 0, PC_TLMM_PHYS + 0x1000 * 17 + 4, 0);
+	/* Stock's config space: link control width field 3 (x2), link
+	 * capabilities max width 2, link control 2 Gen1 first (K90 trains at
+	 * Gen1 before it asks for more). */
+	pc_set("link width: x2 like stock", 0x710, core + 0x710,
+	    (pc_rd(core + 0x710) & ~(0x3fu << 16)) | (3u << 16));
+	pc_set("dbi misc: writes allowed", 0x8bc, core + 0x8bc,
+	    pc_rd(core + 0x8bc) | 1u);
+	pc_set("link cap: max width 2", 0x7c, core + 0x7c,
+	    (pc_rd(core + 0x7c) & ~(0x3fu << 4)) | (2u << 4));
+	pc_set("link ctrl 2: target gen2 like stock", 0xa0, core + 0xa0,
+	    (pc_rd(core + 0xa0) & ~0xfu) | 2u);
+	/* Stock's gen3 related register has bit 0 clear; ours inherits it set.
+	 * air166aq cleared it, and that is the only build that probed. */
+	pc_set("gen3 related: zrxdc compliant", 0x890, core + 0x890,
+	    pc_rd(core + 0x890) & ~1u);
+	pc_set("gen3/gen2: field to 1 like stock", 0x80c, core + 0x80c,
+	    (pc_rd(core + 0x80c) & ~(0xfu << 16)) | (1u << 16));
+	pc_set("root port bus numbers", 0x18, core + 0x18, 0x00010100u);
+	pc_set("root port command: memory, bus master", 0x4, core + 0x4,
+	    (pc_rd(core + 0x4) & 0xffffu) | 6u);
+	pc_set("dbi misc: read only again", 0x8bc, core + 0x8bc,
+	    pc_rd(core + 0x8bc) & ~1u);
+	/* qcom_ep_reset_deassert: PERST# low for at least 100 ms after the module
+	 * is powered, then high, then the LTSSM a millisecond later. */
+	/* One rising edge, from the level stage 4 left asserted: the RC pulses
+	 * detect.active again only when PERST# has been high for a while before
+	 * the LTSSM starts, which is what air166aq did (180 ms) and air167 lost. */
+	pc_set("pin 94 perst io: high", 0, PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4, 2);
+	pc_ms(1);
+	/* bit 0 of the io word is the level on the pad, bit 1 what is driven:
+	 * if the line does not read high, the module never sees PERST# release. */
+	print("pcie: 11: perst pad config %x io %x (level %d)\n",
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST),
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4),
+	    (uint64_t)(pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4) & 1));
+	pc_ms(179);
+	print("pcie: 11: perst pad after 180 ms io %x (level %d)\n",
+	    (uint64_t)pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4),
+	    (uint64_t)(pc_rd(PC_TLMM_PHYS + 0x1000 * PC_PIN_PERST + 4) & 1));
+	pc_set("mhi clock reset: bit 4", 0x174, parf + 0x174,
+	    pc_rd(parf + 0x174) | (1u << 4));
+	pc_set("parf ltssm: enable", 0x1b0, parf + 0x1b0,
+	    pc_rd(parf + 0x1b0) | PC_LTSSM_EN);
+	for (ms = 0; ms < 1000; ms++) {
+		state = pc_rd(parf + 0x1b0) & 0x3f;
+		if (ms == 1 || ms == 10 || ms == 100 || ms == 500) {
+			print("pcie: 11: +%d ms: ltssm %x %s, port debug0 %x, debug1 %x, link %x\n",
+			    (uint64_t)ms, (uint64_t)state, pc_ltssm_name(state),
+			    (uint64_t)pc_rd(core + 0x728), (uint64_t)pc_rd(core + 0x72c),
+			    (uint64_t)pc_rd(core + 0x80));
+		}
+		if (state == 0x11 && (pc_rd(core + 0x72c) & (1u << 4))) {
+			break;
+		}
+		pc_ms(1);
+	}
+	if (capability != 0) {
+		status = pc_rd(core + capability + 0x10) >> 16;
+	}
+	print("pcie: 11: after %d ms: ltssm %x %s, link status %x (up %d, speed %d, width %d)\n",
+	    (uint64_t)ms, (uint64_t)state, pc_ltssm_name(state), (uint64_t)status,
+	    (uint64_t)((status >> 13) & 1), (uint64_t)(status & 0xf),
+	    (uint64_t)((status >> 4) & 0x3f));
+	print("pcie: 11: parf refclk %x, phy +214 %x (ready %d), parf 1b0 %x\n",
+	    (uint64_t)pc_rd(parf + 0x4c), (uint64_t)pc_rd(parf + PC_PHY_AT + 0x214),
+	    (uint64_t)((pc_rd(parf + PC_PHY_AT + 0x214) >> 6) & 1),
+	    (uint64_t)pc_rd(parf + 0x1b0));
+	return state;
+}
+
+
+/* 12: only with the link up, the endpoint's own register space. The outbound
+ * iATU is given the vendor's CFG0 window to bus 1 device 0 and the DT's MEM32
+ * aperture; the identity at 0x60100000 is what says whether the radio answered
+ * -- and it needs no oscilloscope to be believed. */
+static int
+pc_iatu_region(unsigned region, uint32_t type, uint32_t host, uint32_t limit, uint32_t target)
+{
+	static const uint32_t regs[7] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18 };
+	uint32_t values[7] = { type, 0x80000000u, host, 0, limit, target, 0 };
+	uint64_t at = PC_CORE_PHYS + 0x1000 + region * 0x200;
+
+	pc_wr(at + 0x04, 0);
+	for (unsigned i = 0; i < 7; i++) {
+		pc_wr(at + regs[i], values[i]);
+	}
+	pc_wr(at + 0x04, 0x80000000u);
+	for (unsigned i = 0; i < 7; i++) {
+		if (pc_rd(at + regs[i]) != values[i]) {
+			print("pcie: 12: region %d +%x reads %x, not %x\n", (uint64_t)region, (uint64_t)regs[i],
+			    (uint64_t)pc_rd(at + regs[i]), (uint64_t)values[i]);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static void
+pc_identity(void)
+{
+	uint64_t ecam = PC_ECAM_PHYS;
+	uint32_t identity, class, bar0;
+
+	print("pcie: 12: the iATU: cfg0 to bus 1 device 0, mem32 to %x\n", PC_MEM32_PHYS);
+	if (!pc_iatu_region(0, 0x4, (uint32_t)ecam, (uint32_t)(ecam + 0xfff), 0x01000000)) {
+		return;
+	}
+	if (!pc_iatu_region(1, 0x0, (uint32_t)PC_MEM32_PHYS,
+	    (uint32_t)(PC_MEM32_PHYS + PC_MEM32_SIZE - 1), (uint32_t)PC_MEM32_PHYS)) {
+		return;
+	}
+	identity = pc_rd(ecam);
+	class = pc_rd(ecam + 8);
+	bar0 = pc_rd(ecam + 0x10);
+	print("pcie: 12: endpoint id %x (vendor %x, device %x), class %x, bar0 %x\n", (uint64_t)identity,
+	    (uint64_t)(identity & 0xffff), (uint64_t)(identity >> 16), (uint64_t)class, (uint64_t)bar0);
+	if (identity == 0xffffffff || (identity & 0xffff) != 0x17cb) {
+		print("pcie: 12: no endpoint answered: the link is not carrying it\n");
+		return;
+	}
+	print("pcie: 12: THE RADIO ANSWERED (%x): the link is up and its config space is readable\n",
+	    (uint64_t)identity);
+	if (bar0 != 0 && bar0 != 0xffffffff && !(bar0 & 1) && (bar0 & 6) == 0) {
+		uint32_t bar = bar0 & ~0xfu;
+
+		if (bar >= PC_MEM32_PHYS && bar <= PC_MEM32_PHYS + PC_MEM32_SIZE - 4) {
+			print("pcie: 12: bar0 %x reads %x\n", (uint64_t)bar,
+			    (uint64_t)pc_rd(PC_MEM32_PHYS + (bar - (uint32_t)PC_MEM32_PHYS)));
+		}
+	}
+}
+
+static void pc_clocks_again_note(void);
+
+static void
+pc_bringup(void)
+{
+	uint32_t ltssm;
+	int core_up, phy_up;
+
+	print("\npcie: PCIe0 for the WCN7850: the kernel's S1, run in the firmware instead\n");
+	pc_dump("before");
+	pc_pins();
+	pc_clocks();
+	core_up = pc_gdsc("pcie_0_gdsc", PC_GCC_GDSCR, 0);
+	phy_up = pc_gdsc("pcie_0_phy_gdsc", PC_GCC_PHY_GDSCR, 3);
+	if (!core_up || !phy_up) {
+		print("pcie: the power domains did not come up (%d/%d): parf, the phy and the link are left alone\n",
+		    (uint64_t)core_up, (uint64_t)phy_up);
+		return;
+	}
+	pc_clocks_again_note();
+	pc_resets();
+	pc_radio();
+	pc_pmic_survey("after the rails");
+	pc_pmic_sleep_clock();
+	pc_clkref();
+	pc_phy();
+	pc_dbi();
+	pc_extras();
+	pc_sm();
+	ltssm = pc_link();
+	if (ltssm == 0x11) {
+		pc_identity();
+	} else {
+		print("pcie: the link did not reach L0, so nothing behind it is read\n");
+	}
+	print("pcie: done: ltssm %x %s\n", (uint64_t)ltssm, pc_ltssm_name(ltssm));
+}
+
+
+/* The same sequence as pc_bringup(), cut at stage n. Every stage redoes the ones
+ * before it, so "oem pcie-stage 3" is "1, 2 and 3" and a reset names the stage
+ * that did it: the reply for the stage that reset the phone never arrives. */
+static void
+pc_stage(uint32_t upto)
+{
+	uint32_t ltssm;
+
+	/* What the boot loader handed over, before this round touches anything. */
+	print("pcie: 0: left parf +0 %x, +20 %x, +40 %x, +4c %x, +1b0 %x, +1000 %x\n",
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x0), (uint64_t)pc_rd(PC_PARF_PHYS + 0x20),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x40), (uint64_t)pc_rd(PC_PARF_PHYS + 0x4c),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + 0x1b0), (uint64_t)pc_rd(PC_PARF_PHYS + 0x1000));
+	print("pcie: 0: left phy +200 %x, +214 %x, +240 %x, +244 %x, +11e0 %x, +1200 %x\n",
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x200),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x214),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x240),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x244),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x11e0),
+	    (uint64_t)pc_rd(PC_PARF_PHYS + PC_PHY_AT + 0x1200));
+	print("pcie: 0: left gcc pipes %x, pipe mux %x, rchng %x, gdsc %x %x\n",
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x52008), (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b070),
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b058), (uint64_t)pc_rd(PC_GCC_PHYS + 0x6b004),
+	    (uint64_t)pc_rd(PC_GCC_PHYS + 0x6c000));
+	print("\npcie: stages 1..%d (1 pins, 2 clocks, 3 core gdsc, 4 phy gdsc, 5 resets,\n",
+	    (uint64_t)upto);
+	print("pcie:         6 rails, 7 clkref, 8 phy, 9 dbi, 10 link)\n");
+	if (upto >= 1) {
+		pc_pins();
+	}
+	if (upto >= 2) {
+		pc_clocks();
+	}
+	if (upto >= 3 && !pc_gdsc("pcie_0_gdsc", PC_GCC_GDSCR, 0)) {
+		print("pcie: the core's power domain did not come up\n");
+		return;
+	}
+	if (upto >= 4 && !pc_gdsc("pcie_0_phy_gdsc", PC_GCC_PHY_GDSCR, 3)) {
+		print("pcie: the phy's power domain did not come up\n");
+		return;
+	}
+	if (upto >= 5) {
+		pc_resets();
+	}
+	if (upto >= 6) {
+		pc_radio();
+		pc_pmic_survey("after the rails");
+		pc_pmic_sleep_clock();
+	}
+	if (upto >= 7) {
+		pc_clkref();
+	}
+	if (upto >= 8) {
+		pc_phy();
+	}
+	if (upto >= 9) {
+		pc_dbi();
+		pc_extras();
+		pc_sm();
+		}
+	if (upto >= 10) {
+		ltssm = pc_link();
+		print("pcie: ltssm %x %s\n", (uint64_t)ltssm, pc_ltssm_name(ltssm));
+	}
+	pc_dump("after");
+}
+
+/* The clock registers again, now that both power domains are up: before that a
+ * halt bit proves nothing, because a clock whose domain has no power is halted
+ * whatever its branch vote says. */
+static void
+pc_clocks_again_note(void)
+{
+	uint64_t gcc = PC_GCC_PHYS;
+	static const uint32_t halt[] = { 0x6b01c, 0x6b020, 0x6b02c, 0x6b038, 0x6b03c, 0x6b048, 0x6b054, 0x10058 };
+	uint32_t halted = 0;
+
+	for (unsigned i = 0; i < sizeof(halt) / sizeof(halt[0]); i++) {
+		halted |= pc_rd(gcc + halt[i]) & 1;
+	}
+	print("pcie: 2b: with both domains up: vote %x/%x, a halt bit is %s\n",
+	    (uint64_t)pc_rd(gcc + PC_GCC_VOTE), (uint64_t)pc_rd(gcc + PC_GCC_VOTE_RCH),
+	    halted ? "still set (that clock's source is not running)" : "clear");
+}
+
 static int
 starts_with(const char *s, const char *prefix)
 {
@@ -3624,7 +5734,7 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") || starts_with(cmd, "oem pcie"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3639,7 +5749,7 @@ fb_command(char *cmd)
 			} else if (str_eq(var, "version")) {
 				fb_reply("OKAY", "0.5");
 			} else if (str_eq(var, "max-download-size")) {
-				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
+				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x04f00000");
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
@@ -3714,6 +5824,70 @@ fb_command(char *cmd)
 				sent += chunk;
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem pcie")) {
+			/* "oem pcie-state" only reads; "oem pcie-link" runs the sequence.
+			 * Both "oem pcie-state" and "oem pcie state" are accepted, and a
+			 * bare "oem pcie" is the read-only dump: the writing sequence must
+			 * never be reached by a typo. */
+			const char *arg = cmd + 8;
+
+			while (*arg == ' ' || *arg == '-' || *arg == '_') {
+				arg++;
+			}
+			if (PLAT == &platform_corvette) {
+				pc_map_windows();
+			}
+			if (PLAT != &platform_corvette) {
+				fb_reply("FAIL", "not a corvette");
+			} else if (*arg == 0 || starts_with(arg, "state")) {
+				pc_dump("now");
+				fb_reply("OKAY", "");
+			} else if (starts_with(arg, "gdsc")) {
+				const char *num = arg + 4;
+				uint32_t n = 0;
+
+				while (*num == ' ' || *num == '=') {
+					num++;
+				}
+				while (*num >= '0' && *num <= '9') {
+					n = n * 10 + (uint32_t)(*num - '0');
+					num++;
+				}
+				if (n < 1 || n > 8) {
+					fb_reply("FAIL", "oem pcie-gdsc 1..8");
+				} else {
+					pc_gdsc_try(n);
+					fb_reply("OKAY", "");
+				}
+			} else if (starts_with(arg, "stage")) {
+				/* "oem pcie-stage 3" runs stages 1..3 and answers OKAY only if
+				 * stage 3 came back: the first stage whose reply is missing is
+				 * the one that reset the phone. */
+				const char *num = arg + 5;
+				uint32_t n = 0;
+
+				while (*num == ' ' || *num == '=') {
+					num++;
+				}
+				while (*num >= '0' && *num <= '9') {
+					n = n * 10 + (uint32_t)(*num - '0');
+					num++;
+				}
+				if (n < 1 || n > 10) {
+					fb_reply("FAIL", "oem pcie-stage 1..10");
+				} else {
+					pc_stage(n);
+					fb_reply("OKAY", "");
+				}
+			} else if (starts_with(arg, "rsc")) {
+				pc_rsc_probe();
+				fb_reply("OKAY", "");
+			} else if (starts_with(arg, "link") || starts_with(arg, "up")) {
+				pc_bringup();
+				fb_reply("OKAY", "");
+			} else {
+				fb_reply("FAIL", "oem pcie-state or oem pcie-link");
+			}
 		} else if (starts_with(cmd, "oem screenshot")) {
 			/* stage the raw framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {
@@ -3944,6 +6118,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	restore_prev();
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
