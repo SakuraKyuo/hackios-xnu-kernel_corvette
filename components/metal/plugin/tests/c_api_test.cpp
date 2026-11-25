@@ -64,6 +64,7 @@ TEST(c_api_copy_and_callbacks) {
     CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
+    CHECK(!hakios_metal_chip_known(0x43051401)); // Corvette legacy ID: no A7xx backend is registered yet
     CHECK(strlen(hakios_metal_error()) > 0);
 }
 
