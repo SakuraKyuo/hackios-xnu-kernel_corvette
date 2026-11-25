@@ -97,6 +97,12 @@ contained no generated fixture changes.
 
 ## 2026-11-26 identity-routing checkpoint
 
+## 2026-11-26 vendor-DT and Metal divergence audit
+
+- The clean vendor tree `/home/sakurakyuo/opdt` is at `a7ab73a78d71452a1f3bd4c04e2f8aa9ea4ea014` (`oneplus/sm8650_b_16.0.0_ace_3_pro`). Its `kernel_platform/qcom/proprietary/devicetree/qcom/pineapple.dtsi:1264-1278` defines `gpucc` at `0x3d90000` with size `0x9800`; line 2721 is only an empty `msm_gpu: qcom,kgsl-3d0@3d00000 { };` placeholder. The two Corvette overlay files searched contain no GPU/Adreno properties. These fragments do not provide the full A750 board/profile data.
+- The current Metal source itself marks generation boundaries: `plugin/src/render.cpp:1206` says the A7xx `SP_PS_2D_WINDOW_OFFSET` is not represented by the A6xx path; `plugin/src/compute.cpp:232` and `plugin/src/texture.cpp:456` explicitly leave UBWC-through-IBO/storage-image paths unavailable before A7xx; `plugin/include/hakios-metal/a6xx.hpp:3578` records different A7xx texture/sampler slot handling. These are source comments, not proof that A7xx code is already implemented.
+- Porting consequence: keep the current A6xx table immutable. Add a distinct A7xx register/descriptor backend and compiler target, then add fake-GPU fixtures for window offsets, texture/sampler slots and UBWC IBO semantics. The known A750 ID remains rejected until those paths and the Gen7 kernel profile are complete.
+
 `components/metal/plugin/include/hakios-metal/gpu_identity.hpp` distinguishes the Corvette
 MSM GPU_ID from the Gen7 GMU ID and labels `0x43051401` as A7xx for future routing. The
 A7xx backend remains unavailable: `hakios_metal_chip_known()` still rejects it, so no A6xx
