@@ -63,7 +63,9 @@ enum {
 	                                         * imu { } says: the phone's orientation (board/imu.c) */
 	HAKIOS_HAS_IMU_BMI160      = 1u << 20,  /* ... or a Bosch BMI160 there instead: the same imu { }, the same driver; a
 	                                         * board lists one of the two */
-	HAKIOS_HAS_TOUCH_FT5X06    = 1u << 21,  /* a FocalTech controller of the FT5x06 register family (FT5x06, FT5x46,
+	HAKIOS_HAS_TOUCH_FT5X06    = 1u << 21,
+	HAKIOS_HAS_TOUCH_SYNAPTICS = 1u << 22, /* Synaptics S3910 TCM over SPI */
+	                                         /* a FocalTech controller of the FT5x06 register family (FT5x06, FT5x46,
 	                                         * FT6x36 ...) on I2C, wired as touch-i2c { } says (board/ft5x06.c) */
 	HAKIOS_HAS_CPUFREQ_SCMI = 1u << 16,     /* CPU performance queries via SCMI */
 };
@@ -253,6 +255,9 @@ struct hakios_board {
 	 * the clock controller, its pins and its supplies. One driver for a controller, any wiring.
 	 */
 	struct {
+		bool engine;                   /* false: drive SPI pins directly without GENI/GCC */
+		bool io_enable_only;            /* this board's RPMh rail needs only VRM_ENABLE */
+		uint32_t power_delay_ms;        /* board-specific delay after analog power is enabled */
 		uint32_t serial_engine;         /* the SPI engine's registers */
 		uint32_t m_ahb_clock, s_ahb_clock, se_clock;    /* offsets in the clock controller: the wrapper's two bus clocks, the engine's own
 		                                 * (its rate generator's registers follow it) */

@@ -226,6 +226,7 @@ phone(void)
 	kernels_list_in = false;
 	said[0] = 0;
 	log_len = 0;
+	log_partition_writes_allowed = 1;
 	kernel_part_len = 0;                    /* (as "oem run" begins: the last run's kernel log is not this one's) */
 	print("== XNULOADER run (usb) ==\n");
 }
@@ -278,6 +279,20 @@ the_log_goes_into_logdump(void)
 	    "the loader's log and the kernel's");
 	CHECK(strstr(said, "read back the same") != NULL, "and that is said: %s", said);
 	CHECK(handles_given == 0, "the handles' list is given back");
+}
+
+/* A board can keep logs in RAM even when a logdump partition exists. */
+static void
+ram_only_logs(void)
+{
+	phone();
+	log_partition_writes_allowed = 0;
+	kernel_said();
+	write_logs(klog, 1000);
+	CHECK(parts[0].writes == 0 && parts[LOGDUMP].writes == 0 && parts[2].writes == 0, "no partition is written");
+	CHECK(handles_given == 0, "partition handles were not enumerated");
+	CHECK(staged_data == out_buf && staged_len > 1000, "the kernel log is staged in RAM");
+	CHECK(strstr(said, "RAM only") != NULL, "the RAM-only path is logged: %s", said);
 }
 
 /* no logdump: nothing is written anywhere (the kernel's log goes onto the console) */
@@ -406,7 +421,8 @@ int
 main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } scenarios[] = {
-		{ "the_log_goes_into_logdump", the_log_goes_into_logdump }, { "no_logdump", no_logdump },
+		{ "the_log_goes_into_logdump", the_log_goes_into_logdump }, { "ram_only_logs", ram_only_logs },
+		{ "no_logdump", no_logdump },
 		{ "larger_than_the_partition", larger_than_the_partition }, { "flush_that_fails", flush_that_fails },
 		{ "only_through_uefis_list", only_through_uefis_list }, { "the_end_is_written", the_end_is_written },
 		{ "only_gpt_partitions", only_gpt_partitions }, { "failures_are_not_the_same", failures_are_not_the_same },

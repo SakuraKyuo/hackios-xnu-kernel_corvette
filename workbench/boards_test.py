@@ -1388,6 +1388,7 @@ class Generate(Sandbox):
         text = boards.platforms_text(*boards.load())
         for expected in ('static const struct platform platform_phone = {', '.name = "phone",', '.gic_redist = 0x17a60000,',
                          '.psci_hvc = 0,', '.core_shift = 8,', '.small_cores = 0xf,', '.fb_base = 0xe1000000,',
+                         '.ram_only_logs = 0,',
                          'static const struct platform platform_emu = {'):
             self.assertIn(expected, text)
         # only a board with a framebuffer to be known by is in the list the loader searches

@@ -98,6 +98,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	/* Unknown displays fall back to QEMU; fail closed rather than writing a phone's log partition. */
+	log_partition_writes_allowed = PLAT != &platform_qemu_virt && !PLAT->ram_only_logs;
 
 	install_exception_hook();
 	wdt_arm();

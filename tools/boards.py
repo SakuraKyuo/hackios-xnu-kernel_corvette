@@ -136,7 +136,8 @@ BOARD_SCHEMA = {
                'f0_calibration': (int, True)},
     'imu': {'sda': (int, True), 'scl': (int, True), 'interrupt': (int, True), 'address': (int, True),
             'full_scale': (int, True), 'mount': ([str], True)},
-    'touch': {'serial_engine': (int, True), 'clocks': ([int], True), 'vote_register': (int, True), 'votes': ([int], True),
+    'touch': {'bitbang': (bool, False), 'io_enable_only': (bool, False), 'power_delay_ms': (int, False),
+              'serial_engine': (int, False), 'clocks': ([int], False), 'vote_register': (int, False), 'votes': ([int], False),
               'bus_pins': ([int], True),
               'interrupt': (int, True), 'reset': (int, True), 'io_supply': (str, True), 'analog_supply': (str, False),
               'analog_enable': (int, False), 'vendor_pins': ([int], False), 'coordinates': ([int], False)},
@@ -171,7 +172,8 @@ BOARD_SCHEMA = {
              'dsp_memory_size': (int, False), 'pins': ([int], False), 'supplies': ([str], False)},
     'storage': {'type_guid': (str, True), 'unique_guid': (str, True), 'first_lba': (U64, True), 'last_lba': (U64, True),
                 'write_first': (U64, True)},
-    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False)},
+    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False),
+               'ram_only_logs': (bool, False)},
     'uefi': {'fd_base': (U64, True), 'fd_size': (int, True), 'header_version': (int, False)},
     'boot': {'fastboot_product': (str, True), 'cpus': (int, True), 'bootargs': ([str], True)},
 }
@@ -186,7 +188,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
                  # for a part's supply, and give a device its addresses in the SMMU
-                 'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
+                 'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-synaptics': ('pins', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
                  'touch-ft5x06': ('pins',),      # (and rpmh, if its touch_i2c names a supply: feature_needs())
                  'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
@@ -208,6 +210,7 @@ FEATURE_BOOTARGS = {
     'gpu-a660': 'gpu=1',
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
+    'touch-synaptics': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
     'touch-ft5x06': 'touchscreen=-1 looks; touchscreen=1',
     'speaker-aw88261': 'speaker_probe=N looks; sound=N with adsp=1',
@@ -224,13 +227,14 @@ FEATURE_BOOTARGS = {
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
 FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
-                          'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
+                          'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch', 'touch-synaptics': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
 # ... and what a controller's driver uses of [touch] beyond what every one needs
-TOUCH_NEEDS = {'touch-goodix': ('analog_enable', 'vendor_pins', 'coordinates'), 'touch-ft3658u': ('analog_supply',)}
+TOUCH_NEEDS = {'touch-goodix': ('analog_enable', 'vendor_pins', 'coordinates'), 'touch-ft3658u': ('analog_supply',),
+               'touch-synaptics': ('analog_enable', 'io_supply', 'coordinates')}
 # the touch controllers' drivers, each a feature: a board has one controller (board/drivers.c starts one)
-TOUCH_CHIPS = ('touch-goodix', 'touch-ft3658u', 'touch-ft5x06')
+TOUCH_CHIPS = ('touch-goodix', 'touch-ft3658u', 'touch-ft5x06', 'touch-synaptics')
 # what a chip of the FT5x06 family can say (board/ft5x06_report.h): so many fingers, coordinates of 12 bits; and the
 # analog supply its data sheets allow, 2.6 to 3.6 V
 FT5X06_CONTACTS, FT5X06_COORDINATE_MAX, FT5X06_ANALOG_MV = 10, 0xfff, (2600, 3600)
@@ -718,20 +722,21 @@ def load(problems=None):
         if touch is not None:
             wires = list(touch['bus_pins']) + [touch['interrupt'], touch['reset']] + list(touch.get('vendor_pins', [])) + \
                 ([touch['analog_enable']] if 'analog_enable' in touch else [])
-            if len(touch['bus_pins']) != 4 or len(touch.get('vendor_pins', [0, 0])) != 2 or \
+            if len(touch['bus_pins']) != 4 or ('vendor_pins' in touch and len(touch['vendor_pins']) != 2) or \
                     any(not 0 <= pin <= 255 for pin in wires) or len(set(wires)) != len(wires):
                 problems.add(f'{rel} [touch]', 'bus_pins are four, vendor_pins two; every pin is a different pin of the SoC, 0 to 255')
             if 'coordinates' in touch and (len(touch['coordinates']) != 2 or 0 in touch['coordinates']):
                 problems.add(f'{rel} [touch]', 'coordinates are the largest x and y the controller reports: two numbers, not 0')
-            if not 0 < touch['vote_register'] < 0x100000 or touch['vote_register'] & 3:
+            engine = not touch.get('bitbang', False)
+            if engine and (not 0 < touch['vote_register'] < 0x100000 or touch['vote_register'] & 3):
                 problems.add(f'{rel} [touch]', 'vote_register is an offset in the clock controller: a register\'s, not 0')
             # (the drivers map 0x100000 of the clock controller; the engine's clock has its rate registers up to 0xbc after it)
-            if len(touch['clocks']) != 3 or any(not 0 < offset < 0x100000 for offset in touch['clocks']) or \
-                    len(set(touch['clocks'])) != 3 or touch['clocks'][2] > 0x100000 - 0xc0:
+            if engine and (len(touch['clocks']) != 3 or any(not 0 < offset < 0x100000 for offset in touch['clocks']) or \
+                    len(set(touch['clocks'])) != 3 or touch['clocks'][2] > 0x100000 - 0xc0):
                 problems.add(f'{rel} [touch]', 'clocks are three different offsets in the clock controller: the two bus clocks, the engine\'s own')
-            if len(touch['votes']) != 5 or any(not 0 <= bit <= 31 for bit in touch['votes']) or len(set(touch['votes'])) != 5:
+            if engine and (len(touch['votes']) != 5 or any(not 0 <= bit <= 31 for bit in touch['votes']) or len(set(touch['votes'])) != 5):
                 problems.add(f'{rel} [touch]', 'votes are five different bits of the vote register, 0 to 31')
-            if touch['serial_engine'] == 0 or touch['serial_engine'] & 0xfff:
+            if engine and (touch['serial_engine'] == 0 or touch['serial_engine'] & 0xfff):
                 problems.add(f'{rel} [touch]', 'serial_engine is where the engine\'s registers are: a page\'s address, not 0')
         wired = data.get('touch_i2c')
         if wired is not None:
@@ -1092,17 +1097,21 @@ def table_text(socs, boards):
             out.append((f'\t\t\t{files},\n' if files else '') + '\t\t},')
         touch = board.get('touch')
         if touch:
-            pins, clocks = touch['bus_pins'], touch['clocks']
+            pins = touch['bus_pins']
+            engine = not touch.get('bitbang', False)
+            clocks = touch.get('clocks', [0, 0, 0])
             straps = touch.get('vendor_pins', [-1, -1])
             supplies = f'.io_supply = {c_string(touch["io_supply"])}' + (
                 f', .analog_supply = {c_string(touch["analog_supply"])}' if 'analog_supply' in touch else '')
             out += [
                 '\t\t.touch = {',
-                f'\t\t\t.serial_engine = {touch["serial_engine"]:#010x},',
+                f'\t\t\t.engine = {"true" if engine else "false"},',
+                f'\t\t\t.serial_engine = {touch.get("serial_engine", 0):#010x},',
                 f'\t\t\t.m_ahb_clock = {clocks[0]:#x}, .s_ahb_clock = {clocks[1]:#x}, .se_clock = {clocks[2]:#x},',
-                f'\t\t\t.vote_register = {touch["vote_register"]:#x}, .vote = {{ {", ".join(str(bit) for bit in touch["votes"])} }},',
+                f'\t\t\t.vote_register = {touch.get("vote_register", 0):#x}, .vote = {{ {", ".join(str(bit) for bit in touch.get("votes", [0] * 5))} }},',
                 f'\t\t\t.data_in = {pins[0]}, .data_out = {pins[1]}, .clock = {pins[2]}, .chip_select = {pins[3]},',
                 f'\t\t\t.interrupt = {touch["interrupt"]}, .reset = {touch["reset"]},',
+                f'\t\t\t.io_enable_only = {str(touch.get("io_enable_only", False)).lower()}, .power_delay_ms = {touch.get("power_delay_ms", 15)},',
                 f'\t\t\t.analog_enable = {touch.get("analog_enable", -1)}, .vendor_pin = {{ {straps[0]}, {straps[1]} }},',
                 f'\t\t\t{supplies},',
                 f'\t\t\t.max_x = {touch.get("coordinates", [0, 0])[0]}, .max_y = {touch.get("coordinates", [0, 0])[1]},',
@@ -1242,7 +1251,8 @@ def platforms_text(socs, boards):
                    f'.cores = {platform["cores"]}', f'.core_shift = {platform["core_shift"]}',
                    f'.timeout_scale = {platform.get("timeout_scale", 0)}',
                    f'.small_cores = {platform.get("small_cores", 0):#x}',
-                   f'.fb_base = {loader.get("fb_base", 0):#010x}']
+                   f'.fb_base = {loader.get("fb_base", 0):#010x}',
+                   f'.ram_only_logs = {int(loader.get("ram_only_logs", False))}']
         own = board.get('storage')
         if own:
             fields.append(f'.own = {{ .type = {c_guid(own["type_guid"])}, .unique = {c_guid(own["unique_guid"])},\n'

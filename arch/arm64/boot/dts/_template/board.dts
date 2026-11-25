@@ -24,7 +24,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-synaptics, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
 	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -89,6 +89,9 @@
 	// clocks in the clock controller, its pins and its supplies. The controller's node in the device tree is
 	// under its bus's node (qupv3_seN_spi); the numbers below are one phone's.
 	// touch {
+		// bitbang = true;           // drive SPI on bus-pins directly when no serial engine is wired
+		// io-enable-only = true;   // leave the RPMh regulator voltage unchanged and only vote it on
+		// power-delay-ms = <200>;  // wait this long after the I/O supply is enabled before reset is released
 		// serial-engine = <0x00a94000>; // the bus's node: reg (qupv3_se13_spi: spi@a94000)
 		// clocks = <0x18004 0x18008 0x185fc>; // in the clock controller (gcc-SOC.c): the wrapper's two bus clocks,
 		//                              // gcc_qupv3_wrap_N_m_ahb_clk and ..._s_ahb_clk, and the engine's own,
@@ -283,6 +286,7 @@
 		// log-other-cpu;               // keep notes in the log partition while a kernel starts on another core
 		// uefi-charger;                // the firmware has Qualcomm's charger protocols: the loader reads the battery
 		//                              // through them and hands it to the kernel (feature "battery-uefi")
+		// ram-only-logs;               // keep loader logs in RAM and never write the logdump partition
 	// };
 
 	// Its UEFI, as arch/arm64/boot/mkboot.py packs it for `fastboot boot`; the build itself is in firmware/NAME/uefi/.

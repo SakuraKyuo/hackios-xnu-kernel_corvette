@@ -55,6 +55,8 @@ static uint64_t staged_len;
  * that and not what the kernel said.
  */
 static uint64_t kernel_part_at, kernel_part_len;
+/* Set only after the firmware framebuffer identifies the board. */
+static int log_partition_writes_allowed;
 
 /* what compose_logs() leaves for the loader's log beside the kernel's: all of log_buf, the two lines around, a block */
 #define KERNEL_PART_ROOM        (sizeof(log_buf) + 2 * 32 + 512)
@@ -106,9 +108,11 @@ static void hc_take_back(const char *when);
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
-	efi_block_io *bio = find_log_partition();
+	efi_block_io *bio = log_partition_writes_allowed ? find_log_partition() : NULL;
 
-
+	if (!log_partition_writes_allowed) {
+		print("log: RAM only; logdump writes disabled\n");
+	}
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */

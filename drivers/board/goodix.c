@@ -158,6 +158,7 @@ io_supply_on(void)
 	uint32_t base = rpmh_address(WIRED->io_supply);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
 	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	unsigned count = WIRED->io_enable_only ? 1 : 3;
 	const char *problem;
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
@@ -168,7 +169,7 @@ io_supply_on(void)
 	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", WIRED->io_supply, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	io_supply = base;
-	problem = rpmh_write(address, data, 3);
+	problem = WIRED->io_enable_only ? rpmh_write(&address[1], &data[1], 1) : rpmh_write(address, data, count);
 	/* (a request without an answer was triggered all the same and may be in force: withdrawn like one that was answered, as board/ddr.c does) */
 	io_voted = problem == NULL || strcmp(problem, RPMH_SAYS_NO_ANSWER) == 0;
 	if (problem != NULL) {
@@ -1182,13 +1183,521 @@ focaltech_poll(void)
 
 static bool looking_only;              /* touchscreen=-1 */
 
+static void synaptics_reset(void);
+static bool synaptics_move_due(void);
+
+/* ---- the Synaptics S3910 chip (TCM over SPI) -------------------------------------------------------- */
+
+/*
+ * From the phone's own driver (vendor/oplus/kernel/touchpanel/oplus_touchscreen_v2/Synaptics/
+ * Syna_tcm_S3910): a command is one transfer, [command][length low][length high][payload]; the
+ * chip answers on the interrupt line with [0xA5][code][length low][length high][payload][0x5A],
+ * reads and writes being the same number of bytes, 0xFF on the master's data line while the chip
+ * drives the other. A message longer than the nine bytes read up front continues with transfers
+ * that begin [0xA5][0x03] and carry the rest. The touch report is a bit string whose layout the
+ * chip itself describes, as a list of (code, width in bits) pairs: 0 ends it, 1..3 loop over the
+ * objects (the active ones only or all of them), 4 rounds the position up to the next byte, 6 is
+ * an object's index, 7 what it is (1 a finger, 2 a gloved one), 8 and 9 where it is, and 24 how
+ * many objects the loop holds. Fields are least significant bit first.
+ */
+#define SYNA_MARKER             0xa5
+#define SYNA_CONTINUED_READ     0x03
+#define SYNA_PADDING            0x5a
+#define SYNA_HEADER_SIZE        4
+#define SYNA_WINDOW             48              /* the read s13 and s14 proved: header and most payloads */
+#define SYNA_MAX_MESSAGE        1024
+#define SYNA_MAX_TOUCHES        10              /* contact[] is shared with the Goodix chip: same size */
+
+#define SYNA_CMD_IDENTIFY       0x02
+#define SYNA_CMD_ENABLE_REPORT  0x05
+#define SYNA_CMD_RUN_APP        0x14
+#define SYNA_CMD_GET_TOUCH_REPORT_CONFIG 0x25
+
+#define SYNA_STATUS_OK          0x01
+#define SYNA_STATUS_ERROR       0x0f
+
+#define SYNA_REPORT_IDENTIFY    0x10
+#define SYNA_REPORT_TOUCH       0x11
+
+#define SYNA_MODE_APPLICATION   0x01
+#define SYNA_MODE_BOOTLOADER    0x0b
+
+static uint8_t syna_tx[SYNA_MAX_MESSAGE + SYNA_HEADER_SIZE + 1];
+static uint8_t syna_message[SYNA_MAX_MESSAGE + SYNA_HEADER_SIZE + 1]; /* the last message: header, payload, padding */
+static uint32_t syna_message_length;                    /* its payload length */
+static uint8_t syna_message_code;
+static uint8_t syna_config[SYNA_MAX_MESSAGE];           /* the touch report layout the chip describes */
+static uint32_t syna_config_length;
+
+/* One transfer, `length` bytes each way; on a read the master's data line idles high (0xFF). */
+static bool
+syna_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
+{
+	if (length > sizeof(syna_tx)) {
+		return false;
+	}
+	if (tx) {
+		memcpy(syna_tx, tx, length);
+	} else {
+		memset(syna_tx, 0xff, length);
+	}
+	return spi_transfer(syna_tx, rx, length);
+}
+
+/* The chip raises the attention line when a message is waiting; wait for it to fall. */
+static bool
+syna_wait_attention(uint32_t timeout_ms)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
+	while (gpio_get(PIN_INT)) {
+		if (mach_absolute_time() >= deadline) {
+			return false;
+		}
+		sleep_us(200);
+	}
+	return true;
+}
+
+/*
+ * Read one message into syna_message; false when there is nothing readable. The chip streams
+ * [a5][code][length][payload] and pads the rest of the window with 5a (s13); the length field is what
+ * counts, and a command answer carries no 5a of its own (s8: the 128 byte layout answer ends in ff).
+ * A message longer than the window is finished with one more read of just the bytes that are missing:
+ * the chip continues where the window stopped (s8), and over reading is what broke the next command
+ * in s15.
+ */
+static bool
+syna_read_message(void)
+{
+	uint8_t continued[SYNA_WINDOW];
+	uint32_t total, remaining, offset, chunk, attention_before;
+
+	if (!syna_transfer(NULL, syna_message, SYNA_WINDOW) || syna_message[0] != SYNA_MARKER) {
+		return false;
+	}
+	syna_message_code = syna_message[1];
+	syna_message_length = le16(syna_message + 2);
+	if (syna_message_code < SYNA_REPORT_IDENTIFY && syna_message_code != SYNA_STATUS_OK) {
+		return false;           /* idle, busy, an error */
+	}
+	/* The device counts the trailing 0x5a padding byte in every complete message. */
+	total = SYNA_HEADER_SIZE + syna_message_length + 1;
+	if (total > sizeof(syna_message)) {
+		return false;
+	}
+	if (total <= SYNA_WINDOW) {
+		return syna_message[total - 1] == SYNA_PADDING ||
+		    (syna_message_code == SYNA_STATUS_OK && syna_message[total - 1] == 0xff);
+	}
+
+	/*
+	 * S3910 continues a message in windows no larger than SYNA_WINDOW. Keep each
+	 * transaction within the 48-byte limit observed by the old bitbang path;
+	 * every continuation window has its own A5/03 prefix.
+	 */
+	remaining = total - SYNA_WINDOW;
+	offset = SYNA_WINDOW;
+	while (remaining) {
+		chunk = remaining;
+		if (chunk > SYNA_WINDOW - 2) {
+			chunk = SYNA_WINDOW - 2;
+		}
+		attention_before = gpio_get(PIN_INT);
+		if (!syna_wait_attention(500)) {
+			printf("synaptics: continuation attention timeout: offset %u before %u after %u\n",
+			    offset, attention_before, gpio_get(PIN_INT));
+			return false;
+		}
+		printf("synaptics: continuation attention ready: offset %u before %u after %u\n",
+		    offset, attention_before, gpio_get(PIN_INT));
+		if (!syna_transfer(NULL, continued, chunk + 2)) {
+			printf("synaptics: continued read transfer failed: total %u offset %u chunk %u int %u\n",
+			    total, offset, chunk, gpio_get(PIN_INT));
+			return false;
+		}
+		printf("synaptics: continued read: total %u offset %u chunk %u: %02x %02x %02x %02x ... %02x %02x int %u\n",
+		    total, offset, chunk, continued[0], continued[1], continued[2], continued[3],
+		    continued[chunk], continued[chunk + 1], gpio_get(PIN_INT));
+		if (continued[0] != SYNA_MARKER || continued[1] != SYNA_CONTINUED_READ) {
+			return false;
+		}
+		memcpy(syna_message + offset, continued + 2, chunk);
+		offset += chunk;
+		remaining -= chunk;
+	}
+	if (syna_message[total - 1] != SYNA_PADDING &&
+	    !(syna_message_code == SYNA_STATUS_OK && syna_message[total - 1] == 0xff)) {
+		printf("synaptics: invalid message tail: code %02x total %u tail %02x int %u\n",
+		    syna_message_code, total, syna_message[total - 1], gpio_get(PIN_INT));
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Take whatever is already waiting off the line. A command written while the attention line is still
+ * low is swallowed by the chip (s8: the layout request after the announcement got no answer at all),
+ * so the line is emptied first; reports thrown away here are the price of that.
+ */
+static void
+syna_drain(void)
+{
+	uint32_t drained = 0;
+
+	while (drained < 8 && !gpio_get(PIN_INT) && syna_read_message()) {
+		drained++;
+	}
+	if (drained) {
+		printf("synaptics: %u message(s) were still on the line, taken off\n", drained);
+	}
+}
+
+/* Send a command and wait for its answer, which stays in syna_message. */
+static bool
+syna_command(uint8_t command, const uint8_t *payload, uint32_t length, uint32_t timeout_ms)
+{
+	uint8_t out[64];
+	uint64_t deadline;
+	uint32_t rejected = 0;
+
+	if (length + 3 > sizeof(out)) {
+		return false;
+	}
+	out[0] = command;
+	out[1] = (uint8_t)length;
+	out[2] = (uint8_t)(length >> 8);
+	if (length) {
+		memcpy(out + 3, payload, length);
+	}
+	syna_drain();
+	if (!syna_transfer(out, NULL, length + 3)) {
+		return false;
+	}
+	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+		if (!gpio_get(PIN_INT)) {
+			if (syna_read_message()) {
+				if (syna_message_code == SYNA_REPORT_IDENTIFY || syna_message_code == SYNA_STATUS_OK) {
+					return true;    /* (a touch report ahead of the answer is dropped) */
+				}
+				if (syna_message_code == SYNA_STATUS_ERROR) {
+					return false;
+				}
+				if (syna_message_code != SYNA_REPORT_TOUCH) {
+					printf("synaptics: while waiting for command %#x: code %#x, length %u\n", command,
+					    syna_message_code, syna_message_length);
+				}
+			} else if (rejected++ < 3) {
+				printf("synaptics: command %#x: the line carried %02x %02x %02x %02x, not a message\n", command,
+				    syna_message[0], syna_message[1], syna_message[2], syna_message[3]);
+			}
+		}
+		sleep_us(200);
+	}
+	if (rejected) {
+		printf("synaptics: command %#x: %u reads found nothing usable\n", command, rejected);
+	}
+	return false;
+}
+
+/*
+ * What the chip says it is: the first byte of the payload is the firmware mode. Asked for, the answer
+ * comes with a plain OK code and the identification as payload (s14), not with the announcement code.
+ */
+static uint8_t
+synaptics_identify(void)
+{
+	if (!syna_command(SYNA_CMD_IDENTIFY, NULL, 0, 1000) || syna_message_length < 1) {
+		return 0;
+	}
+	return syna_message[SYNA_HEADER_SIZE];
+}
+
+/*
+ * After a reset the chip announces itself, unasked: the message is already waiting on the line. Ask only
+ * when nothing is there; asking over a message that is still half read gets an empty answer, which is
+ * what the first probe of corvette saw (mode 0 while the line was carrying a5 10 1c 00 01 ...).
+ */
+static uint8_t
+synaptics_identify_first(void)
+{
+	if (syna_wait_attention(500) && syna_read_message() && syna_message_code == SYNA_REPORT_IDENTIFY) {
+		return syna_message[SYNA_HEADER_SIZE];
+	}
+	return synaptics_identify();
+}
+
+/* Reset the chip, get its firmware running, and learn where it puts the fields of a touch report. */
+static bool
+synaptics_probe(bool verbose)
+{
+	static const uint8_t enable[2] = { SYNA_REPORT_TOUCH, 0 };
+	uint8_t mode;
+	uint32_t shown;
+
+	synaptics_reset();
+	mode = synaptics_identify_first();
+	printf("synaptics: firmware mode %#x after reset\n", mode);
+	if (mode == SYNA_MODE_BOOTLOADER) {
+		syna_command(SYNA_CMD_RUN_APP, NULL, 0, 1000);
+		sleep_ms(200);
+		mode = synaptics_identify_first();
+		printf("synaptics: firmware mode %#x after the switch\n", mode);
+	}
+	if (mode != SYNA_MODE_APPLICATION) {
+		if (verbose) {
+			printf("synaptics: the application firmware is not running\n");
+		}
+		return false;
+	}
+
+	if (!syna_command(SYNA_CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0, 1000)) {
+		/* s16: the very same request answers in s8 and is lost here, so it is asked again */
+		sleep_ms(50);
+		if (!syna_command(SYNA_CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0, 1000)) {
+			sleep_ms(100);
+			if (!syna_command(SYNA_CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0, 1000)) {
+				printf("synaptics: the layout request went unanswered\n");
+				return false;
+			}
+		}
+	}
+	printf("synaptics: the layout answer: code %#x, length %u\n", syna_message_code, syna_message_length);
+	if (syna_message_code != SYNA_STATUS_OK) {
+		printf("synaptics: the layout answer is not an OK status\n");
+		return false;
+	}
+	syna_config_length = syna_message_length < sizeof(syna_config) ? syna_message_length : sizeof(syna_config);
+	memcpy(syna_config, syna_message + SYNA_HEADER_SIZE, syna_config_length);
+	printf("synaptics: touch report layout, %u bytes:", syna_config_length);
+	for (shown = 0; shown < syna_config_length && shown < 32; shown++) {
+		printf(" %02x", syna_config[shown]);
+	}
+	printf("%s\n", syna_config_length > 32 ? " ..." : "");
+
+	if (syna_command(SYNA_CMD_ENABLE_REPORT, enable, 1, 300)) {
+		printf("synaptics: touch reports enabled\n");
+	} else {
+		printf("synaptics: the report enable was not accepted (touches may still come)\n");
+	}
+	return true;
+}
+
+/* The layout's interpreter: where a field sits is only in the chip's own list. */
+static uint8_t syna_object_status[SYNA_MAX_TOUCHES];
+static uint32_t syna_object_x[SYNA_MAX_TOUCHES], syna_object_y[SYNA_MAX_TOUCHES];
+static bool syna_object_seen[SYNA_MAX_TOUCHES];
+
+static uint32_t
+syna_field(uint32_t offset, uint32_t bits)
+{
+	uint32_t value = 0;
+
+	if (bits > 32) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < bits; i++) {
+		uint32_t bit = offset + i;
+
+		if (bit / 8 >= syna_message_length) {
+			break;                  /* the report is shorter than its layout says */
+		}
+		value |= (uint32_t)((syna_message[SYNA_HEADER_SIZE + bit / 8] >> (bit % 8)) & 1) << i;
+	}
+	return value;
+}
+
+static void
+synaptics_report(void)
+{
+	uint32_t idx = 0, offset = 0, obj = 0, next = 0, active_objects = 0, loops = 0;
+	bool active_only = false, counted = false;
+
+	for (uint32_t i = 0; i < SYNA_MAX_TOUCHES; i++) {
+		syna_object_seen[i] = false;
+		contact[i].seen = false;
+	}
+	while (idx < syna_config_length) {
+		uint32_t code = syna_config[idx++];
+
+		switch (code) {
+		case 0:                 /* TOUCH_END */
+			idx = syna_config_length;
+			break;
+		case 1:                 /* TOUCH_FOREACH_ACTIVE_OBJECT */
+			obj = 0;
+			next = idx;
+			active_only = true;
+			break;
+		case 2:                 /* TOUCH_FOREACH_OBJECT */
+			obj = 0;
+			next = idx;
+			active_only = false;
+			break;
+		case 3: {               /* TOUCH_FOREACH_END */
+			uint32_t end = idx - 1;
+
+			if (!active_only) {
+				if (++obj < SYNA_MAX_TOUCHES && end > next) {
+					idx = next;
+				}
+			} else if (counted) {
+				if (++loops < active_objects && end > next) {
+					idx = next;
+				}
+			} else if (end > next && offset < syna_message_length * 8) {
+				idx = next;
+			}
+			break;
+		}
+		case 4:                 /* TOUCH_PAD_TO_NEXT_BYTE */
+			offset = (offset + 7) & ~7u;
+			break;
+		case 6:                 /* TOUCH_OBJECT_N_INDEX */
+		case 7:                 /* TOUCH_OBJECT_N_CLASSIFICATION */
+		case 8:                 /* TOUCH_OBJECT_N_X_POSITION */
+		case 9: {               /* TOUCH_OBJECT_N_Y_POSITION */
+			uint32_t bits = idx < syna_config_length ? syna_config[idx++] : 0;
+			uint32_t value = syna_field(offset, bits);
+
+			offset += bits;
+			if (code == 6) {
+				obj = value < SYNA_MAX_TOUCHES ? value : SYNA_MAX_TOUCHES;
+			} else if (obj < SYNA_MAX_TOUCHES) {
+				if (code == 7) {
+					syna_object_status[obj] = (uint8_t)value;
+					syna_object_seen[obj] = true;
+				} else if (code == 8) {
+					syna_object_x[obj] = value;
+				} else {
+					syna_object_y[obj] = value;
+				}
+			}
+			break;
+		}
+		case 24: {              /* TOUCH_NUM_OF_ACTIVE_OBJECTS */
+			uint32_t bits = idx < syna_config_length ? syna_config[idx++] : 0;
+
+			active_objects = syna_field(offset, bits);
+			offset += bits;
+			counted = true;
+			if (active_objects == 0) {
+				idx = syna_config_length;       /* nothing down: every finger has lifted */
+			}
+			break;
+		}
+		default:
+			/* every other code carries its width in bits next */
+			if (idx < syna_config_length) {
+				offset += syna_config[idx++];
+			}
+			break;
+		}
+	}
+
+	for (uint32_t i = 0; i < SYNA_MAX_TOUCHES; i++) {
+		uint32_t x, y;
+
+		if (!syna_object_seen[i] || (syna_object_status[i] != 1 && syna_object_status[i] != 2)) {
+			continue;
+		}
+		x = syna_object_x[i];
+		y = syna_object_y[i];
+		seen.touches++;
+		seen.last_x = x;
+		seen.last_y = y;
+		x = x >= max_x ? 65535 : x * 65535 / max_x;
+		y = y >= max_y ? 65535 : y * 65535 / max_y;
+		if (flip & 1) {
+			x = 65535 - x;
+		}
+		if (flip & 2) {
+			y = 65535 - y;
+		}
+		contact[i].seen = true;
+		if (!contact[i].down) {
+
+			hakios_touch_post(HAKIOS_TOUCH_DOWN, i, x, y);
+		} else if ((contact[i].x != x || contact[i].y != y) && synaptics_move_due()) {
+			hakios_touch_post(HAKIOS_TOUCH_MOVE, i, x, y);
+		}
+		contact[i].down = true;
+		contact[i].x = x;
+		contact[i].y = y;
+	}
+	/* a finger that is no longer in the report has lifted */
+	for (uint32_t i = 0; i < SYNA_MAX_TOUCHES; i++) {
+		if (contact[i].down && !contact[i].seen) {
+			contact[i].down = false;
+			hakios_touch_post(HAKIOS_TOUCH_UP, i, contact[i].x, contact[i].y);
+		}
+	}
+}
+
+static void
+synaptics_poll(void)
+{
+	static unsigned bad;
+
+	seen.polls++;
+	if (!syna_read_message()) {
+		seen.bad++;
+		if (bad < 2) {
+			/* what the chip's data line says, when the header does not: all 0xFF is a dead line */
+			printf("synaptics: no message: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    syna_message[0], syna_message[1], syna_message[2], syna_message[3], syna_message[4],
+			    syna_message[5], syna_message[6], syna_message[7], syna_message[8]);
+		} else if (bad < 8) {
+			printf("synaptics: no readable message\n");
+		}
+		bad++;
+		return;
+	}
+	if (syna_message_code == SYNA_REPORT_TOUCH) {
+		seen.reports++;
+		synaptics_report();
+	} else if (syna_message_code == SYNA_REPORT_IDENTIFY) {
+		printf("synaptics: the chip identified itself again (mode %#x)\n", syna_message[SYNA_HEADER_SIZE]);
+	}
+}
+
+
+static void
+synaptics_reset(void)
+{
+	gpio_set(PIN_RESET, false);
+	sleep_ms(10);
+	gpio_set(PIN_RESET, true);
+	sleep_ms(80);
+}
+
+static bool
+synaptics_move_due(void)
+{
+	static uint64_t last;
+	uint64_t now, last_ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	absolutetime_to_nanoseconds(last, &last_ns);
+	if (now - last_ns < 8000000) {
+		return false;
+	}
+	last = mach_absolute_time();
+	return true;
+}
+
 /* Which touch chip is on this board. */
-enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH };
+enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH, TOUCH_SYNAPTICS };
 static enum touch_chip touch_chip;
 
 static enum touch_chip
 touch_chip_detect(void)
 {
+	if (WIRED->vendor_pin[0] < 0 || WIRED->vendor_pin[1] < 0) {
+		return hakios_board_has(HAKIOS_HAS_TOUCH_SYNAPTICS) ? TOUCH_SYNAPTICS : TOUCH_GOODIX;
+	}
 	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
 	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
 	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
@@ -1203,6 +1712,9 @@ chip_probe(bool verbose)
 	if (touch_chip == TOUCH_FOCALTECH) {
 		return focaltech_probe(verbose);
 	}
+	if (touch_chip == TOUCH_SYNAPTICS) {
+		return synaptics_probe(verbose);
+	}
 	touch_reset();
 	return goodix_probe(verbose);
 }
@@ -1212,6 +1724,8 @@ chip_poll(void)
 {
 	if (touch_chip == TOUCH_FOCALTECH) {
 		focaltech_poll();
+	} else if (touch_chip == TOUCH_SYNAPTICS) {
+		synaptics_poll();
 	} else {
 		goodix_poll();
 	}
@@ -1237,11 +1751,14 @@ static void
 show_state(const char *when)
 {
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
-	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP_M_AHB_CBCR),
+	    " reset %#x/%u, int %#x/%u, avdd %#x/%u", when, rd(GCC_VOTE), rd(GCC_QUP_M_AHB_CBCR),
 	    rd(GCC_QUP_S_AHB_CBCR), rd(GCC_SE_CBCR), rd(GCC_SE_CFG), rd(GCC_SE_DFSR), rd(GPIO_CFG(PIN_CS)),
 	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    gpio_get(PIN_FOCALTECH_ID), gpio_get(PIN_GOODIX_ID));
+	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)));
+	if (WIRED->vendor_pin[0] >= 0 && WIRED->vendor_pin[1] >= 0) {
+		printf(", straps %u %u", gpio_get(PIN_FOCALTECH_ID), gpio_get(PIN_GOODIX_ID));
+	}
+	printf("\n");
 }
 
 static bool reset_driven, int_pulled, avdd_on;    /* what power_on() did, for power_down() */
@@ -1264,7 +1781,7 @@ power_on(void)
 	sleep_ms(3);
 	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
 	avdd_on = true;
-	sleep_ms(15);
+	sleep_ms(WIRED->power_delay_ms ? WIRED->power_delay_ms : 15);
 	return true;
 }
 
@@ -1322,6 +1839,9 @@ use_engine_pins(void)
 static const char *
 chip_name(void)
 {
+	if (touch_chip == TOUCH_SYNAPTICS) {
+		return "synaptics";
+	}
 	return touch_chip == TOUCH_FOCALTECH ? "focaltech" : "goodix";
 }
 
@@ -1332,14 +1852,18 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio%u=%u gpio%u=%u: selected %s\n", PIN_GOODIX_ID, gpio_get(PIN_GOODIX_ID), PIN_FOCALTECH_ID,
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (WIRED->vendor_pin[0] >= 0 && WIRED->vendor_pin[1] >= 0) {
+		printf("goodix: ID gpio%u=%u gpio%u=%u: selected %s\n", PIN_GOODIX_ID, gpio_get(PIN_GOODIX_ID),
+		    PIN_FOCALTECH_ID, gpio_get(PIN_FOCALTECH_ID), chip_name());
+	} else {
+		printf("goodix: selected %s from the board feature\n", chip_name());
+	}
 	if (!power_on()) {
 		printf("goodix: the chip's I/O supply is not on: nothing more powered or driven\n");
 		return false;
 	}
 
-	if (clocks_on()) {
+	if (WIRED->engine && clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
 		uint32_t spi_hz = 1000000;
@@ -1403,17 +1927,23 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	if (looking_only) {
 		/* (the clock controller and the pins are always reachable; the serial engine, behind its clocks, is not read) */
 		show_state("as found (touchscreen=-1: looking only)");
-		printf("goodix: touchscreen=-1: the straps read gpio%u=%u gpio%u=%u (%s); nothing powered, configured or sent\n",
-		    PIN_GOODIX_ID, gpio_get(PIN_GOODIX_ID), PIN_FOCALTECH_ID, gpio_get(PIN_FOCALTECH_ID),
-		    gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID) ? "FocalTech" : "Goodix");
+		if (WIRED->vendor_pin[0] >= 0 && WIRED->vendor_pin[1] >= 0) {
+			printf("goodix: touchscreen=-1: the straps read gpio%u=%u gpio%u=%u; nothing powered, configured or sent\n",
+			    PIN_GOODIX_ID, gpio_get(PIN_GOODIX_ID), PIN_FOCALTECH_ID, gpio_get(PIN_FOCALTECH_ID));
+		} else {
+			printf("goodix: touchscreen=-1: %s selected by the board feature; nothing powered, configured or sent\n",
+			    chip_name());
+		}
 		thread_terminate(current_thread());
 		return;
 	}
-	se = ml_io_map(SE_PHYS, SE_SIZE);
+	if (WIRED->engine) {
+		se = ml_io_map(SE_PHYS, SE_SIZE);
+	}
 	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 
-	if (!se || !rsc || !cmd_db) {
+	if ((WIRED->engine && !se) || !rsc || !cmd_db) {
 		printf("goodix: the serial engine, RPMh or its command database could not be mapped\n");
 		thread_terminate(current_thread());
 		return;
@@ -1509,8 +2039,10 @@ hakios_goodix_init(void)
 		printf("touch: disabled: the SoC file does not say where the pins, the clock controller and RPMh are (pins { }, clocks { }, rpmh { })\n");
 		return;
 	}
-	if (WIRED->serial_engine == 0 || WIRED->io_supply == NULL || WIRED->analog_enable < 0 || WIRED->vendor_pin[0] < 0 ||
-	    WIRED->vendor_pin[1] < 0 || WIRED->max_x < 2 || WIRED->max_y < 2) {
+	if ((WIRED->engine && WIRED->serial_engine == 0) || WIRED->io_supply == NULL ||
+	    (!hakios_board_has(HAKIOS_HAS_TOUCH_SYNAPTICS) &&
+	    (WIRED->analog_enable < 0 || WIRED->vendor_pin[0] < 0 || WIRED->vendor_pin[1] < 0)) ||
+	    WIRED->max_x < 2 || WIRED->max_y < 2) {
 		printf("touch: disabled: the board file does not say how the controller is wired (touch { }, with analog-enable, "
 		    "vendor-pins and coordinates)\n");
 		return;
