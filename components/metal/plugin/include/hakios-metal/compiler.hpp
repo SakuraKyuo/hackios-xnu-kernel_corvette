@@ -23,6 +23,10 @@
 
 namespace hakios::metal {
 
+// Select the Mesa ir3 target using the MSM GPU_ID returned by the kernel.
+// This affects shader code generation only; it does not enable GPU submissions.
+bool setCompilerGpuId(uint32_t msmGpuId);
+
 // what a kernel binds, as the front end read it off the function's metadata: the runtime's half of the match
 struct Resource {
     enum Kind { kConstantBuffer, kDeviceBuffer, kThreadgroupBuffer, kTexture, kImage, kSampler } kind;

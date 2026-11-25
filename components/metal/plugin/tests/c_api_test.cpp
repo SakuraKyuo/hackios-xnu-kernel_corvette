@@ -10,6 +10,7 @@
 
 #include "hakios-metal/hakios_metal.h"
 #include "hakios-metal/gpu_identity.hpp"
+#include "hakios-metal/compiler.hpp"
 #include "test.hpp"
 
 namespace {
@@ -69,7 +70,17 @@ TEST(c_api_copy_and_callbacks) {
         hakios::metal::gpu_identity::Family::A7xx);
     CHECK(hakios::metal::gpu_identity::familyFromDriverId(hakios::metal::gpu_identity::kCorvetteA750GmuChipId) ==
         hakios::metal::gpu_identity::Family::Unknown); // a GMU ID must not be used as the MSM GPU_ID
-    CHECK(!hakios_metal_chip_known(hakios::metal::gpu_identity::kCorvetteA750MsmGpuId)); // no A7xx backend yet
+    CHECK(!hakios_metal_chip_known(hakios::metal::gpu_identity::kCorvetteA750MsmGpuId)); // no A7xx command backend yet
+    const auto a750Target = hakios::metal::gpu_identity::ir3TargetForMsmGpuId(
+        hakios::metal::gpu_identity::kCorvetteA750MsmGpuId);
+    CHECK(a750Target.known);
+    CHECK_EQ(a750Target.gpuId, 0u);
+    CHECK_EQ(a750Target.chipId, uint64_t(0x43051401u));
+    CHECK(!hakios::metal::gpu_identity::ir3TargetForMsmGpuId(
+        hakios::metal::gpu_identity::kCorvetteA750GmuChipId).known);
+    CHECK(hakios::metal::setCompilerGpuId(hakios::metal::gpu_identity::kCorvetteA750MsmGpuId));
+    CHECK(!hakios::metal::setCompilerGpuId(hakios::metal::gpu_identity::kCorvetteA750GmuChipId));
+    CHECK(hakios::metal::setCompilerGpuId(0x06030500u)); // restore the A660 default for later tests
     CHECK(strlen(hakios_metal_error()) > 0);
 }
 

@@ -252,10 +252,19 @@ hakios_metal_device* hakios_metal_open(void) {
     }
     hakios_metal_device* d = deviceOn(std::move(t));
     if (!chipKnown(d->gpu->chipId())) {
-        char text[160];
-        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: the tables of this driver are the Adreno's of chip ID %#x (a6xx.hpp), another's would hang it",
-                 d->gpu->chipId(), a6xx::kChipId);
+        char text[192];
+        const uint32_t chipId = d->gpu->chipId();
+        if (gpu_identity::familyFromDriverId(chipId) == gpu_identity::Family::A7xx) {
+            snprintf(text, sizeof(text), "GPU %#x is Adreno 750 (A7xx), but its kernel submit and Metal encoding backends are not implemented", chipId);
+        } else {
+            snprintf(text, sizeof(text), "the GPU's chip ID is %#x: this driver only has the Adreno A6xx packet and descriptor tables", chipId);
+        }
         failed(text);
+        delete d;
+        return nullptr;
+    }
+    if (!setCompilerGpuId(d->gpu->chipId())) {
+        failed("the kernel GPU_ID has no ir3 compiler target");
         delete d;
         return nullptr;
     }
@@ -266,7 +275,13 @@ hakios_metal_device* hakios_metal_open(void) {
     return nullptr;
 }
 
-hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_unique<FakeGpu>(true)); }
+hakios_metal_device* hakios_metal_open_fake(void) {
+    hakios_metal_device* d = deviceOn(std::make_unique<FakeGpu>(true));
+    if (setCompilerGpuId(d->gpu->chipId())) return d;
+    delete d;
+    failed("the fake GPU_ID has no ir3 compiler target");
+    return nullptr;
+}
 
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 

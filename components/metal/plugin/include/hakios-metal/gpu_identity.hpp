@@ -24,8 +24,22 @@ constexpr Family familyFromDriverId(uint32_t id) {
     return Family::Unknown;
 }
 
+// Mesa's fd_dev_id for these MSM GPU_ID values. A zero GPU_ID keeps the
+// existing A660 fallback; the GMU firmware ID is deliberately not accepted.
+struct Ir3Target {
+    uint32_t gpuId;
+    uint64_t chipId;
+    bool known;
+};
+
+constexpr Ir3Target ir3TargetForMsmGpuId(uint32_t id) {
+    if (id == 0 || id == a6xx::kChipId) return {0, a6xx::kChipId, true};
+    if (id == kCorvetteA750MsmGpuId) return {0, kCorvetteA750MsmGpuId, true};
+    return {0, 0, false};
+}
+
 // A7xx is identified for routing, but is not advertised until its packets,
-// descriptors, and compiler path have been implemented and tested.
+// descriptors, and kernel backend have been implemented and tested.
 constexpr bool backendAvailable(uint32_t id) {
     return id == 0 || familyFromDriverId(id) == Family::A6xx;
 }

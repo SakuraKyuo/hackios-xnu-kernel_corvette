@@ -110,3 +110,75 @@ packet, descriptor, or compiler path can accidentally claim the device. `git dif
 passed. No kernel image was produced and no device or emulator was run. The next code step
 is the Gen7 packet/descriptor/compiler backend plus the matching kernel profile, not enabling
 `gpu=1` on the A660 path.
+
+## 2026-11-26 full-device-tree correction and compiler-target change
+
+### Device tree and incident evidence
+
+The previous audit of `/home/sakurakyuo/opdt` did not include the separate local full-tree dump
+`/home/sakurakyuo/corvette-full.dts` (SHA-256
+`52bf18b84e20860d3316ee281ba9d0bcf7c4278f38a1b1e9641d55a755cb6c04`). The dump provides
+additional A750 facts that should be used for the port, while remaining a local, untracked
+artifact:
+
+- `qcom,kgsl-3d0@3d00000`, lines 19296-19316, names `Adreno750v2`, has chip ID `0x43051401`
+  and register windows `0x3d00000/0x40000`, CX debug `0x3d61000/0x3000`, RSCC
+  `0x3d50000/0x10000`, and CX misc `0x3d9e000/0x2000`. It points its zap shader at reserved
+  memory phandle `0x2fe`; that phandle still needs resolving before any secure-load attempt.
+- `clock-controller@3d90000`, lines 13096-13107, is GPUCC at `0x3d90000/0x9800`.
+- `qcom,gmu@3d69000`, lines 34927-34945, describes Gen7 GMU register window
+  `0x3d68000/0x37000`, PDC `0x0b280000/0x10000`, and AO block `0x3d40000/0x10000`.
+- `qcom,kgsl-iommu@3da0000`, lines 34899-34923, provides the GPU SMMU window
+  `0x3da0000/0x40000` and distinct user/LPAC/secure contexts. The GPU speed-bin cell is at
+  QFPROM offset `0x9b`, bits 4-6 (lines 20218-20221); the QFPROM base is `0x221c2000`.
+
+This corrects only the claim that no full Corvette DTS evidence was available. The common
+source branch still contains no Corvette board/SM8650 DTS package, and the dump alone does not
+supply a verified end-to-end kernel profile, RPMh/GPUCC sequence, or safe zap reserved-memory
+mapping.
+
+For the SpringBoard incident, `.work/corvette-port-m4/device-springboard-reboot.txt` line 16
+reports `gpu=0 cpus=1`, and line 474 says `SpringBoard: no GPU draws`. Lines 4881-4911 show a
+backboardd `push_surface` assertion followed by backboardd signal 6; lines 4976/5016 show
+runningboardd killing SpringBoard (signal 9), not a SpringBoard SIGABRT stack. Line 5193 is the
+180-second `loader_return_after` expiry, about five seconds after the assertion. A later,
+separate backboardd `userabort` at line 6566/uptime 407.224874 remains unsymbolized. This run
+cannot diagnose A7xx submissions, fences, DeviceLost, or GPU OOM; do not attribute either
+backboardd event to an active GPU driver from this log.
+
+### Old-to-new implementation delta and applied first step
+
+The four legacy commits are `6f90e14f`, `5ef4f3c3`, `f9b5c2aa`, and `ce8ad510`. The central
+A750 bring-up is `5ef4f3c3`: it added Gen7 GMU/HFI/context setup, CP submission and retirement,
+plus a separate NativeAdreno tunnel. The current common kernel remains an A660 implementation;
+its `BoardGPU.cpp` contract is MSM DRM, so the legacy Native tunnel is not a drop-in ABI. The
+new Metal plugin's `compiler.cpp` previously hard-coded Mesa `fd_dev_id.chip_id` to A635
+`0x06030500`, even though Mesa 25.0.7 lists FD750 at `0x43051401` in
+`src/freedreno/common/freedreno_devices.py:1289-1290`.
+
+The plugin now maps the **MSM GPU_ID** `0x43051401` to Mesa's A750 `chip_id` for ir3 compiler
+target selection, rebuilds each thread-local compiler if the selected target changes, and
+rejects the Gen7 GMU firmware ID `0x07090000` as a compiler GPU ID. The hardware backend gate
+is intentionally unchanged: `hakios_metal_chip_known(0x43051401)` remains false until kernel
+submission and A7xx PM4/register/descriptor backends are implemented. This compiler-target
+change alone does not enable GPU access or fix device frame rate.
+
+### Verification and next change
+
+- `make test` in `components/metal/plugin`: **303 tests, 0 failed checks**, exit 0. This is the
+  host/FakeGPU build without Mesa; it tests target-ID mapping and refusal of the GMU ID, not
+  Mesa's A750 compiler execution.
+- The existing `build-softpipe-freedreno` was not compatible with the current Mesa source headers
+  for `compiler-smoke` (generated format names differ). A clean `tools/mk-mesa-host.sh` attempt
+  stopped in Meson setup because network requests for libxml2/WrapDB were reset/timed out. No
+  A750 Mesa smoke result is claimed.
+- `git diff --check` passes. No kernel/image build, QEMU, fastboot, adb, or UFS operation was run.
+- All six Gen7 firmware files remain present under the original Corvette repository's `fw-gpu/`
+  with the SHA-256 values recorded above. **No additional firmware is requested.**
+
+Next: add a Corvette/SM8650 board data package from the verified full dump, resolve the zap memory
+phandle and exact RPMh/GPUCC inputs, then port the old Gen7 startup/HFI/ring-retirement behavior
+into the common kernel's MSM contract. Separately implement A7xx PM4, descriptor, and Mesa-target
+paths in `components/metal/plugin`. Keep the A7xx hardware gate closed until both sides have
+matching FakeGPU/host tests. Investigate `push_surface` and the later `userabort` separately from
+GPU bring-up.

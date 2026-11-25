@@ -1,6 +1,8 @@
 #include "hakios-metal/compiler.hpp"
+#include "hakios-metal/gpu_identity.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -29,6 +31,13 @@ namespace hakios::metal {
 
 namespace {
 thread_local std::vector<LinkedFunction> tLinked;   // LinkedScope's
+std::atomic<uint32_t> gCompilerMsmGpuId{0};
+}
+
+bool setCompilerGpuId(uint32_t msmGpuId) {
+    if (!gpu_identity::ir3TargetForMsmGpuId(msmGpuId).known) return false;
+    gCompilerMsmGpuId.store(msmGpuId, std::memory_order_release);
+    return true;
 }
 
 LinkedScope::LinkedScope(std::vector<LinkedFunction> functions) : saved_(std::move(tLinked)) { tLinked = std::move(functions); }
@@ -69,18 +78,23 @@ std::string stageCacheFileName(const void*, size_t, const FunctionConstants&, ui
 
 namespace {
 
-// A compiler for the chip, as the kernel names it (Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row), one for
-// each thread that compiles: ir3 keeps state in the compiler object (compileStage turns its preamble off and on again),
+// The active kernel MSM GPU_ID selects Mesa's device row. Each compiling thread has its own ir3
+// compiler because it keeps state in that object (compileStage turns its preamble off and on again),
 // and with one for the process and a lock around every compilation the window server's thread waited for whatever the
 // specialising thread had begun -- 1 to 2.5 s an uber shader variant on the phone, 140 of them behind Settings, and a
 // buffer took up to 5 s from made to committed (logs/064041-run.log). The front end keeps nothing between calls. What
 // one thread compiles is what the same compilation alone makes: sweep -j compares them word for word.
 struct ThreadCompiler {
+    uint32_t msmGpuId;
     ir3_compiler* compiler = nullptr;
-    ThreadCompiler() {
+    explicit ThreadCompiler(uint32_t selectedGpuId) : msmGpuId(selectedGpuId) {
+        const gpu_identity::Ir3Target target = gpu_identity::ir3TargetForMsmGpuId(msmGpuId);
+        if (!target.known) return;
         fd_dev_id id{};
-        id.gpu_id = 0;
-        id.chip_id = a6xx::kChipId;
+        id.gpu_id = target.gpuId;
+        id.chip_id = target.chipId;
+        const fd_dev_info* info = fd_dev_info_raw(&id);
+        if (info == nullptr) return;
         // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
         // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
         // set 0, which this driver never binds
@@ -89,22 +103,42 @@ struct ThreadCompiler {
         // the GLSL type cache, which ir3 uses for the driver UBOs' types (get_driver_ubo_type: a module's constant table
         // is read through one); a reference for each compiler, given back with it
         glsl_type_singleton_init_or_ref();
-        compiler = ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
+        compiler = ir3_compiler_create(nullptr, &id, info, &options);
+        if (compiler == nullptr) glsl_type_singleton_decref();
     }
     ~ThreadCompiler() {
-        if (compiler != nullptr) ir3_compiler_destroy(compiler);
-        glsl_type_singleton_decref();
+        if (compiler != nullptr) {
+            ir3_compiler_destroy(compiler);
+            glsl_type_singleton_decref();
+        }
     }
 };
 
 ir3_compiler* theCompiler() {
-    thread_local ThreadCompiler mine;   // (made at a thread's first compilation, gone with the thread)
-    return mine.compiler;
+    const uint32_t selectedGpuId = gCompilerMsmGpuId.load(std::memory_order_acquire);
+    thread_local std::unique_ptr<ThreadCompiler> mine;
+    // A device may be opened after a capability query compiled the default target.
+    // Rebuild this thread's compiler when the active kernel-reported GPU changes.
+    if (!mine || mine->msmGpuId != selectedGpuId) mine = std::make_unique<ThreadCompiler>(selectedGpuId);
+    return mine->compiler;
 }
 
 bool refuse(std::string* why, const std::string& text) {
     *why = text;
     return false;
+}
+
+std::string compilerUnavailableReason() {
+    const uint32_t msmGpuId = gCompilerMsmGpuId.load(std::memory_order_acquire);
+    const gpu_identity::Ir3Target target = gpu_identity::ir3TargetForMsmGpuId(msmGpuId);
+    char text[144];
+    if (!target.known) {
+        snprintf(text, sizeof(text), "ir3 has no target for MSM GPU_ID %#x", msmGpuId);
+    } else {
+        snprintf(text, sizeof(text), "Mesa ir3 has no compiler for MSM GPU_ID %#x (target chip %#llx)",
+                 msmGpuId, static_cast<unsigned long long>(target.chipId));
+    }
+    return text;
 }
 
 // KernelTextureDim from the NIR's sampler dimension; false, with the dimension's name, for the ones no Texture can be
@@ -1257,7 +1291,7 @@ bool hasCompiler() { return theCompiler() != nullptr; }
 
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, compilerUnavailableReason());
         return nullptr;
     }
     Translation t;
@@ -1516,7 +1550,7 @@ std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionC
 
 bool knownBufferControlBytes(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
                              std::vector<uint8_t>* mask, std::string* why) {
-    if (theCompiler() == nullptr) return refuse(why, "ir3 has no compiler for chip 0x06030500");
+    if (theCompiler() == nullptr) return refuse(why, compilerUnavailableReason());
     // the function's NIR as a specialisation starts from (the kept translation of the module), nothing folded
     KnownBuffer none;
     none.binding = binding;
@@ -1586,7 +1620,7 @@ bool knownBufferControlBytes(const void* bitcode, size_t size, const FunctionCon
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
                                            const KnownBuffer* known) {
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, compilerUnavailableReason());
         return nullptr;
     }
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
