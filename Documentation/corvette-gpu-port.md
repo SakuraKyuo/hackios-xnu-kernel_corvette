@@ -9,8 +9,10 @@ and the current common kernel/Metal tree. It is not a claim that the GPU is enab
 
 - Line 16: `gpu=0 cpus=1` and `loader_return_after=180`.
 - Line 474: SpringBoard reports `no GPU draws`.
-- Lines 4881-4883: backboardd hits `Assertion failed: (found != slist->end ()), function push_surface, file ogl-context.cpp, line 1309`, then exits with signal 6 (line 4911).
-- Line 5016: SpringBoard receives SIGKILL; line 5193 records the configured loader return.
+- Line 4881 records a newly made IOSurface port immediately before the assertion on line 4882: `found != slist->end ()` in `push_surface` (`ogl-context.cpp:1309`). backboardd exits by signal 6 at line 4911.
+- Lines 4976/5016 show SpringBoard being SIGKILLed by runningboardd and ending by signal 9 in the same broad process-termination burst; this is not a SpringBoard SIGABRT stack.
+- Line 5193 records `loader_return_after expired`. The assertion wall-clock time is about 22:03:02, roughly 175 seconds after the boot-args timestamp at 22:00:07, so the 180-second loader return follows about five seconds later and confounds the black-screen observation.
+- Line 6564 later records another backboardd `userabort` at uptime 407.224874; its cause is also not identified here.
 
 Therefore this run provides no A7xx submit, fence, DeviceLost, or GPU-OOM evidence. The
 assertion is in the userspace surface path; its cause is not identified by this log. The
@@ -19,15 +21,15 @@ the persistent-black-screen observation. Do not label this event a GPU reset.
 
 ## Current common implementation
 
-- `arch/arm64/boot/dts/corvette/board.dts` lists only `touch-synaptics`; no GPU profile is
-  selected for this board.
+- The `common` branch tracks no Corvette `board.dts` or SM8650 `soc.dtsi`; `git ls-files | grep -i corvette` lists only this document and `arch/arm64/configs/kconfig/corvette.config`. The config does not supply board GPU data. The earlier claim that a Corvette DTS listed `touch-synaptics` was incorrect and is withdrawn.
 - `drivers/board/board.h` exposes `HAKIOS_HAS_GPU_A660`. `drivers/board/adreno_profile.h`
   rejects boards without that feature, and `drivers/board/adreno.c` expects the A660
   firmware names and A660 initialization path. There is no A750/Gen7 driver path here.
-- `components/metal/plugin/include/hakios-metal/a6xx.hpp` defines chip ID `0x06030500`.
-  `src/c_api.cpp` accepts only that ID (or zero), and `src/compiler.cpp` hard-codes it for
-  ir3. The old Corvette MSM interface reports `0x43051401` for GPU parameter 0x03; the
-  added C API test keeps this ID explicitly unsupported until an A7xx backend exists.
+- `components/metal/plugin/include/hakios-metal/a6xx.hpp` defines chip ID `0x06030500`;
+  `src/compiler.cpp` hard-codes it for ir3. `include/hakios-metal/gpu_identity.hpp` now
+  classifies the legacy Corvette MSM GPU_ID `0x43051401` as A7xx while keeping it
+  unavailable to the A6xx backend; GMU chip ID `0x07090000` is explicitly not treated as
+  the MSM GPU_ID. This prevents mistaken A6xx dispatch; it does not enable rendering.
 - Current `drivers/iokit/BoardGPU.cpp` is the MSM DRM transport used by this source plugin.
   The old `NativeAdreno` tunnel is a separate ABI; its client-private VA sizes and ioctl
   behavior must not be copied as if they were current MSM behavior.
@@ -46,6 +48,10 @@ through MSM (`0x43051401`). Keep those identifiers separate. Port the Gen7 regis
 firmware and submission behavior into the common driver's profile/API; do not label the
 A750 as A660 or reuse the A6xx packet/register tables. The new source plugin is the current
 MSM client, so the NativeAdreno tunnel is not itself a drop-in fix for it.
+
+The legacy `6f90e14f..5ef4f3c3` Adreno patch changes the old driver by 2,652 insertions and
+349 deletions. A zero-fuzz dry run against `drivers/board/adreno.c` applies only 50 of 90
+hunks; adapt the Gen7 changes by subsystem rather than applying that file diff wholesale.
 
 ## Required work sequence
 
@@ -82,9 +88,19 @@ must remain out of source commits. Their SHA-256 values are:
 No additional firmware upload is needed at this stage. The image builder still needs an
 explicit Gen7 firmware mapping before `gpu=1` can be enabled.
 
-## Baseline test
+## Host test result
 
-On this branch, `make test` in `components/metal/plugin` completed with 303 tests and 0
-failed checks. This was a host/fake-GPU run without Mesa enabled; it is not A7xx or device
-validation. `make test` regenerated tracked LLVM fixture headers with the local LLVM build;
-those generated changes were restored afterward.
+On 2026-11-26, after the GPU-ID routing change below, `make test` in
+`components/metal/plugin` completed with 303 tests and 0 failed checks. This was a host/fake-
+GPU run without Mesa enabled; it is not A7xx or device validation. The post-test worktree
+contained no generated fixture changes.
+
+## 2026-11-26 identity-routing checkpoint
+
+`components/metal/plugin/include/hakios-metal/gpu_identity.hpp` distinguishes the Corvette
+MSM GPU_ID from the Gen7 GMU ID and labels `0x43051401` as A7xx for future routing. The
+A7xx backend remains unavailable: `hakios_metal_chip_known()` still rejects it, so no A6xx
+packet, descriptor, or compiler path can accidentally claim the device. `git diff --check`
+passed. No kernel image was produced and no device or emulator was run. The next code step
+is the Gen7 packet/descriptor/compiler backend plus the matching kernel profile, not enabling
+`gpu=1` on the A660 path.

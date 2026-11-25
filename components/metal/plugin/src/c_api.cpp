@@ -21,6 +21,7 @@
 #include "hakios-metal/fake_gpu.hpp"
 #include "hakios-metal/hakios_metal.h"
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/gpu_identity.hpp"
 #include "hakios-metal/metallib.hpp"
 #include "../tests/fixtures/null_fs_bc.hpp"
 #include "hakios-metal/texture.hpp"
@@ -230,9 +231,8 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
 
 const char* hakios_metal_error(void) { return lastError.c_str(); }
 
-// Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
-// word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
-bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
+// Only a registered backend may claim a named chip. Zero preserves the existing fallback for a kernel that does not say.
+bool hakios_metal_chip_known(uint32_t chip) { return gpu_identity::backendAvailable(chip); }
 [[maybe_unused]] static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
