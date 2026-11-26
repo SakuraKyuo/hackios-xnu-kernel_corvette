@@ -95,9 +95,13 @@ int main(int argc, char** argv)
 
     // 2. The compiler (libfreedreno_ir3).
     struct ir3_compiler_options copts = {};
+    // compiler.cpp keeps this Mesa type cache alive for each per-thread ir3 compiler.
+    glsl_type_singleton_init_or_ref();
     struct ir3_compiler* compiler = ir3_compiler_create(nullptr, &devId, devInfo, &copts);
-    if (!compiler)
+    if (!compiler) {
+        glsl_type_singleton_decref();
         die("ir3_compiler_create failed");
+    }
     printf("ir3 compiler: gen %u, max_const_compute %u, branchstack %u\n", compiler->gen,
            compiler->max_const_compute, compiler->branchstack_size);
 
@@ -152,6 +156,12 @@ int main(int argc, char** argv)
     v->type = shader->type;
     v->compiler = compiler;
     v->const_state = static_cast<struct ir3_const_state*>(rzalloc_size(v, sizeof(*v->const_state)));
+    // Match ir3_shader.c: alloc_variant leaves driver UBOs unassigned. Zero is a real UBO slot;
+    // gen7's shared-UBO path asserts that an uninitialized slot was not mistaken for slot zero.
+    v->const_state->consts_ubo.idx = -1;
+    v->const_state->driver_params_ubo.idx = -1;
+    v->const_state->primitive_map_ubo.idx = -1;
+    v->const_state->primitive_param_ubo.idx = -1;
     v->mergedregs = compiler->gen >= 6;
     v->num_ssbos = nir->info.num_ssbos;
     v->num_ibos = nir->info.num_ssbos + nir->info.num_images;
@@ -181,6 +191,7 @@ int main(int argc, char** argv)
 
     ralloc_free(shader);
     ir3_compiler_destroy(compiler);
+    glsl_type_singleton_decref();
     puts("compiler-smoke: ok");
     return 0;
 }

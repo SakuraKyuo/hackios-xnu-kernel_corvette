@@ -182,3 +182,37 @@ into the common kernel's MSM contract. Separately implement A7xx PM4, descriptor
 paths in `components/metal/plugin`. Keep the A7xx hardware gate closed until both sides have
 matching FakeGPU/host tests. Investigate `push_surface` and the later `userabort` separately from
 GPU bring-up.
+
+## 2026-11-26 A750 Mesa compiler-smoke follow-up
+
+The first A750 `compiler-smoke` attempt stopped in `ir3_get_shared_driver_ubo`, but that was a
+smoke-harness setup defect, not evidence of a Mesa or production-plugin failure. The helper built
+an `ir3_shader_variant` by hand and left Mesa's driver-UBO indexes zeroed; zero is a valid UBO
+slot, while the production `src/compiler.cpp` initializes all four indexes to `-1`. The helper
+also omitted the GLSL type-cache reference held by the production thread-local compiler. Both
+initializations are now mirrored in `components/metal/plugin/tools/compiler-smoke.cc`.
+
+Using the existing Mesa 25.0.7 host build from the original checkout:
+
+```sh
+cd components/metal/plugin
+make compiler-smoke MESA=1 \
+  MESA_HOST=/home/sakurakyuo/hackios-xnu-kernel_corvette/xnu-deps/build/mesa-host \
+  CHIP_ID=0x43051401
+```
+
+Observed result: Mesa identifies `FD750`, chip `0x43051401`, generation 7; `fill_id.bc` passes
+AIR-to-NIR, ir3 lowering, compilation and assembly, producing 256 bytes / 64 instruction dwords;
+the command ends with `compiler-smoke: ok`. The same binary and `fill_id.bc` also pass with
+`CHIP_ID=0x06030500` (A635 baseline).
+
+`make test` in `components/metal/plugin` passes **303 tests, 0 failed checks** without Mesa.
+`make test MESA=1` remains unverified: its fixture-generation dependency attempts to link Mesa's
+full patched `ir3_compiler`, and the existing host Mesa configuration lacks `xf86drm.h`. This is a
+build-environment dependency, not a failure of the direct compiler-smoke, which links the smaller
+AIR/ir3 archive set.
+
+This evidence is limited to one compute shader through Mesa's raw AIR/ir3 smoke helper. It does
+not test the plugin's `compileStage`/`compileAir` integration, A7xx register or descriptor encoding,
+PM4 submission, kernel MSM transport, or the phone. The `0x43051401` hardware backend gate remains
+closed; no GPU image is ready to flash from this change.
