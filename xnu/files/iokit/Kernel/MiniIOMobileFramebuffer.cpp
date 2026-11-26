@@ -40,6 +40,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void hakios_gpu_trace(const char * format, ...) __printflike(1, 2);
 extern "C" bool hakios_gpu_debug(void);
+extern "C" int hakios_wifi_tell(const char * format, ...) __attribute__((format(printf, 1, 2)));  /* air243: the channel the log carries */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -78,7 +79,15 @@ enum {
 
 #define kFBNotifyVSync          5
 #define kFBNotifyTypes          8
-#define kFBRefreshHz            60                      /* unless boot-arg fb_hz says otherwise */
+/*
+ * The rate the beat in show() and the vsync callbacks are worked out from; boot-arg fb_hz=N overrides
+ * it (1 to 240).  It is not the panel's own rate -- the scanout DisplayDxe left us is 60 Hz, and this
+ * driver has no DSI or timing code to change it.  It is 120 so that the beat's quantisation falls
+ * away: frames arrive every ~18 ms here, which is more than 1.5 periods at 120 Hz (12.5 ms) and so
+ * skips the branch, but less than 1.5 at 60 Hz (25 ms) and so is held to the 16.67 ms grid -- six
+ * frames in ten of them (air245 vs air246).
+ */
+#define kFBRefreshHz            120
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
@@ -149,10 +158,12 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  * iPhone's 1125 x 2436 on this panel's 1080 x 2400 is 45 columns and 36 rows fewer: nearest
  * neighbour leaves out every 25th column and every 67th row, and where one of them goes through a
  * letter or a slanting line, that is a step in it or a stroke a pixel thinner -- text and lines a
- * little crooked, here and there and never in the same places twice. By default every pixel of the
- * panel is worked out from the four of the picture around where it falls (bilinear).
+ * a little crooked, here and there and never in the same places twice. By default it is done that
+ * way: the copy into the panel costs 2 ms a frame instead of 10 (air244 vs air245), and that is worth
+ * the crookedness. Boot-arg fb_filter=1 works every pixel of the panel out from the four of the
+ * picture around where it falls (bilinear) instead.
  */
-static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
+static TUNABLE(uint32_t, gFilter, "fb_filter", 0);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 /*
@@ -333,7 +344,7 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 /*
  * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
  * and ColorElements; without a mode it draws nothing). One timing, the panel's size at
- * 60 Hz (boot-arg fb_hz=N: at N), with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
+ * kFBRefreshHz (boot-arg fb_hz=N: at N), with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
  * (block 0x40) answers with.
  */
 #define kFBTimingID     1
@@ -872,7 +883,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	nanoseconds_to_absolutetime(FRAME_PAUSE * NSEC_PER_MSEC, &pause);
 	clock_interval_to_deadline(SWAP_HELD_MS, kMillisecondScale, &deadline);
 	if (gTouchLat) {
-		hakios_gpu_trace("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+		hakios_wifi_tell("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
 	}
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
@@ -1074,7 +1085,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
         hakios_gpu_trace("tl: air87 display completed: swap %u surface %u\n", fSwapCompleted, swapWord(swap, SWAP_SURFACE(0)));
 	fSwapsShown++;
 	if (gTouchLat) {
-		hakios_gpu_trace("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+		hakios_wifi_tell("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
 		    micros(drawn));
 	}
 	if (layers != fLayersShown) {
